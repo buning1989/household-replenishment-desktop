@@ -16,8 +16,8 @@ import { fileURLToPath } from "node:url"
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
 const DAY_MS = 24 * 60 * 60 * 1000
-const ORDER_REMINDER_DELAY_MS = 3 * DAY_MS
 const APP_NAME = "403家庭管家"
+const APP_ICON = path.join(__dirname, "../build/icons/icon_1024.png")
 
 let mainWindow = null
 let tray = null
@@ -72,6 +72,7 @@ function createWindow() {
     minWidth: 940,
     minHeight: 650,
     title: APP_NAME,
+    icon: APP_ICON,
     backgroundColor: "#f3f1ec",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     webPreferences: {
@@ -132,10 +133,6 @@ function depletionAt(item) {
   return date.getTime()
 }
 
-function isOrderArrivalOverdue(item, now = Date.now()) {
-  return Number(item.orderedAt || 0) > 0 && now - Number(item.orderedAt) > ORDER_REMINDER_DELAY_MS
-}
-
 function inQuietHours(now, start, end) {
   const [startHour, startMinute] = String(start || "22:00").split(":").map(Number)
   const [endHour, endMinute] = String(end || "08:00").split(":").map(Number)
@@ -150,41 +147,26 @@ function inQuietHours(now, start, end) {
 function getDueItems(state, now = Date.now()) {
   return (state?.items || []).filter((item) => {
     if (Number(item.snoozeUntil || 0) > now) return false
-    if (Number(item.orderedAt || 0) > 0) return isOrderArrivalOverdue(item, now)
     return calendarDayNumber(now) >= calendarDayNumber(dueAt(item))
-  })
+  }).sort((a, b) => depletionAt(a) - depletionAt(b))
 }
 
 function sendNotification(items, isTest = false) {
   if (!Notification.isSupported()) return
-  const grouped = items.length > 1
-  const arrivalItems = items.filter((item) => isOrderArrivalOverdue(item))
-  const urgentCount = items.filter((item) => calendarDayNumber(Date.now()) >= calendarDayNumber(depletionAt(item))).length
-  const warningCount = items.length - urgentCount
+  const item = items[0]
+  const urgent = item && calendarDayNumber(Date.now()) >= calendarDayNumber(depletionAt(item))
   const title = isTest
     ? "提醒功能工作正常"
-    : arrivalItems.length === 1
-      ? `${arrivalItems[0]?.name || "物品"}到货了吗？`
-      : arrivalItems.length > 1
-        ? `${arrivalItems.slice(0, 2).map((item) => item.name).join("、")}${arrivalItems.length > 2 ? "等" : ""}到货了吗？`
-    : grouped
-      ? urgentCount
-        ? `${urgentCount} 样急需补货${warningCount ? `，${warningCount} 样快用完` : ""}`
-        : `${warningCount} 样东西快用完了`
-      : urgentCount
-        ? `${items[0]?.name || "物品"}需要马上补货`
-        : `${items[0]?.name || "物品"}快用完了`
+    : urgent
+      ? `${item?.name || "物品"}需要补货了`
+      : `${item?.name || "物品"}快用完了`
   const body = isTest
-    ? "以后到补货点时，我会像这样提醒你。"
-    : arrivalItems.length === items.length
-      ? "下单超过 3 天了，收到后记得点“已补到家”。"
-      : arrivalItems.length > 0
-        ? `还有 ${items.length - arrivalItems.length} 样东西也该补了。`
-    : items.slice(0, 3).map((item) => item.name).join("、") + (items.length > 3 ? "等" : "")
+    ? "通知已开启"
+    : String(item?.category || "家庭用品")
   const actions = process.platform === "darwin"
     ? [
-        { type: "button", text: grouped ? "查看清单" : "已补到家" },
-        { type: "button", text: "稍后提醒" }
+        { type: "button", text: "已买好" },
+        { type: "button", text: "明天提醒我" }
       ]
     : []
   const notification = new Notification({
@@ -196,19 +178,19 @@ function sendNotification(items, isTest = false) {
 
   notification.on("click", () => {
     showWindow()
-    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: items.map((item) => item.id) })
+    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: item ? [item.id] : [] })
   })
   notification.on("action", (_event, index) => {
-    if (index === 0 && items.length === 1) {
-      mainWindow?.webContents.send("notification:action", { action: "restock", itemIds: [items[0].id] })
+    if (index === 0 && item) {
+      mainWindow?.webContents.send("notification:action", { action: "restock", itemIds: [item.id] })
       return
     }
-    if (index === 1) {
-      mainWindow?.webContents.send("notification:action", { action: "snooze", itemIds: items.map((item) => item.id) })
+    if (index === 1 && item) {
+      mainWindow?.webContents.send("notification:action", { action: "snooze", itemIds: [item.id] })
       return
     }
     showWindow()
-    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: items.map((item) => item.id) })
+    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: item ? [item.id] : [] })
   })
   notification.show()
 }
@@ -233,12 +215,13 @@ function checkReminders(force = false) {
   const itemSetChanged = key !== lastNotificationKey
   if (!force && !itemSetChanged && now - lastNotificationAt < repeatMs) return
 
-  sendNotification(dueItems)
+  sendNotification([dueItems[0]])
   lastNotificationKey = key
   lastNotificationAt = now
 }
 
 app.whenReady().then(() => {
+  if (process.platform === "darwin") app.dock.setIcon(APP_ICON)
   loadState()
   createWindow()
   createTray()

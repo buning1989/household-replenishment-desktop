@@ -1,7 +1,6 @@
-import type { AppState, ItemComputed, ItemDraft, ItemUrgency, ReplenishmentItem } from "./types"
+import type { AppState, ConsumptionInfo, ItemComputed, ItemDraft, ItemUrgency, PriceAnchor, ReplenishmentItem } from "./types"
 
 const DAY_MS = 24 * 60 * 60 * 1000
-export const ORDER_REMINDER_DELAY_MS = 3 * DAY_MS
 
 export const DEFAULT_CYCLES: Record<string, number> = {
   卫生纸: 30,
@@ -40,36 +39,26 @@ export function differenceInDays(later: number, earlier: number): number {
   return calendarDayNumber(later) - calendarDayNumber(earlier)
 }
 
-export function isOrderArrivalOverdue(item: Pick<ReplenishmentItem, "orderedAt">, now = Date.now()): boolean {
-  return Number(item.orderedAt || 0) > 0 && now - Number(item.orderedAt) > ORDER_REMINDER_DELAY_MS
-}
-
 export function computeItem(item: ReplenishmentItem, now = Date.now()): ItemComputed {
   const depletionAt = addDays(item.lastRestockedAt, item.cycleDays)
   const dueAt = addDays(depletionAt, -item.bufferDays)
   const daysUntilDue = differenceInDays(dueAt, now)
   const daysUntilDepletion = differenceInDays(depletionAt, now)
   const isSnoozed = Number(item.snoozeUntil || 0) > now
-  const isOrdered = Number(item.orderedAt || 0) > 0
-  const isArrivalOverdue = isOrderArrivalOverdue(item, now)
   const status: ItemUrgency = daysUntilDepletion <= 0
     ? "urgent"
     : daysUntilDue <= 0
       ? "warning"
       : "normal"
-  const statusLabel = isOrdered ? "在路上" : status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
-  const displayStatus = isOrdered ? "ordered" : status
-  const isDue = !isSnoozed && (isArrivalOverdue || (status !== "normal" && !isOrdered))
+  const statusLabel = status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
+  const displayStatus = status
+  const isDue = !isSnoozed && status !== "normal"
 
   let remainingText = `还剩约 ${Math.max(0, daysUntilDepletion)} 天`
   let statusText = statusLabel
   if (daysUntilDepletion < 0) remainingText = `预计已用完 ${Math.abs(daysUntilDepletion)} 天`
   if (daysUntilDepletion === 0) remainingText = "预计今天用完"
-  if (isOrdered) {
-    const orderedDays = Math.max(0, Math.floor((now - Number(item.orderedAt)) / DAY_MS))
-    remainingText = isArrivalOverdue ? `下单已 ${orderedDays} 天，到货了吗？` : "已下单，正在路上"
-  }
-  if (isSnoozed && status !== "normal") statusText = `${statusLabel} · 已稍后至 ${formatDateTime(item.snoozeUntil!)}`
+  if (isSnoozed && status !== "normal") statusText = `${statusLabel} · 已推迟至 ${formatDateTime(item.snoozeUntil!)}`
 
   return {
     status,
@@ -81,8 +70,6 @@ export function computeItem(item: ReplenishmentItem, now = Date.now()): ItemComp
     daysUntilDepletion,
     isDue,
     isSnoozed,
-    isOrdered,
-    isArrivalOverdue,
     remainingText,
     statusText
   }
@@ -99,6 +86,10 @@ export function formatDateTime(timestamp: number): string {
     hour: "2-digit",
     minute: "2-digit"
   }).format(timestamp)
+}
+
+export function formatPrice(value: number): string {
+  return value.toFixed(2)
 }
 
 export function calculateMonthlySpend(items: ReplenishmentItem[], now = Date.now()): number {
@@ -143,11 +134,11 @@ function weightedCycle(intervals: number[], currentCycle: number): number | unde
   return Math.max(1, Math.round(weightedTotal / weightTotal))
 }
 
-export function restockItem(item: ReplenishmentItem, now = Date.now(), price?: number): ReplenishmentItem {
+export function restockItem(item: ReplenishmentItem, now = Date.now(), price?: number, qty?: number, platform?: string): ReplenishmentItem {
   const actualInterval = item.anchorEstimated ? undefined : Math.max(1, differenceInDays(now, item.lastRestockedAt))
   const history = [
     ...item.history,
-    { id: id("restock"), at: now, intervalDays: actualInterval, price }
+    { id: id("restock"), at: now, intervalDays: actualInterval, price, qty, platform }
   ]
   const intervals = history.flatMap((event) => event.intervalDays ? [event.intervalDays] : [])
   const candidate = item.learningEnabled !== false ? weightedCycle(intervals, item.cycleDays) : undefined
@@ -159,6 +150,7 @@ export function restockItem(item: ReplenishmentItem, now = Date.now(), price?: n
     anchorEstimated: false,
     history,
     price: price ?? item.price,
+    platform: platform || item.platform,
     snoozeUntil: undefined,
     orderedAt: undefined,
     suggestedCycleDays: meaningfulChange ? candidate : undefined,
@@ -192,6 +184,9 @@ export function createItem(draft: ItemDraft, now = Date.now()): ReplenishmentIte
     anchorEstimated: true,
     history: [],
     link: draft.link.trim() || undefined,
+    unit: draft.unit.trim() || undefined,
+    platform: draft.platform.trim() || undefined,
+    defaultQty: draft.defaultQty ? Math.max(1, Number(draft.defaultQty)) : undefined,
     createdAt: now,
     updatedAt: now
   }
@@ -208,6 +203,9 @@ export function updateItemFromDraft(item: ReplenishmentItem, draft: ItemDraft): 
     cycleDays,
     bufferDays: Math.min(Math.max(0, cycleDays - 1), Math.max(0, Number(draft.bufferDays))),
     link: draft.link.trim() || undefined,
+    unit: draft.unit.trim() || undefined,
+    platform: draft.platform.trim() || undefined,
+    defaultQty: draft.defaultQty ? Math.max(1, Number(draft.defaultQty)) : undefined,
     suggestedCycleDays: undefined,
     updatedAt: Date.now()
   }
@@ -226,7 +224,6 @@ export function createInitialState(): AppState {
     bufferDays: number,
     elapsedDays: number,
     type: "learning" | "fixed" = "learning",
-    orderedDaysAgo?: number
   ): ReplenishmentItem => ({
     id: id("item"),
     name,
@@ -238,7 +235,6 @@ export function createInitialState(): AppState {
     lastRestockedAt: daysAgo(elapsedDays),
     anchorEstimated: true,
     history: [],
-    orderedAt: orderedDaysAgo === undefined ? undefined : Date.now() - orderedDaysAgo * DAY_MS,
     createdAt: now,
     updatedAt: now
   })
@@ -254,7 +250,7 @@ export function createInitialState(): AppState {
       item("猫砂", "宠物用品", 14, 3, 12),
       item("猫粮", "宠物用品", 30, 5, 10),
       item("洗衣液", "洗衣清洁", 45, 7, 16),
-      item("洗衣凝珠", "洗衣清洁", 32, 5, 29, "learning", 1),
+      item("洗衣凝珠", "洗衣清洁", 32, 5, 29),
       item("洗发水", "日常护理", 60, 7, 22),
       item("卸妆棉", "日常护理", 28, 4, 25),
       item("咖啡豆", "饮品零食", 21, 4, 18),
@@ -270,4 +266,66 @@ export function createInitialState(): AppState {
     },
     updatedAt: now
   }
+}
+
+export function calculatePriceAnchor(history: ReplenishmentItem["history"]): PriceAnchor {
+  const priced = history.filter((e) =>
+    Number.isFinite(e.price) && e.price! > 0 &&
+    Number.isFinite(e.qty) && e.qty! > 0
+  )
+  if (!priced.length) {
+    return { lowestUnitPrice: null, avgUnitPrice: null, latestUnitPrice: null, priceCount: 0 }
+  }
+
+  const unitPrices = priced.map((e) => e.price! / e.qty!)
+  return {
+    lowestUnitPrice: Math.min(...unitPrices),
+    avgUnitPrice: unitPrices.reduce((a, b) => a + b, 0) / unitPrices.length,
+    latestUnitPrice: unitPrices[unitPrices.length - 1],
+    priceCount: priced.length
+  }
+}
+
+export function calculateConsumption(item: ReplenishmentItem): ConsumptionInfo {
+  const qtyEvents = item.history.filter((e) => Number.isFinite(e.qty) && e.qty! > 0)
+  if (!qtyEvents.length || !item.cycleDays) {
+    return { dailyUse: null, dailyUseText: "暂无数据" }
+  }
+
+  const latest = qtyEvents[qtyEvents.length - 1]
+  const dailyUse = latest.qty! / item.cycleDays
+
+  const unit = item.unit || "件"
+  const formatted = dailyUse < 0.1
+    ? dailyUse.toFixed(2)
+    : dailyUse < 1
+      ? dailyUse.toFixed(1)
+      : String(Math.round(dailyUse * 10) / 10)
+
+  return {
+    dailyUse,
+    dailyUseText: `约 ${formatted} ${unit}/天`
+  }
+}
+
+export function estimateRemainingQty(item: ReplenishmentItem, now = Date.now()): string | null {
+  const consumption = calculateConsumption(item)
+  if (!consumption.dailyUse) return null
+
+  const computed = computeItem(item, now)
+  const remainingDays = Math.max(0, computed.daysUntilDepletion)
+  const remainingQty = remainingDays * consumption.dailyUse
+  const unit = item.unit || "件"
+
+  return `约 ${Math.round(remainingQty)} ${unit}`
+}
+
+export function getLatestRating(item: ReplenishmentItem): number | null {
+  const rated = item.history.filter((e) => e.rating !== undefined).reverse()
+  if (!rated.length) return null
+  return rated[0].rating ?? null
+}
+
+export function formatUnitPrice(price: number, unit: string): string {
+  return `¥${formatPrice(price)}/${unit}`
 }

@@ -3,9 +3,8 @@ import type { AppState, ReplenishmentItem } from "./types"
 
 const STORAGE_KEY = "household_replenishment_desktop_v1"
 const CARD_STATES_DEMO_KEY = "household_replenishment_card_states_demo_v1"
-const DAY_MS = 24 * 60 * 60 * 1000
 
-function demoItem(name: string, category: string, cycleDays: number, bufferDays: number, elapsedDays: number, orderedDaysAgo?: number): ReplenishmentItem {
+function demoItem(name: string, category: string, cycleDays: number, bufferDays: number, elapsedDays: number): ReplenishmentItem {
   const now = Date.now()
   const lastRestockedAt = new Date(now)
   lastRestockedAt.setDate(lastRestockedAt.getDate() - elapsedDays)
@@ -20,7 +19,6 @@ function demoItem(name: string, category: string, cycleDays: number, bufferDays:
     lastRestockedAt: lastRestockedAt.getTime(),
     anchorEstimated: true,
     history: [],
-    orderedAt: orderedDaysAgo === undefined ? undefined : now - orderedDaysAgo * DAY_MS,
     learningEnabled: true,
     createdAt: now,
     updatedAt: now
@@ -36,11 +34,36 @@ function addCardStateDemoItems(state: AppState): AppState {
   const additions = [
     kitchen && demoItem("食用油", kitchen, 30, 5, 31),
     bathroom && demoItem("洗手液", bathroom, 30, 5, 26),
-    laundry && demoItem("洗衣凝珠", laundry, 32, 5, 29, 1)
+    laundry && demoItem("洗衣凝珠", laundry, 32, 5, 29)
   ].filter((item): item is ReplenishmentItem => Boolean(item))
     .filter((item) => !state.items.some((current) => current.name === item.name && current.category === item.category))
   localStorage.setItem(CARD_STATES_DEMO_KEY, "1")
   return additions.length ? { ...state, items: [...state.items, ...additions], updatedAt: Date.now() } : state
+}
+
+function migrateItem(item: ReplenishmentItem): ReplenishmentItem {
+  const migratedHistory = item.history.map((event) => ({
+    ...event,
+    qty: Number.isFinite(Number(event.qty)) && Number(event.qty) > 0 ? Number(event.qty) : undefined,
+    platform: event.platform || undefined,
+    rating: event.rating || undefined,
+    review: event.review?.trim() || undefined
+  }))
+  return {
+    ...item,
+    type: "learning",
+    bufferDays: Math.min(Math.max(0, Number(item.cycleDays) - 1), Math.max(0, Number(item.bufferDays) || 0)),
+    learningEnabled: item.learningEnabled !== false,
+    orderedAt: Number.isFinite(Number(item.orderedAt)) && Number(item.orderedAt) > 0
+      ? Number(item.orderedAt)
+      : undefined,
+    unit: item.unit?.trim() || undefined,
+    platform: item.platform?.trim() || undefined,
+    defaultQty: Number.isFinite(Number(item.defaultQty)) && Number(item.defaultQty) > 0
+      ? Number(item.defaultQty)
+      : undefined,
+    history: migratedHistory
+  }
 }
 
 export function loadState(): AppState {
@@ -57,15 +80,7 @@ export function loadState(): AppState {
             ? Number(saved.settings.monthlyBudget)
             : undefined
         },
-        items: saved.items.map((item) => ({
-          ...item,
-          type: "learning",
-          bufferDays: Math.min(Math.max(0, Number(item.cycleDays) - 1), Math.max(0, Number(item.bufferDays) || 0)),
-          learningEnabled: item.learningEnabled !== false,
-          orderedAt: Number.isFinite(Number(item.orderedAt)) && Number(item.orderedAt) > 0
-            ? Number(item.orderedAt)
-            : undefined
-        }))
+        items: saved.items.map(migrateItem)
       })
     }
   } catch (error) {
