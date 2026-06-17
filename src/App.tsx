@@ -478,20 +478,28 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
     return (
       <section className="current-section empty-current" aria-labelledby="current-title">
         {upcomingItems.length > 0 ? (
-          <div className="upcoming-cards">
-            {upcomingItems.map(({ item, computed }) => (
-              <div key={item.id} className={`upcoming-card ${computed.status}`}>
-                <button className="upcoming-card-info" onClick={() => onOpenItem(item)}>
-                  <span className={`status-dot ${computed.status}`} />
-                  <span className="upcoming-card-name">{item.name}</span>
-                  <span className="upcoming-card-meta">{computed.remainingText}</span>
-                </button>
-                <div className="upcoming-card-actions">
-                  <button className="upcoming-action-primary" onClick={() => onRestock(item)}>已买好</button>
-                  <button className="upcoming-action" onClick={() => onSnooze(item)}>稍后提醒</button>
+          <div className="current-list">
+            {upcomingItems.map(({ item, computed }) => {
+              const remainingQty = estimateRemainingQty(item)
+              return (
+                <div key={item.id} className="current-card-group">
+                  <article className={`current-card ${computed.status}`}>
+                    <div className="current-card-copy">
+                      <span className={`status-dot ${computed.status}`} />
+                      <span>
+                        <strong>{item.name}</strong>
+                        <small>
+                          {item.category} · {computed.remainingText}
+                          {item.platform && <span className="platform-tag">{item.platform}</span>}
+                          {remainingQty && <span> · {remainingQty}</span>}
+                        </small>
+                      </span>
+                    </div>
+                    <TaskActions item={item} onPurchase={onPurchase} onRestock={onRestock} onSnooze={onSnooze} />
+                  </article>
                 </div>
-              </div>
-            ))}
+              )
+            })}
           </div>
         ) : (
           <p className="all-good-msg">家里的消耗品都很充足，继续保持！</p>

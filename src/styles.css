@@ -116,21 +116,8 @@ main { max-width: 1040px; margin: 24px auto 0; }
 .current-heading > span { color: var(--faint); font-size: var(--text-small); }
 .current-list { display: grid; gap: 12px; }
 
-/* Upcoming item cards (empty / all-good state) */
+/* Empty / all-good state */
 .all-good-msg { margin: 0; color: var(--faint); font-size: var(--text-small); }
-.upcoming-cards { display: flex; flex-direction: column; gap: 8px; }
-.upcoming-card { display: flex; align-items: stretch; background: var(--paper); border: 1px solid var(--line); border-radius: var(--radius-small); overflow: hidden; }
-.upcoming-card.warning { border-color: rgba(183, 122, 34, .3); }
-.upcoming-card.urgent { border-color: rgba(181, 77, 53, .3); }
-.upcoming-card-info { display: flex; align-items: center; gap: 10px; flex: 1; padding: 11px 16px; border: 0; background: transparent; cursor: pointer; text-align: left; transition: background .12s; }
-.upcoming-card-info:hover { background: var(--hover); }
-.upcoming-card-name { flex: 1; font-size: var(--text-small); font-weight: 500; color: var(--ink); }
-.upcoming-card-meta { font-size: 12px; color: var(--faint); flex-shrink: 0; }
-.upcoming-card-actions { display: flex; align-items: stretch; border-left: 1px solid var(--line); flex-shrink: 0; }
-.upcoming-action-primary { padding: 0 16px; font-size: 12px; font-weight: 500; border: 0; background: transparent; color: var(--ink); cursor: pointer; transition: background .12s; white-space: nowrap; }
-.upcoming-action-primary:hover { background: var(--ink); color: #fff; }
-.upcoming-action { padding: 0 16px; font-size: 12px; border: 0; border-left: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; transition: background .12s, color .12s; white-space: nowrap; }
-.upcoming-action:hover { background: var(--hover); color: var(--ink); }
 
 /* Status Pills */
 .status-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
