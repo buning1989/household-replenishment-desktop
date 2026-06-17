@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react"
 import { AnimatedIcon as Icon } from "./AnimatedIcon"
+import catIcon from "./assets/cat-icon.png"
 import {
   calibrateRemainingDays,
   calculateConsumption,
@@ -50,6 +51,8 @@ function App() {
   const [detailItemId, setDetailItemId] = useState<string | null>(null)
   const [recentRestock, setRecentRestock] = useState<RecentRestock | null>(null)
   const [now, setNow] = useState(() => Date.now())
+  // 标题滚动隐入兜底：作为 scroll-timeline 的 JS 兜底，保证标题一定能随滚动消失。
+  const brandTitleRef = useRef<HTMLHeadingElement>(null)
 
   const itemViews = useMemo(() => state.items
     .map((item) => ({ item, computed: computeItem(item, now) }))
@@ -65,6 +68,29 @@ function App() {
       warning: views.filter(({ computed }) => computed.displayStatus === "warning").length
     }
   }), [itemViews, state.categories])
+
+  // 标题滚动隐入兜底：监听窗口滚动，按比例改透明度/位移/模糊。
+  // 与 CSS 的 animation-timeline: scroll() 并存；若 CSS 生效则本逻辑被覆盖，二者无冲突。
+  useEffect(() => {
+    if (!brandTitleRef.current) return
+    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    if (reduce) return
+    let raf = 0
+    const apply = () => {
+      raf = 0
+      const node = brandTitleRef.current
+      if (!node) return
+      const y = window.scrollY
+      const t = Math.min(1, Math.max(0, y / 72))   // 0→72px 完成隐入，与 CSS 区间一致
+      node.style.opacity = String(1 - t)
+      node.style.transform = `translateX(${-12 * t}px)`
+      node.style.filter = t > 0 ? `blur(${(2 * t).toFixed(2)}px)` : "none"
+    }
+    function onScroll() { if (!raf) raf = window.requestAnimationFrame(apply) }
+    apply()
+    window.addEventListener("scroll", onScroll, { passive: true })
+    return () => { window.removeEventListener("scroll", onScroll); if (raf) window.cancelAnimationFrame(raf) }
+  }, [])
 
   useEffect(() => {
     persistState(state)
@@ -290,8 +316,8 @@ function App() {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-block">
-          <div className="brand-mark"><Icon name="bell" size={19} /></div>
-          <h1>403家庭管家</h1>
+          <div className="brand-mark"><img src={catIcon} alt="403家庭管家" className="brand-cat" /></div>
+          <h1 className="brand-title" ref={brandTitleRef}>403家庭管家</h1>
         </div>
         <div className="top-actions">
           <button className="icon-button" aria-label="提醒设置" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button>
@@ -452,29 +478,33 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
     return (
       <section className="current-section empty-current" aria-labelledby="current-title">
         <div className="status-card">
-          <div className="status-card-icon">
-            <Icon name="check" size={18} />
+          <div className="status-card-left">
+            <div className="status-card-check">
+              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+            </div>
+            <div className="status-card-content">
+              <h3>今天不用补货</h3>
+              <p>家里的消耗品都很充足，继续保持！</p>
+            </div>
           </div>
-          <div className="status-card-content">
-            <h3>今天不用补货</h3>
-            <p>家里的消耗品都很充足，继续保持！</p>
-            {upcomingItems.length > 0 && (
-              <div className="status-card-items">
-                <span className="status-card-items-label">接下来要留意</span>
-                {upcomingItems.map(({ item, computed }) => (
-                  <button
-                    key={item.id}
-                    className="status-card-item"
-                    onClick={() => onOpenItem(item)}
-                  >
-                    <span className={`status-dot ${computed.status}`} />
-                    <span className="status-card-item-name">{item.name}</span>
-                    <span className="status-card-item-meta">{computed.remainingText}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
+          {upcomingItems.length > 0 && (
+            <div className="status-card-right">
+              <span className="status-card-items-label">接下来要留意</span>
+              {upcomingItems.map(({ item, computed }) => (
+                <button
+                  key={item.id}
+                  className="status-card-item"
+                  onClick={() => onOpenItem(item)}
+                >
+                  <span className={`status-dot ${computed.status}`} />
+                  <span className="status-card-item-name">{item.name}</span>
+                  <span className="status-card-item-meta">{computed.remainingText}</span>
+                </button>
+              ))}
+            </div>
+          )}
         </div>
       </section>
     )
@@ -764,6 +794,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
   const [ratingEventId, setRatingEventId] = useState<string | null>(null)
   const [ratingItemId, setRatingItemId] = useState<string | null>(null)
   const [ratingDraft, setRatingDraft] = useState<{ rating: Rating | null; review: string }>({ rating: null, review: "" })
+  const [moreOpen, setMoreOpen] = useState(false)
   const urgent = views.filter(({ computed }) => computed.status === "urgent" && computed.isDue).length
   const warning = views.filter(({ computed }) => computed.status === "warning" && computed.isDue).length
 
@@ -819,8 +850,25 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
   return (
     <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <aside className="panel category-panel">
-        <div className="panel-header"><h2>{category}</h2><div className="panel-header-actions"><button className="primary-button" onClick={onAddItem}><Icon name="plus" />添加消耗品</button><button className="text-button" onClick={onRename}>重命名</button><button className="text-button danger" onClick={onDelete}>删除</button><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div></div>
-        <div className="category-summary"><strong>{views.length}</strong><span>项</span>{urgent > 0 && <span className="category-summary-status"><i className="status-dot urgent" />{urgent} 急需</span>}{warning > 0 && <span className="category-summary-status"><i className="status-dot warning" />{warning} 快用完</span>}{views.length > 0 && urgent === 0 && warning === 0 && <span className="category-summary-status"><i className="status-dot" />充足</span>}</div>
+        <div className="panel-header">
+          <div className="panel-header-top">
+            <h2>{category}</h2>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button className="icon-button panel-more-btn" aria-label="更多操作" onClick={() => setMoreOpen(!moreOpen)}><Icon name="more" /></button>
+              <button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button>
+            </div>
+          </div>
+          <div className="panel-header-bottom">
+            <span className="category-summary-text">{views.length} 项</span>
+            <button className="primary-button" onClick={onAddItem}><Icon name="plus" />添加消耗品</button>
+          </div>
+          {moreOpen && (
+            <div className="panel-more-popover">
+              <button onClick={() => { setMoreOpen(false); onRename() }}>重命名</button>
+              <button className="danger" onClick={() => { setMoreOpen(false); onDelete() }}>删除</button>
+            </div>
+          )}
+        </div>
         <div className="category-item-list">
           {views.map(({ item, computed }) => (
             <div key={item.id} className={`category-item-group ${expandedId === item.id ? "is-expanded" : ""}`}>
@@ -1456,12 +1504,14 @@ function SettingsPanel({ state, onChange, onClose }: { state: AppState; onChange
     <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <aside className="panel settings-panel">
         <div className="panel-header"><h2>提醒与预算</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
-        <div className="settings-group"><h3>每月生活预算</h3><div className="input-prefix budget-input"><b>¥</b><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div>
-        <div className="settings-group"><h3>重复提醒间隔</h3><div className="segmented compact"><button className={settings.reminderIntervalMinutes === 30 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 30 })}>30 分钟</button><button className={settings.reminderIntervalMinutes === 60 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 60 })}>60 分钟</button></div></div>
-        <div className="settings-group"><h3>勿扰时段</h3><div className="time-range"><input type="time" value={settings.quietStart} onChange={(event) => patch({ quietStart: event.target.value })} /><span>至</span><input type="time" value={settings.quietEnd} onChange={(event) => patch({ quietEnd: event.target.value })} /></div></div>
-        <div className="settings-group"><h3>空闲后暂停提醒</h3><div className="input-suffix short"><input type="number" min="1" max="30" value={settings.idleThresholdMinutes} onChange={(event) => patch({ idleThresholdMinutes: Number(event.target.value) })} /><b>分钟</b></div></div>
-        <div className="settings-group"><h3>明天几点提醒</h3><div className="input-suffix short"><input type="number" min="0" max="23" value={settings.snoozeUntilHour} onChange={(event) => patch({ snoozeUntilHour: Number(event.target.value) })} /><b>点</b></div></div>
-        <div className="notification-test"><div className="brand-mark"><Icon name="bell" /></div><h3>系统通知</h3><button className="quiet-button" onClick={() => window.desktop?.testNotification()}>发送测试</button></div>
+        <div className="settings-body">
+          <div className="settings-row"><span className="settings-row-label">每月生活预算</span><div className="settings-row-control"><div className="input-prefix budget-input"><b>¥</b><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">重复提醒间隔</span><div className="settings-row-control"><div className="segment-control"><button className={settings.reminderIntervalMinutes === 30 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 30 })}>30 分钟</button><button className={settings.reminderIntervalMinutes === 60 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 60 })}>60 分钟</button></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">勿扰时段</span><div className="settings-row-control"><div className="time-range"><input type="time" value={settings.quietStart} onChange={(event) => patch({ quietStart: event.target.value })} /><span>至</span><input type="time" value={settings.quietEnd} onChange={(event) => patch({ quietEnd: event.target.value })} /></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">空闲后暂停提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="1" max="30" value={settings.idleThresholdMinutes} onChange={(event) => patch({ idleThresholdMinutes: Number(event.target.value) })} /><b>分钟</b></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">明天几点提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="0" max="23" value={settings.snoozeUntilHour} onChange={(event) => patch({ snoozeUntilHour: Number(event.target.value) })} /><b>点</b></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">系统通知</span><div className="settings-row-control"><button className="quiet-button" onClick={() => window.desktop?.testNotification()}>发送测试</button></div></div>
+        </div>
       </aside>
     </div>
   )
