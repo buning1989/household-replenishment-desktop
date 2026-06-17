@@ -492,17 +492,20 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
           {upcomingItems.length > 0 && (
             <div className="status-card-right">
               <span className="status-card-items-label">接下来要留意</span>
-              {upcomingItems.map(({ item, computed }) => (
-                <button
-                  key={item.id}
-                  className="status-card-item"
-                  onClick={() => onOpenItem(item)}
-                >
-                  <span className={`status-dot ${computed.status}`} />
-                  <span className="status-card-item-name">{item.name}</span>
-                  <span className="status-card-item-meta">{computed.remainingText}</span>
-                </button>
-              ))}
+              <div className="upcoming-items">
+                {upcomingItems.map(({ item, computed }) => (
+                  <div key={item.id} className={`upcoming-card ${computed.status}`}>
+                    <button className="upcoming-card-main" onClick={() => onOpenItem(item)}>
+                      <span className={`status-dot ${computed.status}`} />
+                      <span className="upcoming-card-name">{item.name}</span>
+                      <span className="upcoming-card-meta">{computed.remainingText}</span>
+                    </button>
+                    <button className="upcoming-card-restock" title="已买好" onClick={() => onRestock(item)}>
+                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+                    </button>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

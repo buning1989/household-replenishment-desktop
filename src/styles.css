@@ -123,13 +123,20 @@ main { max-width: 1040px; margin: 24px auto 0; }
 .status-card-content { min-width: 0; }
 .status-card-content h3 { margin: 0 0 4px; font-size: var(--text-body); font-weight: 600; color: var(--ink); }
 .status-card-content p { margin: 0; color: var(--muted); font-size: var(--text-small); line-height: 1.5; }
-.status-card-right { display: flex; flex-direction: column; gap: 6px; padding-left: 24px; border-left: 1px solid var(--line); }
-.status-card-items-label { display: block; margin-bottom: 4px; color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; }
-.status-card-item { display: flex; align-items: center; gap: 10px; padding: 6px 0; border: 0; border-radius: 0; background: transparent; cursor: pointer; text-align: left; transition: color .15s ease; }
-.status-card-item:hover .status-card-item-name { color: var(--accent); }
-.status-card-item-name { flex: 1; font-size: var(--text-small); font-weight: 500; color: var(--ink); }
-.status-card-item-meta { color: var(--faint); font-size: var(--text-small); }
-.status-card-item .status-pill { flex-shrink: 0; }
+.status-card-right { display: flex; flex-direction: column; gap: 10px; padding-left: 24px; border-left: 1px solid var(--line); }
+.status-card-items-label { display: block; color: var(--faint); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.upcoming-items { display: flex; flex-wrap: wrap; gap: 8px; }
+.upcoming-card { display: flex; align-items: stretch; border: 1px solid var(--line); border-radius: var(--radius-small); background: var(--paper); overflow: hidden; transition: border-color .15s ease; }
+.upcoming-card:hover { border-color: #C0C0C0; }
+.upcoming-card.warning { border-color: rgba(183, 122, 34, .35); }
+.upcoming-card.urgent { border-color: rgba(181, 77, 53, .35); }
+.upcoming-card-main { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border: 0; background: transparent; cursor: pointer; text-align: left; min-width: 0; }
+.upcoming-card-main:hover { background: var(--hover); }
+.upcoming-card-name { font-size: var(--text-small); font-weight: 500; color: var(--ink); white-space: nowrap; }
+.upcoming-card-meta { color: var(--faint); font-size: 12px; white-space: nowrap; }
+.upcoming-card-restock { display: none; align-items: center; justify-content: center; width: 30px; flex-shrink: 0; border: 0; border-left: 1px solid var(--line); background: transparent; cursor: pointer; color: var(--muted); transition: background .15s, color .15s; }
+.upcoming-card:hover .upcoming-card-restock { display: flex; }
+.upcoming-card-restock:hover { background: var(--ink); color: #fff; border-color: var(--ink); }
 
 /* Status Pills */
 .status-pill { display: inline-flex; align-items: center; gap: 5px; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
