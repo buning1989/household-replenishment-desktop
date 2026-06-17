@@ -473,7 +473,7 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
     // 找出最近需要关注的消耗品（按 dueAt 排序的前 5 个，排除已到期的）
     const upcomingItems = allItems
       .filter(({ computed }) => !computed.isDue)
-      .slice(0, 5)
+      .slice(0, 3)
 
     return (
       <section className="current-section empty-current" aria-labelledby="current-title">
@@ -495,14 +495,17 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
               <div className="upcoming-items">
                 {upcomingItems.map(({ item, computed }) => (
                   <div key={item.id} className={`upcoming-card ${computed.status}`}>
-                    <button className="upcoming-card-main" onClick={() => onOpenItem(item)}>
+                    <button className="upcoming-card-body" onClick={() => onOpenItem(item)}>
                       <span className={`status-dot ${computed.status}`} />
-                      <span className="upcoming-card-name">{item.name}</span>
-                      <span className="upcoming-card-meta">{computed.remainingText}</span>
+                      <div className="upcoming-card-info">
+                        <span className="upcoming-card-name">{item.name}</span>
+                        <span className="upcoming-card-meta">{computed.remainingText}</span>
+                      </div>
                     </button>
-                    <button className="upcoming-card-restock" title="已买好" onClick={() => onRestock(item)}>
-                      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
-                    </button>
+                    <div className="upcoming-card-actions">
+                      <button className="upcoming-action-primary" onClick={() => onRestock(item)}>已买好</button>
+                      <button className="upcoming-action" onClick={() => onSnooze(item)}>稍后提醒</button>
+                    </div>
                   </div>
                 ))}
               </div>
