@@ -473,45 +473,29 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
     // 找出最近需要关注的消耗品（按 dueAt 排序的前 5 个，排除已到期的）
     const upcomingItems = allItems
       .filter(({ computed }) => !computed.isDue)
-      .slice(0, 3)
+      .slice(0, 5)
 
     return (
       <section className="current-section empty-current" aria-labelledby="current-title">
-        <div className="status-card">
-          <div className="status-card-left">
-            <div className="status-card-check">
-              <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="20 6 9 17 4 12" />
-              </svg>
-            </div>
-            <div className="status-card-content">
-              <h3>今天不用补货</h3>
-              <p>家里的消耗品都很充足，继续保持！</p>
-            </div>
-          </div>
-          {upcomingItems.length > 0 && (
-            <div className="status-card-right">
-              <span className="status-card-items-label">接下来要留意</span>
-              <div className="upcoming-items">
-                {upcomingItems.map(({ item, computed }) => (
-                  <div key={item.id} className={`upcoming-card ${computed.status}`}>
-                    <button className="upcoming-card-body" onClick={() => onOpenItem(item)}>
-                      <span className={`status-dot ${computed.status}`} />
-                      <div className="upcoming-card-info">
-                        <span className="upcoming-card-name">{item.name}</span>
-                        <span className="upcoming-card-meta">{computed.remainingText}</span>
-                      </div>
-                    </button>
-                    <div className="upcoming-card-actions">
-                      <button className="upcoming-action-primary" onClick={() => onRestock(item)}>已买好</button>
-                      <button className="upcoming-action" onClick={() => onSnooze(item)}>稍后提醒</button>
-                    </div>
-                  </div>
-                ))}
+        {upcomingItems.length > 0 ? (
+          <div className="upcoming-cards">
+            {upcomingItems.map(({ item, computed }) => (
+              <div key={item.id} className={`upcoming-card ${computed.status}`}>
+                <button className="upcoming-card-info" onClick={() => onOpenItem(item)}>
+                  <span className={`status-dot ${computed.status}`} />
+                  <span className="upcoming-card-name">{item.name}</span>
+                  <span className="upcoming-card-meta">{computed.remainingText}</span>
+                </button>
+                <div className="upcoming-card-actions">
+                  <button className="upcoming-action-primary" onClick={() => onRestock(item)}>已买好</button>
+                  <button className="upcoming-action" onClick={() => onSnooze(item)}>稍后提醒</button>
+                </div>
               </div>
-            </div>
-          )}
-        </div>
+            ))}
+          </div>
+        ) : (
+          <p className="all-good-msg">家里的消耗品都很充足，继续保持！</p>
+        )}
       </section>
     )
   }
