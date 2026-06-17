@@ -51,8 +51,17 @@ function App() {
   const [detailItemId, setDetailItemId] = useState<string | null>(null)
   const [recentRestock, setRecentRestock] = useState<RecentRestock | null>(null)
   const [now, setNow] = useState(() => Date.now())
-  // 标题滚动隐入兜底：作为 scroll-timeline 的 JS 兜底，保证标题一定能随滚动消失。
-  const brandTitleRef = useRef<HTMLHeadingElement>(null)
+  // Panel exit animation states
+  const [categoryPanelClosing, setCategoryPanelClosing] = useState(false)
+  const [detailPanelClosing, setDetailPanelClosing] = useState(false)
+  const [editorClosing, setEditorClosing] = useState(false)
+  const [settingsClosing, setSettingsClosing] = useState(false)
+  const [categoryCreatorClosing, setCategoryCreatorClosing] = useState(false)
+  const [categoryManagerClosing, setCategoryManagerClosing] = useState(false)
+  function deferredClose(setClosing: (v: boolean) => void, actualClose: () => void, delay = 200) {
+    setClosing(true)
+    setTimeout(() => { setClosing(false); actualClose() }, delay)
+  }
 
   const itemViews = useMemo(() => state.items
     .map((item) => ({ item, computed: computeItem(item, now) }))
@@ -68,29 +77,6 @@ function App() {
       warning: views.filter(({ computed }) => computed.displayStatus === "warning").length
     }
   }), [itemViews, state.categories])
-
-  // 标题滚动隐入兜底：监听窗口滚动，按比例改透明度/位移/模糊。
-  // 与 CSS 的 animation-timeline: scroll() 并存；若 CSS 生效则本逻辑被覆盖，二者无冲突。
-  useEffect(() => {
-    if (!brandTitleRef.current) return
-    const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches
-    if (reduce) return
-    let raf = 0
-    const apply = () => {
-      raf = 0
-      const node = brandTitleRef.current
-      if (!node) return
-      const y = window.scrollY
-      const t = Math.min(1, Math.max(0, y / 72))   // 0→72px 完成隐入，与 CSS 区间一致
-      node.style.opacity = String(1 - t)
-      node.style.transform = `translateX(${-12 * t}px)`
-      node.style.filter = t > 0 ? `blur(${(2 * t).toFixed(2)}px)` : "none"
-    }
-    function onScroll() { if (!raf) raf = window.requestAnimationFrame(apply) }
-    apply()
-    window.addEventListener("scroll", onScroll, { passive: true })
-    return () => { window.removeEventListener("scroll", onScroll); if (raf) window.cancelAnimationFrame(raf) }
-  }, [])
 
   useEffect(() => {
     persistState(state)
@@ -119,14 +105,13 @@ function App() {
     function closeTopPanel(event: KeyboardEvent) {
       if (event.key !== "Escape") return
       if (categoryDialog) setCategoryDialog(null)
-      else if (detailItemId) setDetailItemId(null)
-      else if (settingsOpen) setSettingsOpen(false)
+      else if (detailItemId) deferredClose(setDetailPanelClosing, () => setDetailItemId(null))
+      else if (settingsOpen) deferredClose(setSettingsClosing, () => setSettingsOpen(false))
       else if (editingItem !== undefined) {
-        setEditingItem(undefined)
-        setNewItemCategory(undefined)
+        deferredClose(setEditorClosing, () => { setEditingItem(undefined); setNewItemCategory(undefined) })
       }
-      else if (categoryCreatorOpen) setCategoryCreatorOpen(false)
-      else if (activeCategory) setActiveCategory(null)
+      else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
+      else if (activeCategory) deferredClose(setCategoryPanelClosing, () => setActiveCategory(null))
     }
     window.addEventListener("keydown", closeTopPanel)
     return () => window.removeEventListener("keydown", closeTopPanel)
@@ -291,12 +276,6 @@ function App() {
     }))
   }
 
-  async function openPurchase(item: ReplenishmentItem) {
-    if (!item.link) return
-    if (window.desktop) await window.desktop.openExternal(item.link)
-    else window.open(item.link, "_blank", "noopener,noreferrer")
-  }
-
   function openItem(item: ReplenishmentItem) {
     setDetailItemId(item.id)
   }
@@ -314,11 +293,8 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-block">
-          <div className="brand-mark"><img src={catIcon} alt="403家庭管家" className="brand-cat" /></div>
-          <h1 className="brand-title" ref={brandTitleRef}>403家庭管家</h1>
-        </div>
+      <header className="top-row">
+        <div className="brand-mark"><img src={catIcon} alt="403家庭管家" className="brand-cat" /></div>
         <div className="top-actions">
           <button className="icon-button" aria-label="提醒设置" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button>
         </div>
@@ -329,7 +305,7 @@ function App() {
           items={dueItems}
           recentRestock={recentRestock}
           allItems={itemViews}
-          onPurchase={openPurchase}
+          snoozeUntilHour={state.settings.snoozeUntilHour}
           onRestock={handleRestock}
           onSnooze={handleSnooze}
           onUpdateRestock={(patch) => setRecentRestock((current) => current ? { ...current, ...patch } : current)}
@@ -347,22 +323,22 @@ function App() {
             <div className="category-heading-actions"><span>{state.categories.length} 组</span><button onClick={() => setCategoryCreatorOpen(true)}><Icon name="plus" size={15} />新建分类</button></div>
           </div>
           <div className="category-grid">
-            {categorySummaries.map((summary) => <CategoryCard key={summary.category} {...summary} onOpen={() => setActiveCategory(summary.category)} onRename={(name) => renameCategory(summary.category, name)} onDelete={() => deleteCategory(summary.category)} />)}
+            {categorySummaries.map((summary, i) => <CategoryCard key={summary.category} index={i} {...summary} onOpen={() => setActiveCategory(summary.category)} onRename={(name) => renameCategory(summary.category, name)} onDelete={() => deleteCategory(summary.category)} />)}
           </div>
         </section>
       </main>
 
-      {activeCategory && (
+      {(activeCategory || categoryPanelClosing) && (
         <CategoryPanel
-          category={activeCategory}
+          category={activeCategory || ""}
           views={itemViews.filter(({ item }) => item.category === activeCategory)}
-          onClose={() => setActiveCategory(null)}
-          onAddItem={() => addItemToCategory(activeCategory)}
-          onRename={() => setCategoryDialog("rename")}
-          onDelete={() => setCategoryDialog("delete")}
+          isClosing={categoryPanelClosing}
+          onClose={() => deferredClose(setCategoryPanelClosing, () => setActiveCategory(null))}
+          onAddItem={() => addItemToCategory(activeCategory || "")}
           onEdit={editFromDetail}
+          onDeleteItem={deleteItem}
           onSnooze={handleSnooze}
-          onPurchase={openPurchase}
+          
           onRestock={handleRestock}
           onQuickEdit={quickEditItem}
           onApplySuggestion={applyCycleSuggestion}
@@ -370,15 +346,16 @@ function App() {
           onRateEvent={rateRestockEvent}
         />
       )}
-      {detailItem && (
+      {(detailItem || detailPanelClosing) && detailItem && (
         <ItemDetailPanel
           key={detailItem.id}
           item={detailItem}
           computed={computeItem(detailItem, now)}
-          onClose={() => setDetailItemId(null)}
+          isClosing={detailPanelClosing}
+          onClose={() => deferredClose(setDetailPanelClosing, () => setDetailItemId(null))}
           onEdit={editFromDetail}
           onSnooze={handleSnooze}
-          onPurchase={openPurchase}
+          
           onRestock={handleRestock}
           onCalibrate={calibrateItem}
           onApplySuggestion={applyCycleSuggestion}
@@ -386,28 +363,29 @@ function App() {
           onRateEvent={rateRestockEvent}
         />
       )}
-      {editingItem !== undefined && (
-        <ItemEditor item={editingItem} initialCategory={newItemCategory} categories={state.categories} onAddCategory={addCategory} onClose={() => {
+      {(editingItem !== undefined || editorClosing) && (
+        <ItemEditor item={editingItem ?? null} initialCategory={newItemCategory} categories={state.categories} onAddCategory={addCategory} isClosing={editorClosing} onClose={() => deferredClose(setEditorClosing, () => {
           setEditingItem(undefined)
           setNewItemCategory(undefined)
-        }} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
+        })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
-      {settingsOpen && <SettingsPanel state={state} onChange={commit} onClose={() => setSettingsOpen(false)} />}
-      {categoryCreatorOpen && <CategoryCreator existingCategories={state.categories} onClose={() => setCategoryCreatorOpen(false)} onCreate={(name) => {
+      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
+      {(categoryCreatorOpen || categoryCreatorClosing) && <CategoryCreator existingCategories={state.categories} isClosing={categoryCreatorClosing} onClose={() => deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)} onCreate={(name) => {
         const category = addCategory(name)
         if (!category) return false
         setCategoryCreatorOpen(false)
         return true
       }} />}
-      {activeCategory && categoryDialog && <CategoryManagerDialog mode={categoryDialog} category={activeCategory} categories={state.categories} itemCount={state.items.filter((item) => item.category === activeCategory).length} onClose={() => setCategoryDialog(null)} onRename={(name) => renameCategory(activeCategory, name)} onDelete={(moveTo) => deleteCategory(activeCategory, moveTo)} />}
+      {activeCategory && categoryDialog && <CategoryManagerDialog mode={categoryDialog} category={activeCategory} categories={state.categories} itemCount={state.items.filter((item) => item.category === activeCategory).length} isClosing={categoryManagerClosing} onClose={() => deferredClose(setCategoryManagerClosing, () => setCategoryDialog(null), 150)} onRename={(name) => renameCategory(activeCategory, name)} onDelete={(moveTo) => deleteCategory(activeCategory, moveTo)} />}
     </div>
   )
 }
 
-function CategoryCreator({ existingCategories, onClose, onCreate }: {
+function CategoryCreator({ existingCategories, onClose, onCreate, isClosing }: {
   existingCategories: string[]
   onClose: () => void
   onCreate: (name: string) => boolean
+  isClosing?: boolean
 }) {
   const [name, setName] = useState("")
   const normalized = name.trim()
@@ -420,13 +398,13 @@ function CategoryCreator({ existingCategories, onClose, onCreate }: {
   }
 
   return (
-    <div className="overlay category-creator-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <form className="category-creator" onSubmit={submit}>
+    <div className={`overlay category-creator-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <form className={`category-creator ${isClosing ? "is-closing" : ""}`} onSubmit={submit}>
         <div className="category-creator-header">
           <h2>添加分类</h2>
           <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button>
         </div>
-        <label className="field"><span>分类名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：宝宝用品" /></label>
+        <label className="field"><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：宝宝用品" /></label>
         {duplicated && <p className="category-creator-tip error">这个分类已经有了</p>}
         <div className="category-creator-actions"><button type="button" className="quiet-button" onClick={onClose}>取消</button><button type="submit" className="primary-button" disabled={!normalized || duplicated}>添加</button></div>
       </form>
@@ -436,28 +414,33 @@ function CategoryCreator({ existingCategories, onClose, onCreate }: {
 
 type ItemView = { item: ReplenishmentItem; computed: ItemComputed }
 
-function TaskActions({ item, onPurchase, onRestock, onSnooze }: {
+function TaskActions({ item, onRestock, onUndo, isExpanded }: {
   item: ReplenishmentItem
-  onPurchase: (item: ReplenishmentItem) => void
   onRestock: (item: ReplenishmentItem) => void
-  onSnooze: (item: ReplenishmentItem) => void
+  onUndo?: () => void
+  isExpanded?: boolean
 }) {
   const latestRating = getLatestRating(item)
+  if (isExpanded && onUndo) {
+    return (
+      <div className="task-actions">
+        <button className="task-action collapse" onClick={onUndo}>收起</button>
+      </div>
+    )
+  }
   return (
     <div className="task-actions">
       {latestRating === 1 && <span className="rating-warning" title="上次评价较差">⚠ 上次较差</span>}
-      <button className="task-action purchase" disabled={!item.link} title={item.link ? undefined : "可在分类中添加常买链接"} onClick={() => onPurchase(item)}><Icon name="cart" />去补货</button>
-      <button className="task-action done" onClick={() => onRestock(item)}><Icon name="check" />已买好</button>
-      <button className="task-action" onClick={() => onSnooze(item)}><Icon name="clock" />明天提醒我</button>
+      <button className="task-action done" onClick={() => onRestock(item)}>补货</button>
     </div>
   )
 }
 
-function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, onSnooze, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem }: {
+function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onRestock, onSnooze, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem }: {
   items: ItemView[]
   recentRestock: RecentRestock | null
   allItems: ItemView[]
-  onPurchase: (item: ReplenishmentItem) => void
+  snoozeUntilHour: number
   onRestock: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
   onUpdateRestock: (patch: Partial<RecentRestock>) => void
@@ -468,106 +451,86 @@ function CurrentTasks({ items, recentRestock, allItems, onPurchase, onRestock, o
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onOpenItem: (item: ReplenishmentItem) => void
 }) {
-  // 没有待处理事项时，展示更有意义的空状态
-  if (!items.length) {
-    // 找出最近需要关注的消耗品（按 dueAt 排序的前 5 个，排除已到期的）
-    const upcomingItems = allItems
-      .filter(({ computed }) => !computed.isDue)
-      .slice(0, 5)
+  const [snoozedMap, setSnoozedMap] = useState<Map<string, number>>(new Map())
 
-    return (
-      <section className="current-section empty-current" aria-labelledby="current-title">
-        {upcomingItems.length > 0 ? (
-          <div className="current-list">
-            {upcomingItems.map(({ item, computed }) => {
-              const remainingQty = estimateRemainingQty(item)
-              return (
-                <div key={item.id} className="current-card-group">
-                  <article className={`current-card ${computed.status}`}>
-                    <div className="current-card-copy">
-                      <span className={`status-dot ${computed.status}`} />
-                      <span>
-                        <strong>{item.name}</strong>
-                        <small>
-                          {item.category} · {computed.remainingText}
-                          {item.platform && <span className="platform-tag">{item.platform}</span>}
-                          {remainingQty && <span> · {remainingQty}</span>}
-                        </small>
-                      </span>
-                    </div>
-                    <TaskActions item={item} onPurchase={onPurchase} onRestock={onRestock} onSnooze={onSnooze} />
-                  </article>
-                </div>
-              )
-            })}
-          </div>
-        ) : (
-          <p className="all-good-msg">家里的消耗品都很充足，继续保持！</p>
-        )}
-      </section>
-    )
+  function handleSnoozeWithFeedback(item: ReplenishmentItem) {
+    onSnooze(item)
+    const hour = snoozeUntilHour || 9
+    setSnoozedMap(prev => new Map(prev).set(item.id, hour))
+    setTimeout(() => {
+      setSnoozedMap(prev => { const next = new Map(prev); next.delete(item.id); return next })
+    }, 2000)
   }
 
   const restockItem = recentRestock ? items.find(({ item }) => item.id === recentRestock.itemId) : null
 
+  const hasAny = items.length > 0
+
   return (
     <section className="current-section" aria-labelledby="current-title">
-      <div className="current-heading"><h2 id="current-title">当前待处理</h2><span>{items.length} 项</span></div>
-      <div className="current-list">
-        {items.map(({ item, computed }) => {
-          const remainingQty = estimateRemainingQty(item)
-          const latestRating = getLatestRating(item)
-          return (
-            <div key={item.id} className="current-card-group">
-              <article className={`current-card ${computed.status}`}>
-                <div className="current-card-copy">
-                  <span className={`status-dot ${computed.status}`} />
-                  <span>
-                    <strong>{item.name}</strong>
-                    <small>
-                      {item.category} · {computed.remainingText}
-                      {item.platform && <span className="platform-tag">{item.platform}</span>}
-                      {remainingQty && <span> · {remainingQty}</span>}
-                    </small>
-                  </span>
-                </div>
-                <TaskActions item={item} onPurchase={onPurchase} onRestock={onRestock} onSnooze={onSnooze} />
-              </article>
-              {recentRestock && item.id === recentRestock.itemId && restockItem && (
-                <RestockReceiptInline
-                  recentRestock={recentRestock}
-                  item={restockItem.item}
-                  computed={restockItem.computed}
-                  onUpdate={onUpdateRestock}
-                  onSave={onSaveRestock}
-                  onUndo={onUndoRestock}
-                  onDismiss={onDismissRestock}
-                  onApplySuggestion={onApplySuggestion}
-                  onDismissSuggestion={onDismissSuggestion}
-                />
-              )}
-            </div>
-          )
-        })}
-      </div>
+      {hasAny && (
+        <div className="current-heading"><h2 id="current-title">当前待处理</h2><span>{items.length > 0 ? `${items.length} 项` : ""}</span></div>
+      )}
+
+      {items.length > 0 && (
+        <div className="current-list">
+          {items.map(({ item, computed }, i) => {
+            const remainingQty = estimateRemainingQty(item)
+            const snoozeHour = snoozedMap.get(item.id)
+            return (
+              <div key={item.id} className="current-card-group" style={{ "--index": i } as React.CSSProperties}>
+                <article className={`current-card ${computed.status}`}>
+                  <div className="current-card-copy">
+                    <span className={`status-dot ${computed.status}`} />
+                    <span>
+                      <strong>{item.name}</strong>
+                      <small>
+                        {item.category} · {computed.remainingText}
+                        {remainingQty && <span> · {remainingQty}</span>}
+                      </small>
+                    </span>
+                  </div>
+                  <button className={`task-snooze-link ${snoozeHour ? "is-snoozed" : ""}`} onClick={() => handleSnoozeWithFeedback(item)}>{snoozeHour ? `已推迟到 ${snoozeHour} 点` : "稍后提醒"}</button>
+                  <TaskActions item={item} onRestock={onRestock} isExpanded={recentRestock?.itemId === item.id} onUndo={recentRestock?.itemId === item.id ? onUndoRestock : undefined} />
+                </article>
+                {recentRestock && item.id === recentRestock.itemId && restockItem && (
+                  <RestockReceiptInline
+                    recentRestock={recentRestock}
+                    item={restockItem.item}
+                    computed={restockItem.computed}
+                    onUpdate={onUpdateRestock}
+                    onSave={onSaveRestock}
+                    onApplySuggestion={onApplySuggestion}
+                    onDismissSuggestion={onDismissSuggestion}
+                  />
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {!hasAny && (
+        <div className="all-good-msg">
+          <Icon name="check" size={32} />
+          <span>家里的消耗品都很充足，继续保持！</span>
+        </div>
+      )}
     </section>
   )
 }
 
-function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave, onUndo, onDismiss, onApplySuggestion, onDismissSuggestion }: {
+function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave, onApplySuggestion, onDismissSuggestion }: {
   recentRestock: RecentRestock
   item: ReplenishmentItem
   computed: ItemComputed
   onUpdate: (patch: Partial<RecentRestock>) => void
   onSave: () => void
-  onUndo: () => void
-  onDismiss: () => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
 }) {
   const priceAnchor = calculatePriceAnchor(item.history)
   const unit = item.unit || "件"
-  const showOtherPlatform = recentRestock.platform === "其他"
 
   // 计算当前单价和比价提示
   const currentPrice = recentRestock.amount ? Number(recentRestock.amount) : 0
@@ -601,21 +564,19 @@ function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave,
         <div className="restock-inline-field">
           <span>购买数量</span>
           <div className="input-suffix">
-            <input aria-label="购买数量" type="number" min="1" value={recentRestock.qty} onChange={(event) => onUpdate({ qty: event.target.value })} placeholder="选填" />
+            <input aria-label="购买数量" type="number" min="1" value={recentRestock.qty} onChange={(event) => onUpdate({ qty: event.target.value })} placeholder={item.defaultQty ? String(item.defaultQty) : "选填"} />
             <b>{unit}</b>
           </div>
         </div>
         <div className="restock-inline-field">
           <span>购买平台</span>
           <select value={recentRestock.platform} onChange={(event) => onUpdate({ platform: event.target.value, customPlatform: "" })}>
-            <option value="">未选择</option>
+            <option value="">选填</option>
             {platforms.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
-          {showOtherPlatform && <input type="text" value={recentRestock.customPlatform} onChange={(event) => onUpdate({ customPlatform: event.target.value })} placeholder="输入平台名称" />}
-        </div>
-        <div className="restock-inline-field">
-          <span>购买链接</span>
-          <input className="restock-inline-link" type="url" value={recentRestock.linkDraft} onChange={(event) => onUpdate({ linkDraft: event.target.value })} placeholder="选填" />
+          {recentRestock.platform === "其他" && (
+            <input type="text" value={recentRestock.customPlatform} onChange={(event) => onUpdate({ customPlatform: event.target.value })} placeholder="输入平台名称" />
+          )}
         </div>
       </div>
       {priceHint && <div className={`price-comparison ${priceHint.tone}`}>{priceHint.text}</div>}
@@ -627,19 +588,18 @@ function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave,
         </div>
       )}
       <div className="restock-inline-actions">
-        <button className="receipt-undo" onClick={onUndo}>撤销</button>
-        <button className="primary-button compact" onClick={onSave}>记下</button>
-        <button className="quiet-button compact" onClick={onDismiss}>跳过</button>
+        <button className="primary-button compact" onClick={onSave}>确认</button>
       </div>
     </div>
   )
 }
 
-function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDelete }: {
+function CategoryCard({ category, views, urgent, warning, index = 0, onOpen, onRename, onDelete }: {
   category: string
   views: ItemView[]
   urgent: number
   warning: number
+  index?: number
   onOpen: () => void
   onRename: (name: string) => void
   onDelete: () => void
@@ -649,8 +609,10 @@ function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDe
   const [nameValue, setNameValue] = useState(category)
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [popoverAlign, setPopoverAlign] = useState<"right" | "left">("right")
+  const [popoverTop, setPopoverTop] = useState<number | null>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const cardRef = useRef<HTMLDivElement>(null)
+  const editBtnRef = useRef<HTMLSpanElement>(null)
 
   // 计算最近到期的消耗品（按 dueAt 排序取第一个）
   const nextDue = views.length > 0
@@ -676,6 +638,14 @@ function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDe
       const rightEdge = cardRect.right - 8
       const viewportWidth = window.innerWidth
       setPopoverAlign(rightEdge - popoverWidth < 0 ? "left" : "right")
+    }
+    // Position popover just below the edit button instead of below the card
+    if (editBtnRef.current && cardRef.current) {
+      const btnRect = editBtnRef.current.getBoundingClientRect()
+      const wrapRect = cardRef.current.getBoundingClientRect()
+      setPopoverTop(btnRect.bottom - wrapRect.top + 4)
+    } else {
+      setPopoverTop(null)
     }
     setPopoverOpen(true)
     setEditingName(false)
@@ -718,17 +688,17 @@ function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDe
   }, [popoverOpen])
 
   return (
-    <div className="category-card-wrap" ref={cardRef}>
-      <button className={`category-card ${popoverOpen ? "is-active" : ""}`} onClick={onOpen}>
+    <div className="category-card-wrap" ref={cardRef} style={{ "--index": index } as React.CSSProperties}>
+      <button className={`category-card ${popoverOpen ? "is-active" : ""} ${signal.tone === "urgent" ? "has-urgent" : ""}`} onClick={onOpen}>
         <span className="category-card-top">
           <strong className="category-card-title">{category}</strong>
           <span className="category-card-actions">
+            <span className="category-card-edit" ref={editBtnRef} onClick={openPopover}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg></span>
             <span className="category-card-count">{views.length} 项</span>
-            <span className="category-card-edit" onClick={openPopover}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 20h9" /><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" /></svg></span>
           </span>
         </span>
         <span className="category-card-bottom">
-          <span className="category-card-signal">
+          <span className={`category-card-signal ${signal.tone}`}>
             <span className={`status-dot ${signal.tone}`} />
             <strong>{signal.label}</strong>
           </span>
@@ -740,7 +710,7 @@ function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDe
         </span>
       </button>
       {popoverOpen && (
-        <div className={`category-card-popover ${popoverAlign}`} onClick={(e) => e.stopPropagation()} ref={popoverRef}>
+        <div className={`category-card-popover ${popoverAlign}`} onClick={(e) => e.stopPropagation()} ref={popoverRef} style={popoverTop != null ? { top: popoverTop } : undefined}>
           {confirmDelete ? (
             <div className="category-card-confirm">
               <p>该分类下还有消耗品，确认删除？</p>
@@ -769,21 +739,20 @@ function CategoryCard({ category, views, urgent, warning, onOpen, onRename, onDe
   )
 }
 
-function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete, onEdit, onSnooze, onPurchase, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent }: {
+function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteItem, onSnooze, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent, isClosing }: {
   category: string
   views: ItemView[]
   onClose: () => void
   onAddItem: () => void
-  onRename: () => void
-  onDelete: () => void
   onEdit: (item: ReplenishmentItem) => void
+  onDeleteItem?: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
-  onPurchase: (item: ReplenishmentItem) => void
   onRestock: (item: ReplenishmentItem) => void
   onQuickEdit: (item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform">>) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onRateEvent: (itemId: string, eventId: string, rating: Rating, review?: string) => void
+  isClosing?: boolean
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
   const [editingField, setEditingField] = useState<{ id: string; field: "cycleDays" | "bufferDays" | "link" | "defaultQty" | "unit" | "platform" } | null>(null)
@@ -792,9 +761,24 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
   const [ratingEventId, setRatingEventId] = useState<string | null>(null)
   const [ratingItemId, setRatingItemId] = useState<string | null>(null)
   const [ratingDraft, setRatingDraft] = useState<{ rating: Rating | null; review: string }>({ rating: null, review: "" })
-  const [moreOpen, setMoreOpen] = useState(false)
+  const [itemDeleteId, setItemDeleteId] = useState<string | null>(null)
+  const [savedFieldKey, setSavedFieldKey] = useState<string | null>(null)
   const urgent = views.filter(({ computed }) => computed.status === "urgent" && computed.isDue).length
   const warning = views.filter(({ computed }) => computed.status === "warning" && computed.isDue).length
+
+  // Escape key to collapse expanded item
+  useEffect(() => {
+    if (expandedId === null) return
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setExpandedId(null)
+        setEditingField(null)
+        setItemDeleteId(null)
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown)
+    return () => document.removeEventListener("keydown", handleKeyDown)
+  }, [expandedId])
 
   function toggleExpand(item: ReplenishmentItem, computed: ItemComputed) {
     if (expandedId === item.id) {
@@ -813,10 +797,16 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
     setEditValue(String(currentValue))
   }
 
+  function flashSaved(key: string) {
+    setSavedFieldKey(key)
+    setTimeout(() => setSavedFieldKey(null), 1200)
+  }
+
   function saveEditing(item: ReplenishmentItem) {
     if (!editingField) return
     if (editingField.field === "link") {
       onQuickEdit(item, { link: editValue || undefined })
+      flashSaved(`${item.id}-link`)
       setEditingField(null)
       return
     }
@@ -824,6 +814,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
       const trimmed = editValue.trim()
       const num = Number(trimmed)
       onQuickEdit(item, { defaultQty: trimmed && Number.isFinite(num) && num > 0 ? Math.round(num) : undefined })
+      flashSaved(`${item.id}-defaultQty`)
       setEditingField(null)
       return
     }
@@ -831,8 +822,10 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
     if (isNaN(num) || num < 1) { setEditingField(null); return }
     if (editingField.field === "cycleDays") {
       onQuickEdit(item, { cycleDays: Math.max(1, num) })
+      flashSaved(`${item.id}-cycleDays`)
     } else {
       onQuickEdit(item, { bufferDays: Math.max(0, num) })
+      flashSaved(`${item.id}-bufferDays`)
     }
     setEditingField(null)
   }
@@ -846,26 +839,17 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
   }
 
   return (
-    <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="panel category-panel">
+    <div className={`overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside className={`panel category-panel ${isClosing ? "is-closing" : ""}`}>
         <div className="panel-header">
           <div className="panel-header-top">
             <h2>{category}</h2>
-            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <button className="icon-button panel-more-btn" aria-label="更多操作" onClick={() => setMoreOpen(!moreOpen)}><Icon name="more" /></button>
-              <button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button>
-            </div>
+            <button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button>
           </div>
           <div className="panel-header-bottom">
             <span className="category-summary-text">{views.length} 项</span>
-            <button className="primary-button" onClick={onAddItem}><Icon name="plus" />添加消耗品</button>
+            <button className="primary-button green" onClick={onAddItem}>添加</button>
           </div>
-          {moreOpen && (
-            <div className="panel-more-popover">
-              <button onClick={() => { setMoreOpen(false); onRename() }}>重命名</button>
-              <button className="danger" onClick={() => { setMoreOpen(false); onDelete() }}>删除</button>
-            </div>
-          )}
         </div>
         <div className="category-item-list">
           {views.map(({ item, computed }) => (
@@ -874,13 +858,13 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                 <span className={`status-dot ${computed.displayStatus}`} />
                 <span className="category-item-copy"><strong>{item.name}</strong><small>{computed.remainingText}</small></span>
                 <span className={`status-label ${computed.displayStatus}`}>{computed.statusLabel}</span>
-                <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M9 18l6-6-6-6" /></svg></span>
+                <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
               </button>
               {expandedId === item.id && (
                 <div className="category-item-detail">
                   {computed.status !== "normal" && (
                     <div className="category-detail-actions">
-                      <TaskActions item={item} onPurchase={onPurchase} onRestock={onRestock} onSnooze={onSnooze} />
+                      <TaskActions item={item} onRestock={onRestock} />
                     </div>
                   )}
                   <div className="detail-facts-bar">
@@ -893,6 +877,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                       ) : (
                         <button className="detail-fact-edit" onClick={() => startEditing(item.id, "cycleDays", item.cycleDays)}><strong>约 {item.cycleDays} 天</strong><Icon name="edit" size={13} /></button>
                       )}
+                      {savedFieldKey === `${item.id}-cycleDays` && <small style={{ color: "var(--signal-normal)", fontSize: 11 }}>已保存</small>}
                     </div>
                     <div className="detail-fact">
                       <span>提前提醒</span>
@@ -903,6 +888,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                       ) : (
                         <button className="detail-fact-edit" onClick={() => startEditing(item.id, "bufferDays", item.bufferDays)}><strong>{item.bufferDays} 天</strong><Icon name="edit" size={13} /></button>
                       )}
+                      {savedFieldKey === `${item.id}-bufferDays` && <small style={{ color: "var(--signal-normal)", fontSize: 11 }}>已保存</small>}
                     </div>
                     <div className="detail-fact">
                       <span>上次补货</span>
@@ -910,7 +896,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                     </div>
                   </div>
                   <div className="detail-purchase-info">
-                    <h3 className="detail-section-title">购买信息</h3>
+                    <h3 className="detail-section-title">补货设置</h3>
                     <div className="detail-link-row">
                       <span className="detail-link-label">计量单位</span>
                       {(() => {
@@ -946,22 +932,6 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                       ) : (
                         <button className="detail-link-value" onClick={() => startEditing(item.id, "defaultQty", item.defaultQty ? String(item.defaultQty) : "")}>
                           {item.defaultQty ? <span className="detail-link-text">{item.defaultQty} {item.unit || "件"}</span> : <span className="detail-link-empty">未设置，点击添加</span>}
-                          <Icon name="edit" size={13} />
-                        </button>
-                      )}
-                    </div>
-                    <div className="detail-link-row">
-                      <span className="detail-link-label">常买平台</span>
-                      {editingField?.id === item.id && editingField.field === "platform" ? (
-                        <div className="inline-edit inline-edit-wide">
-                          <select autoFocus value={editValue} onChange={(e) => { const v = e.target.value; onQuickEdit(item, { platform: v || undefined }); setEditingField(null) }} onBlur={() => setEditingField(null)}>
-                            <option value="">未选择</option>
-                            {platforms.map((p) => <option key={p} value={p}>{p}</option>)}
-                          </select>
-                        </div>
-                      ) : (
-                        <button className="detail-link-value" onClick={() => { setEditingField({ id: item.id, field: "platform" }); setEditValue(item.platform || "") }}>
-                          {item.platform ? <span className="detail-link-text">{item.platform}</span> : <span className="detail-link-empty">未设置，点击添加</span>}
                           <Icon name="edit" size={13} />
                         </button>
                       )}
@@ -1005,19 +975,6 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                       })}
                     </div>
                   )}
-                  <div className="detail-link-row">
-                    <span className="detail-link-label">商品链接</span>
-                    {editingField?.id === item.id && editingField.field === "link" ? (
-                      <div className="inline-edit inline-edit-wide">
-                        <input autoFocus type="url" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={() => saveEditing(item)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveEditing(item) } if (e.key === "Escape") setEditingField(null) }} placeholder="https://" />
-                      </div>
-                    ) : (
-                      <button className="detail-link-value" onClick={() => startEditing(item.id, "link", item.link || "")}>
-                        {item.link ? <span className="detail-link-text">{item.link}</span> : <span className="detail-link-empty">未设置，点击添加</span>}
-                        <Icon name="edit" size={13} />
-                      </button>
-                    )}
-                  </div>
                   {item.suggestedCycleDays && (
                     <div className="suggestion">
                       <span>最近几次大约每 {item.suggestedCycleDays} 天补一次，要把原来的 {item.cycleDays} 天改掉吗？</span>
@@ -1025,18 +982,32 @@ function CategoryPanel({ category, views, onClose, onAddItem, onRename, onDelete
                       <button className="text-button" onClick={() => onDismissSuggestion(item)}>暂不</button>
                     </div>
                   )}
+                  <div className="item-action-row">
+                    <button className="text-button" onClick={() => onEdit(item)}>编辑名称与设置</button>
+                    {onDeleteItem && (
+                      itemDeleteId === item.id ? (
+                        <div className="item-delete-confirm">
+                          <span>确认删除？</span>
+                          <button className="text-button" onClick={() => setItemDeleteId(null)}>取消</button>
+                          <button className="text-button danger" onClick={() => { onDeleteItem(item); setItemDeleteId(null); setExpandedId(null) }}>确认删除</button>
+                        </div>
+                      ) : (
+                        <button className="text-button danger" onClick={() => setItemDeleteId(item.id)}>删除</button>
+                      )
+                    )}
+                  </div>
                 </div>
               )}
             </div>
           ))}
-          {!views.length && <div className="empty-category">这个分类还没有记录</div>}
+          {!views.length && <div className="empty-category"><p style={{ margin: "0 0 6px" }}>这个分类还没有记录</p><p style={{ margin: 0, fontSize: "var(--text-small)" }}>点击上方「添加」开始记录</p></div>}
         </div>
       </aside>
     </div>
   )
 }
 
-function CategoryManagerDialog({ mode, category, categories, itemCount, onClose, onRename, onDelete }: {
+function CategoryManagerDialog({ mode, category, categories, itemCount, onClose, onRename, onDelete, isClosing }: {
   mode: "rename" | "delete"
   category: string
   categories: string[]
@@ -1044,6 +1015,7 @@ function CategoryManagerDialog({ mode, category, categories, itemCount, onClose,
   onClose: () => void
   onRename: (name: string) => void
   onDelete: (moveTo?: string) => void
+  isClosing?: boolean
 }) {
   const [name, setName] = useState(category)
   const moveTargets = categories.filter((name) => name !== category)
@@ -1059,8 +1031,8 @@ function CategoryManagerDialog({ mode, category, categories, itemCount, onClose,
   }
 
   return (
-    <div className="overlay category-manager-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="category-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="category-manager-title">
+    <div className={`overlay category-manager-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className={`category-manager-dialog ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="category-manager-title">
         <div className="category-creator-header"><h2 id="category-manager-title">{mode === "rename" ? "修改分类名称" : `删除"${category}"`}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
         {mode === "rename" ? (
           <form onSubmit={submitRename}>
@@ -1089,18 +1061,18 @@ function CategoryManagerDialog({ mode, category, categories, itemCount, onClose,
   )
 }
 
-function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onPurchase, onRestock, onCalibrate, onApplySuggestion, onDismissSuggestion, onRateEvent }: {
+function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock, onCalibrate, onApplySuggestion, onDismissSuggestion, onRateEvent, isClosing }: {
   item: ReplenishmentItem
   computed: ItemComputed
   onClose: () => void
   onEdit: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
-  onPurchase: (item: ReplenishmentItem) => void
   onRestock: (item: ReplenishmentItem) => void
   onCalibrate: (item: ReplenishmentItem, remainingDays: number) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onRateEvent: (itemId: string, eventId: string, rating: Rating, review?: string) => void
+  isClosing?: boolean
 }) {
   const [calibrating, setCalibrating] = useState(false)
   const [remainingDays, setRemainingDays] = useState(String(Math.max(0, computed.daysUntilDepletion)))
@@ -1128,8 +1100,8 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onPurchase
   }
 
   return (
-    <div className="overlay detail-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="panel detail-panel">
+    <div className={`overlay detail-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside className={`panel detail-panel ${isClosing ? "is-closing" : ""}`}>
         <div className="panel-header">
           <div className="panel-header-info">
             <span className="panel-header-eyebrow">{item.category}</span>
@@ -1150,7 +1122,7 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onPurchase
           {latestRating === 1 && <p className="rating-warning-text">上次购买评价较差，考虑更换品牌</p>}
           {computed.status !== "normal" && (
             <div className="detail-hero-actions">
-              <TaskActions item={item} onPurchase={onPurchase} onRestock={onRestock} onSnooze={onSnooze} />
+              <TaskActions item={item} onRestock={onRestock} />
             </div>
           )}
         </div>
@@ -1286,7 +1258,7 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onPurchase
   )
 }
 
-function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose, onSave, onDelete }: {
+function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose, onSave, onDelete, isClosing }: {
   item: ReplenishmentItem | null
   initialCategory?: string
   categories: string[]
@@ -1294,6 +1266,7 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   onClose: () => void
   onSave: (draft: ItemDraft) => void
   onDelete?: (item: ReplenishmentItem) => void
+  isClosing?: boolean
 }) {
   const [addingGroup, setAddingGroup] = useState(false)
   const [newGroupName, setNewGroupName] = useState("")
@@ -1372,8 +1345,8 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   }
 
   return (
-    <div className="overlay editor-overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="panel editor-panel">
+    <div className={`overlay editor-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <aside className={`panel editor-panel ${isClosing ? "is-closing" : ""}`}>
         <div className="panel-header"><h2>{item ? `编辑 ${item.name}` : "添加消耗品"}</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
         <form className="editor-form" onSubmit={submit}>
           {/* 分类选择 */}
@@ -1446,22 +1419,9 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
             {!item && <label className="field field-wide"><span>手头这些大概还能用多久 <em>选填</em></span><div className="input-suffix"><input type="number" min="0" value={draft.remainingDays} onChange={(event) => set("remainingDays", event.target.value)} placeholder="不确定就留空" /><b>天</b></div></label>}
           </div>
 
-          {/* 购买信息 */}
-          <div className="editor-section">
-            <h3 className="editor-section-title">购买信息 <em>选填</em></h3>
-            <label className="field field-wide"><span>常买的商品链接</span><input type="url" value={draft.link} onChange={(event) => set("link", event.target.value)} placeholder="https://" /></label>
-            <label className="field">
-              <span>常买平台</span>
-              <select value={draft.platform} onChange={(event) => set("platform", event.target.value)}>
-                <option value="">未选择</option>
-                {platforms.map((p) => <option key={p} value={p}>{p}</option>)}
-              </select>
-            </label>
-          </div>
-
           {/* 高级选项 */}
           <div className="editor-section">
-            <label className="learning-toggle field-wide"><input type="checkbox" checked={!draft.learningEnabled} onChange={(event) => set("learningEnabled", !event.target.checked)} /><span>不再给出补货间隔调整建议</span></label>
+            <label className="learning-toggle field-wide"><input type="checkbox" checked={draft.learningEnabled} onChange={(event) => set("learningEnabled", event.target.checked)} /><span>根据补货记录自动调整间隔建议</span></label>
           </div>
 
           {/* 编辑时显示历史 */}
@@ -1493,24 +1453,23 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   )
 }
 
-function SettingsPanel({ state, onChange, onClose }: { state: AppState; onChange: (state: AppState) => void; onClose: () => void }) {
+function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onClose: () => void; isClosing?: boolean }) {
   const settings = state.settings
   function patch(values: Partial<typeof settings>) {
     onChange({ ...state, settings: { ...settings, ...values } })
   }
   return (
-    <div className="overlay" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <aside className="panel settings-panel">
-        <div className="panel-header"><h2>提醒与预算</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
+    <div className={`overlay settings-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
+      <div className={`settings-dialog ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-title">
+        <div className="settings-dialog-header"><h2 id="settings-title">提醒与预算</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
         <div className="settings-body">
           <div className="settings-row"><span className="settings-row-label">每月生活预算</span><div className="settings-row-control"><div className="input-prefix budget-input"><b>¥</b><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div></div>
           <div className="settings-row"><span className="settings-row-label">重复提醒间隔</span><div className="settings-row-control"><div className="segment-control"><button className={settings.reminderIntervalMinutes === 30 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 30 })}>30 分钟</button><button className={settings.reminderIntervalMinutes === 60 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 60 })}>60 分钟</button></div></div></div>
           <div className="settings-row"><span className="settings-row-label">勿扰时段</span><div className="settings-row-control"><div className="time-range"><input type="time" value={settings.quietStart} onChange={(event) => patch({ quietStart: event.target.value })} /><span>至</span><input type="time" value={settings.quietEnd} onChange={(event) => patch({ quietEnd: event.target.value })} /></div></div></div>
-          <div className="settings-row"><span className="settings-row-label">空闲后暂停提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="1" max="30" value={settings.idleThresholdMinutes} onChange={(event) => patch({ idleThresholdMinutes: Number(event.target.value) })} /><b>分钟</b></div></div></div>
           <div className="settings-row"><span className="settings-row-label">明天几点提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="0" max="23" value={settings.snoozeUntilHour} onChange={(event) => patch({ snoozeUntilHour: Number(event.target.value) })} /><b>点</b></div></div></div>
           <div className="settings-row"><span className="settings-row-label">系统通知</span><div className="settings-row-control"><button className="quiet-button" onClick={() => window.desktop?.testNotification()}>发送测试</button></div></div>
         </div>
-      </aside>
+      </div>
     </div>
   )
 }

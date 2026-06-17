@@ -259,7 +259,6 @@ export function createInitialState(): AppState {
     ],
     settings: {
       reminderIntervalMinutes: 60,
-      idleThresholdMinutes: 5,
       quietStart: "22:00",
       quietEnd: "08:00",
       snoozeUntilHour: 8

@@ -5,7 +5,6 @@ import {
   Menu,
   nativeImage,
   Notification,
-  powerMonitor,
   shell,
   Tray
 } from "electron"
@@ -207,7 +206,6 @@ function checkReminders(force = false) {
 
   if (!force) {
     if (inQuietHours(new Date(now), settings.quietStart, settings.quietEnd)) return
-    if (powerMonitor.getSystemIdleTime() > Number(settings.idleThresholdMinutes || 5) * 60) return
   }
 
   const key = dueItems.map((item) => item.id).sort().join(",")
@@ -221,7 +219,10 @@ function checkReminders(force = false) {
 }
 
 app.whenReady().then(() => {
-  if (process.platform === "darwin") app.dock.setIcon(APP_ICON)
+  if (process.platform === "darwin") {
+    const dockIcon = nativeImage.createFromPath(APP_ICON).resize({ width: 128, height: 128 })
+    app.dock.setIcon(dockIcon)
+  }
   loadState()
   createWindow()
   createTray()

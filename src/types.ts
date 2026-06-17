@@ -38,7 +38,6 @@ export type ReplenishmentItem = {
 
 export type ReminderSettings = {
   reminderIntervalMinutes: 30 | 60
-  idleThresholdMinutes: number
   quietStart: string
   quietEnd: string
   snoozeUntilHour: number

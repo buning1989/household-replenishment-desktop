@@ -2,7 +2,7 @@ import { createInitialState } from "./domain"
 import type { AppState, ReplenishmentItem } from "./types"
 
 const STORAGE_KEY = "household_replenishment_desktop_v1"
-const CARD_STATES_DEMO_KEY = "household_replenishment_card_states_demo_v1"
+const CARD_STATES_DEMO_KEY = "household_replenishment_card_states_demo_v2"
 
 function demoItem(name: string, category: string, cycleDays: number, bufferDays: number, elapsedDays: number): ReplenishmentItem {
   const now = Date.now()
@@ -32,9 +32,12 @@ function addCardStateDemoItems(state: AppState): AppState {
   const bathroom = findCategory("卫生", "浴室") || state.categories[1] || state.categories[0]
   const laundry = findCategory("洗衣") || state.categories[2] || state.categories[0]
   const additions = [
-    kitchen && demoItem("食用油", kitchen, 30, 5, 31),
-    bathroom && demoItem("洗手液", bathroom, 30, 5, 26),
-    laundry && demoItem("洗衣凝珠", laundry, 32, 5, 29)
+    kitchen && demoItem("食用油", kitchen, 30, 5, 36),
+    bathroom && demoItem("洗手液", bathroom, 30, 5, 28),
+    laundry && demoItem("洗衣凝珠", laundry, 32, 5, 30),
+    bathroom && demoItem("沐浴露", bathroom, 45, 5, 42),
+    kitchen && demoItem("保鲜膜", kitchen, 25, 3, 26),
+    laundry && demoItem("柔顺剂", laundry, 40, 5, 38),
   ].filter((item): item is ReplenishmentItem => Boolean(item))
     .filter((item) => !state.items.some((current) => current.name === item.name && current.category === item.category))
   localStorage.setItem(CARD_STATES_DEMO_KEY, "1")
