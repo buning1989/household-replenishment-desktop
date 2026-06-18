@@ -2,6 +2,16 @@ export type ItemType = "learning" | "fixed"
 export type ItemUrgency = "normal" | "warning" | "urgent"
 export type Rating = 1 | 2 | 3
 
+export interface PurchaseOption {
+  id: string
+  productName: string  // 具体商品名称（如"维达卫生纸"）
+  platform: string     // 购买平台
+  unit: string         // 计量单位
+  price?: number       // 采购价格
+  link?: string        // 商品链接（可选）
+  isDefault?: boolean  // 是否为默认选项
+}
+
 export type RestockEvent = {
   id: string
   at: number
@@ -15,14 +25,15 @@ export type RestockEvent = {
 
 export type ReplenishmentItem = {
   id: string
-  name: string
+  name: string              // 消耗品名称（如"卫生纸"）
   category: string
   type: ItemType
   cycleDays: number
   bufferDays: number
   lastRestockedAt: number
   anchorEstimated: boolean
-  history: RestockEvent[]
+  purchaseOptions: PurchaseOption[]  // 新增：采购选项列表
+  history: RestockEvent[]            // 已有：补货记录
   link?: string
   price?: number
   snoozeUntil?: number
@@ -32,6 +43,7 @@ export type ReplenishmentItem = {
   unit?: string
   platform?: string
   defaultQty?: number
+  reminderDaysAhead?: number
   createdAt: number
   updatedAt: number
 }
@@ -77,6 +89,10 @@ export type ItemDraft = {
   unit: string
   defaultQty: string
   platform: string
+  price?: number
+  usageIntervalDays?: number
+  reminderDaysAhead?: number
+  purchaseOptions?: PurchaseOption[]  // 新增：采购选项列表
 }
 
 export type PriceAnchor = {

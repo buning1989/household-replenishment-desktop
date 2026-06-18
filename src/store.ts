@@ -18,6 +18,7 @@ function demoItem(name: string, category: string, cycleDays: number, bufferDays:
     bufferDays,
     lastRestockedAt: lastRestockedAt.getTime(),
     anchorEstimated: true,
+    purchaseOptions: [],
     history: [],
     learningEnabled: true,
     createdAt: now,
