@@ -37,19 +37,73 @@ function stateFile() {
   return path.join(app.getPath("userData"), "reminder-state.json")
 }
 
-function saveState(state) {
-  latestState = state
-  try {
-    fs.writeFileSync(stateFile(), JSON.stringify(state), "utf8")
-  } catch (error) {
-    console.warn("Unable to persist reminder state", error)
+function stateTmpFile() {
+  return path.join(app.getPath("userData"), "reminder-state.json.tmp")
+}
+
+// 轻量 state 校验：只做最低限度检查，不复制 renderer store.ts 的完整迁移逻辑。
+// 返回 { valid: boolean, reason?: string }
+function validateState(state) {
+  if (state === null || typeof state !== "object" || Array.isArray(state)) {
+    return { valid: false, reason: "state is not an object" }
   }
+  if (!Array.isArray(state.items)) {
+    return { valid: false, reason: "state.items is not an array" }
+  }
+  for (let i = 0; i < state.items.length; i++) {
+    const item = state.items[i]
+    if (item === null || typeof item !== "object") {
+      return { valid: false, reason: `items[${i}] is not an object` }
+    }
+    if (!item.id || typeof item.name !== "string" || typeof item.category !== "string") {
+      return { valid: false, reason: `items[${i}] missing id/name/category` }
+    }
+    if (!Number.isFinite(Number(item.cycleDays))) {
+      return { valid: false, reason: `items[${i}].cycleDays is not finite` }
+    }
+    if (!Number.isFinite(Number(item.bufferDays))) {
+      return { valid: false, reason: `items[${i}].bufferDays is not finite` }
+    }
+    if (!Number.isFinite(Number(item.lastRestockedAt))) {
+      return { valid: false, reason: `items[${i}].lastRestockedAt is not finite` }
+    }
+  }
+  if (state.settings !== undefined && state.settings !== null) {
+    if (typeof state.settings !== "object" || Array.isArray(state.settings)) {
+      return { valid: false, reason: "state.settings is not an object" }
+    }
+  }
+  return { valid: true }
+}
+
+function saveState(state) {
+  // 原子写入：先写临时文件，成功后 rename 到正式路径。
+  // 写入失败时保留旧文件，不影响 latestState 内存值。
+  try {
+    fs.writeFileSync(stateTmpFile(), JSON.stringify(state), "utf8")
+    fs.renameSync(stateTmpFile(), stateFile())
+  } catch (error) {
+    console.warn("[main] saveState: failed to persist state", error)
+    // 尝试清理残留的 tmp 文件（忽略错误）
+    try { fs.unlinkSync(stateTmpFile()) } catch { /* ignore */ }
+    return false
+  }
+  return true
 }
 
 function loadState() {
   try {
-    latestState = JSON.parse(fs.readFileSync(stateFile(), "utf8"))
-  } catch {
+    const raw = fs.readFileSync(stateFile(), "utf8")
+    const parsed = JSON.parse(raw)
+    const result = validateState(parsed)
+    if (!result.valid) {
+      console.warn("[main] loadState: invalid state on disk, ignoring:", result.reason)
+      latestState = null
+      return
+    }
+    latestState = parsed
+  } catch (error) {
+    console.warn("[main] loadState: failed to read/parse state file", error)
     latestState = null
   }
 }
@@ -283,6 +337,14 @@ app.on("before-quit", () => {
 app.on("window-all-closed", (event) => event.preventDefault())
 
 ipcMain.on("state:sync", (_event, state) => {
+  const result = validateState(state)
+  if (!result.valid) {
+    console.warn("[main] state:sync: rejected invalid state:", result.reason)
+    return
+  }
+  // 校验合法：先更新内存，再尝试写文件。
+  // 写入失败不影响当前运行时提醒，但不会破坏旧文件（原子写入保证）。
+  latestState = state
   saveState(state)
   checkReminders(false)
 })
