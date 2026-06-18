@@ -53,6 +53,9 @@ function migrateItem(item: ReplenishmentItem): ReplenishmentItem {
     rating: event.rating || undefined,
     review: event.review?.trim() || undefined
   }))
+  // 统一 history 顺序为旧到新（按 at 升序），与 domain.restockItem 的 append 约定及
+  // 统计函数“末尾为最新”的假设保持一致；修复历史数据中被新流程 prepend 反序的记录
+  migratedHistory.sort((a, b) => (a.at || 0) - (b.at || 0))
   return {
     ...item,
     type: "learning",
