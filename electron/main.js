@@ -87,6 +87,44 @@ function createWindow() {
     void mainWindow.loadFile(path.join(__dirname, "../dist/index.html"))
   }
 
+  // ---- 导航安全：阻止主窗口跳转到外部 URL ----
+  mainWindow.webContents.on("will-navigate", (event, url) => {
+    try {
+      const parsed = new URL(url)
+      // dev 模式允许 Vite dev server；production 允许 file:// 协议
+      const allowed = isDev
+        ? parsed.protocol === "http:" && parsed.hostname === "127.0.0.1" && parsed.port === "5173"
+        : parsed.protocol === "file:"
+      if (!allowed) {
+        // 对合法 http/https 外链，委托系统浏览器打开而非主窗口导航
+        if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+          shell.openExternal(parsed.toString()).catch((error) => {
+            console.warn("Unable to open external link via will-navigate", error)
+          })
+        }
+        event.preventDefault()
+      }
+    } catch {
+      // URL 解析失败（非法 URL），一律阻止
+      event.preventDefault()
+    }
+  })
+
+  // ---- 阻止 window.open / target=_blank 在应用内打开新窗口 ----
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      const parsed = new URL(url)
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        shell.openExternal(parsed.toString()).catch((error) => {
+          console.warn("Unable to open external link via window.open", error)
+        })
+      }
+    } catch {
+      // 非法 URL，静默忽略
+    }
+    return { action: "deny" }
+  })
+
   mainWindow.on("close", (event) => {
     if (!isQuitting) {
       event.preventDefault()
@@ -242,10 +280,20 @@ ipcMain.on("state:sync", (_event, state) => {
 })
 ipcMain.on("window:show", showWindow)
 ipcMain.on("notification:test", () => sendNotification([], true))
-ipcMain.handle("external:open", (_event, url) => {
-  const target = new URL(url)
-  if (!['http:', 'https:'].includes(target.protocol)) {
-    throw new Error("Only http and https links are supported")
+ipcMain.handle("external:open", async (_event, url) => {
+  let target
+  try {
+    target = new URL(url)
+  } catch {
+    return { ok: false, error: "Invalid URL" }
   }
-  return shell.openExternal(target.toString())
+  if (!['http:', 'https:'].includes(target.protocol)) {
+    return { ok: false, error: "Only http and https links are supported" }
+  }
+  try {
+    await shell.openExternal(target.toString())
+    return { ok: true }
+  } catch (openError) {
+    return { ok: false, error: openError.message }
+  }
 })
