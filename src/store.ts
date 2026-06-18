@@ -27,7 +27,14 @@ function demoItem(name: string, category: string, cycleDays: number, bufferDays:
 }
 
 function addCardStateDemoItems(state: AppState): AppState {
-  if (localStorage.getItem(CARD_STATES_DEMO_KEY)) return state
+  // getItem 失败（localStorage 被禁用/异常）按“没有 demo key”处理，继续注入 demo
+  let hasDemoKey = false
+  try {
+    hasDemoKey = Boolean(localStorage.getItem(CARD_STATES_DEMO_KEY))
+  } catch (readError) {
+    console.warn("Unable to read card states demo key", readError)
+  }
+  if (hasDemoKey) return state
   const findCategory = (...keywords: string[]) => state.categories.find((category) => keywords.some((keyword) => category.includes(keyword)))
   const kitchen = findCategory("厨房") || state.categories[0]
   const bathroom = findCategory("卫生", "浴室") || state.categories[1] || state.categories[0]
@@ -41,7 +48,12 @@ function addCardStateDemoItems(state: AppState): AppState {
     laundry && demoItem("柔顺剂", laundry, 40, 5, 38),
   ].filter((item): item is ReplenishmentItem => Boolean(item))
     .filter((item) => !state.items.some((current) => current.name === item.name && current.category === item.category))
-  localStorage.setItem(CARD_STATES_DEMO_KEY, "1")
+  // setItem 失败（配额超限/被禁用）仅 warn，不阻断返回 state
+  try {
+    localStorage.setItem(CARD_STATES_DEMO_KEY, "1")
+  } catch (writeError) {
+    console.warn("Unable to persist card states demo key", writeError)
+  }
   return additions.length ? { ...state, items: [...state.items, ...additions], updatedAt: Date.now() } : state
 }
 
@@ -75,11 +87,16 @@ const DEFAULT_SETTINGS: ReminderSettings = {
 function migrateSettings(raw: unknown): ReminderSettings {
   if (!isObject(raw)) return { ...DEFAULT_SETTINGS }
   const interval = raw.reminderIntervalMinutes
+  const snoozeRaw = asFiniteNumber(raw.snoozeUntilHour)
+  // snoozeUntilHour 是小时（0-23）：非有限数字回退默认值，否则钳制到 [0, 23]
+  const snoozeUntilHour = snoozeRaw === undefined
+    ? DEFAULT_SETTINGS.snoozeUntilHour
+    : Math.min(23, Math.max(0, Math.round(snoozeRaw)))
   return {
     reminderIntervalMinutes: interval === 30 || interval === 60 ? interval : DEFAULT_SETTINGS.reminderIntervalMinutes,
     quietStart: asString(raw.quietStart) ?? DEFAULT_SETTINGS.quietStart,
     quietEnd: asString(raw.quietEnd) ?? DEFAULT_SETTINGS.quietEnd,
-    snoozeUntilHour: asFiniteNumber(raw.snoozeUntilHour) ?? DEFAULT_SETTINGS.snoozeUntilHour,
+    snoozeUntilHour,
     monthlyBudget: asFiniteNumber(raw.monthlyBudget) !== undefined && (asFiniteNumber(raw.monthlyBudget) as number) > 0
       ? asFiniteNumber(raw.monthlyBudget)
       : undefined
