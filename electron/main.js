@@ -55,8 +55,12 @@ function validateState(state) {
     if (item === null || typeof item !== "object") {
       return { valid: false, reason: `items[${i}] is not an object` }
     }
-    if (!item.id || typeof item.name !== "string" || typeof item.category !== "string") {
-      return { valid: false, reason: `items[${i}] missing id/name/category` }
+    if (
+      typeof item.id !== "string" || item.id.trim() === "" ||
+      typeof item.name !== "string" || item.name.trim() === "" ||
+      typeof item.category !== "string" || item.category.trim() === ""
+    ) {
+      return { valid: false, reason: `items[${i}] has invalid id/name/category` }
     }
     if (!Number.isFinite(Number(item.cycleDays))) {
       return { valid: false, reason: `items[${i}].cycleDays is not finite` }
