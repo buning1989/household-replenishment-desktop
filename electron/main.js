@@ -18,6 +18,14 @@ const DAY_MS = 24 * 60 * 60 * 1000
 const APP_NAME = "403家庭管家"
 const APP_ICON = path.join(__dirname, "../build/icons/icon_1024.png")
 
+// ---- 主进程全局异常兜底：仅记录日志，不弹 UI、不退出、不重启 ----
+process.on("uncaughtException", (error) => {
+  console.error("[main] uncaughtException", error)
+})
+process.on("unhandledRejection", (reason) => {
+  console.error("[main] unhandledRejection", reason)
+})
+
 let mainWindow = null
 let tray = null
 let isQuitting = false
