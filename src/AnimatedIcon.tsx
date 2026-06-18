@@ -3,7 +3,7 @@ import { motion, useReducedMotion } from "motion/react"
 
 // Paths and motion ideas adapted from Its Hover icons (Apache-2.0).
 // https://github.com/itshover/itshover/tree/master/icons
-export type IconName = "plus" | "settings" | "cart" | "check" | "clock" | "close" | "edit" | "bell" | "arrow" | "more"
+export type IconName = "plus" | "settings" | "cart" | "check" | "clock" | "close" | "edit" | "bell" | "arrow" | "more" | "trash"
 
 type AnimatedIconProps = {
   name: IconName
@@ -148,6 +148,19 @@ export function AnimatedIcon({ name, size = 18 }: AnimatedIconProps) {
         <motion.circle cx="5" cy="12" r="1.25" animate={hovered ? { x: [-2, 0], scale: [1, 1.2, 1] } : { x: 0, scale: 1 }} transition={{ duration: 0.3 }} />
         <motion.circle cx="12" cy="12" r="1.25" animate={hovered ? { scale: [1, 1.3, 1] } : { scale: 1 }} transition={{ duration: 0.3, delay: hovered ? 0.1 : 0 }} />
         <motion.circle cx="19" cy="12" r="1.25" animate={hovered ? { x: [2, 0], scale: [1, 1.2, 1] } : { x: 0, scale: 1 }} transition={{ duration: 0.3, delay: hovered ? 0.2 : 0 }} />
+      </motion.svg>
+    )
+  }
+
+  if (name === "trash") {
+    return (
+      <motion.svg {...commonProps} {...hoverProps} viewBox="0 0 24 24">
+        <motion.path
+          d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"
+          animate={hovered ? { y: [0, -2, 0], rotate: [0, -5, 5, 0] } : { y: 0, rotate: 0 }}
+          transition={{ duration: hovered ? 0.5 : 0.2, ease: "easeInOut" }}
+          style={{ transformOrigin: "50% 50%" }}
+        />
       </motion.svg>
     )
   }
