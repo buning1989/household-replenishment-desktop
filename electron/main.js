@@ -98,7 +98,9 @@ function createWindow() {
       if (!allowed) {
         // 对合法 http/https 外链，委托系统浏览器打开而非主窗口导航
         if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-          void shell.openExternal(parsed.toString())
+          shell.openExternal(parsed.toString()).catch((error) => {
+            console.warn("Unable to open external link via will-navigate", error)
+          })
         }
         event.preventDefault()
       }
@@ -113,7 +115,9 @@ function createWindow() {
     try {
       const parsed = new URL(url)
       if (parsed.protocol === "http:" || parsed.protocol === "https:") {
-        void shell.openExternal(parsed.toString())
+        shell.openExternal(parsed.toString()).catch((error) => {
+          console.warn("Unable to open external link via window.open", error)
+        })
       }
     } catch {
       // 非法 URL，静默忽略
@@ -276,7 +280,7 @@ ipcMain.on("state:sync", (_event, state) => {
 })
 ipcMain.on("window:show", showWindow)
 ipcMain.on("notification:test", () => sendNotification([], true))
-ipcMain.handle("external:open", (_event, url) => {
+ipcMain.handle("external:open", async (_event, url) => {
   let target
   try {
     target = new URL(url)
@@ -287,7 +291,7 @@ ipcMain.handle("external:open", (_event, url) => {
     return { ok: false, error: "Only http and https links are supported" }
   }
   try {
-    void shell.openExternal(target.toString())
+    await shell.openExternal(target.toString())
     return { ok: true }
   } catch (openError) {
     return { ok: false, error: openError.message }
