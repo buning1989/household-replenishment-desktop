@@ -202,6 +202,12 @@ function App() {
     setRestockPrice('')
   }
 
+  // 统一补货入口：所有补货流程都经由 domain.restockItem 完成状态迁移
+  // （append history、计算 intervalDays、清除 snoozeUntil、周期学习等均由 domain 负责）
+  function performRestock(itemId: string, qty?: number, price?: number, platform?: string) {
+    updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform))
+  }
+
   function undoRestock() {
     if (!recentRestock) return
     const snapshot = cloneItem(recentRestock.snapshot)
@@ -341,24 +347,8 @@ function App() {
   function handleRestockFromOption(itemId: string, option: PurchaseOption) {
     const item = state.items.find(i => i.id === itemId)
     if (!item) return
-    
-    // 使用采购选项的信息创建补货记录
-    const newRecord: RestockEvent = {
-      id: crypto.randomUUID(),
-      at: Date.now(),
-      price: option.price,
-      qty: item.defaultQty || 1,
-      platform: option.platform
-    }
-    
-    // 更新物品的 lastRestockAt 和 history
-    updateItems([itemId], (current) => ({
-      ...current,
-      lastRestockedAt: Date.now(),
-      history: [newRecord, ...(current.history || [])]
-    }))
-    
-    // 关闭详情面板
+    // 经由 domain.restockItem 完成补货，避免手写 patch 绕过学习/状态机
+    performRestock(itemId, item.defaultQty || 1, option.price, option.platform)
     setDetailItemId(null)
   }
 
@@ -411,40 +401,6 @@ function App() {
       ...current,
       purchaseOptions: (current.purchaseOptions || []).filter(opt => opt.id !== optionId)
     }))
-  }
-
-  // 确认补货
-  function handleConfirmRestock() {
-    if (!restockModalItemId || !selectedPurchaseOption) return
-    
-    const item = state.items.find(i => i.id === restockModalItemId)
-    if (!item) return
-    
-    const qty = restockQty || 1
-    const price = restockPrice || selectedPurchaseOption.price || 0
-    
-    // 创建补货记录
-    const newRecord: RestockEvent = {
-      id: crypto.randomUUID(),
-      at: Date.now(),
-      price: price,
-      qty: qty,
-      platform: selectedPurchaseOption.platform
-    }
-    
-    // 更新物品状态
-    updateItems([item.id], (current) => ({
-      ...current,
-      lastRestockedAt: Date.now(),
-      history: [newRecord, ...(current.history || [])]
-    }))
-    
-    // 关闭弹窗并重置状态
-    setRestockModalOpen(false)
-    setRestockModalItemId(null)
-    setSelectedPurchaseOption(null)
-    setRestockQty('')
-    setRestockPrice('')
   }
 
   // 取消补货
@@ -653,26 +609,7 @@ function App() {
         onClose={handleCancelRestock}
         item={restockModalItemId ? state.items.find(i => i.id === restockModalItemId) || null : null}
         onConfirm={(itemId, option, qty, price) => {
-          const item = state.items.find(i => i.id === itemId)
-          if (!item) return
-          
-          // 创建补货记录
-          const newRecord: RestockEvent = {
-            id: crypto.randomUUID(),
-            at: Date.now(),
-            price: price,
-            qty: qty,
-            platform: option.platform
-          }
-          
-          // 更新物品状态
-          updateItems([item.id], (current) => ({
-            ...current,
-            lastRestockedAt: Date.now(),
-            history: [newRecord, ...(current.history || [])]
-          }))
-          
-          // 关闭弹窗并重置状态
+          performRestock(itemId, qty, price || undefined, option?.platform)
           handleCancelRestock()
         }}
       />
@@ -1730,39 +1667,47 @@ interface RestockModalProps {
   isOpen: boolean
   onClose: () => void
   item: ReplenishmentItem | null
-  onConfirm: (itemId: string, option: PurchaseOption, qty: number, price: number) => void
+  onConfirm: (itemId: string, option: PurchaseOption | null, qty: number, price: number) => void
 }
 
 function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
   const [selectedOption, setSelectedOption] = useState<PurchaseOption | null>(null)
   const [qty, setQty] = useState<number | ''>('')
   const [price, setPrice] = useState<number | ''>('')
-  
-  // 当选中选项时，自动填充默认值
+
+  // 选中采购选项时自动填充默认数量与价格；取消选择时保留用户已输入的内容
   useEffect(() => {
     if (selectedOption) {
-      setQty(selectedOption.unit ? 1 : '')
+      setQty(1)
       setPrice(selectedOption.price || '')
-    } else {
+    }
+  }, [selectedOption])
+
+  // 每次打开弹窗或切换物品时重置内部状态，避免显示上一次补货的残留值
+  useEffect(() => {
+    if (isOpen && item) {
+      setSelectedOption(null)
       setQty('')
       setPrice('')
     }
-  }, [selectedOption])
-  
+  }, [isOpen, item?.id])
+
   if (!isOpen || !item) return null
-  
+
   const purchaseOptions = item.purchaseOptions || []
-  
+  const unitText = selectedOption?.unit || item.unit || '件'
+  const canConfirm = !!qty && Number(qty) >= 1
+
   return (
     <div className="restock-modal-overlay" onClick={onClose}>
       <div className="restock-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h3>选择采购选项 - {item.name}</h3>
+          <h3>补货 - {item.name}</h3>
           <button className="icon-button modal-close-btn" onClick={onClose}>
             <Icon name="close" size={18} />
           </button>
         </div>
-        
+
         <div className="modal-body">
           {/* 采购选项列表 */}
           {purchaseOptions.length > 0 ? (
@@ -1771,7 +1716,7 @@ function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
                 // 从补货记录中匹配该平台最近的有评价内容
                 const latestReview = (item.history || [])
                   .find(e => e.platform === option.platform && e.review)
-                
+
                 return (
                   <button
                     key={option.id}
@@ -1790,50 +1735,48 @@ function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
               })}
             </div>
           ) : (
-            <p className="empty-hint">暂无采购选项，请先在详情中添加</p>
+            <p className="empty-hint">暂无采购选项，可直接填写下方数量与价格完成补货</p>
           )}
-          
-          {/* 数量和价格输入 */}
-          {selectedOption && (
-            <div className="restock-inputs">
-              <div className="input-row">
-                <label>采购数量：</label>
-                <input
-                  type="number"
-                  min="1"
-                  value={qty}
-                  onChange={(e) => setQty(e.target.value === '' ? '' : Number(e.target.value))}
-                  placeholder="例如：2"
-                />
-                <span className="unit-text">{selectedOption.unit || '件'}</span>
-              </div>
-              
-              <div className="input-row">
-                <label>采购价格：</label>
-                <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  value={price}
-                  onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
-                  placeholder="例如：50"
-                />
-                <span className="unit-text">元</span>
-              </div>
+
+          {/* 数量和价格输入：无论是否选择采购选项都可填写，保证无选项时也能补货 */}
+          <div className="restock-inputs">
+            <div className="input-row">
+              <label>采购数量：</label>
+              <input
+                type="number"
+                min="1"
+                value={qty}
+                onChange={(e) => setQty(e.target.value === '' ? '' : Number(e.target.value))}
+                placeholder="例如：2"
+              />
+              <span className="unit-text">{unitText}</span>
             </div>
-          )}
+
+            <div className="input-row">
+              <label>采购价格：</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={price}
+                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                placeholder="例如：50"
+              />
+              <span className="unit-text">元</span>
+            </div>
+          </div>
         </div>
-        
+
         <div className="modal-footer">
           <button className="btn btn-secondary" onClick={onClose}>取消</button>
-          <button 
-            className="btn btn-primary" 
+          <button
+            className="btn btn-primary"
             onClick={() => {
-              if (selectedOption && qty) {
+              if (canConfirm) {
                 onConfirm(item.id, selectedOption, Number(qty), Number(price) || 0)
               }
             }}
-            disabled={!selectedOption || !qty}
+            disabled={!canConfirm}
           >
             确认补货
           </button>
@@ -1860,11 +1803,19 @@ function ItemEditorDialog({
   onMove: (id: string, newCategory: string) => void
   onDelete: (id: string) => void
 }) {
+  const [name, setName] = useState(item?.name ?? "")
+  const [category, setCategory] = useState(item?.category ?? "")
+
+  // 组件始终挂载，需在早退判断之前调用 hooks；切换物品或重新打开时同步表单状态
+  useEffect(() => {
+    if (isOpen && item) {
+      setName(item.name)
+      setCategory(item.category)
+    }
+  }, [isOpen, item?.id])
+
   if (!isOpen || !item) return null
-  
-  const [name, setName] = useState(item.name)
-  const [category, setCategory] = useState(item.category)
-  
+
   const handleSave = () => {
     if (name !== item.name) {
       onRename(item.id, name)
@@ -2572,9 +2523,12 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
     setEditingUsageInterval(true)
   }
 
-  // 保存补货间隔
+  // 保存补货间隔（清空或非法值时回退到当前值，避免写入 undefined 导致 computeItem 产生 NaN）
   function handleSaveUsageInterval(item: ReplenishmentItem) {
-    const newValue = tempUsageInterval === '' ? undefined : Number(tempUsageInterval)
+    const parsed = Number(tempUsageInterval)
+    const newValue = Number.isFinite(parsed) && parsed > 0
+      ? Math.max(1, Math.round(parsed))
+      : item.cycleDays
     onQuickEdit(item, { cycleDays: newValue })
     setEditingUsageInterval(false)
   }
@@ -2585,9 +2539,12 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
     setEditingReminderDays(true)
   }
 
-  // 保存提前提醒
+  // 保存提前提醒（清空或非法值时回退到当前值，避免写入 undefined 导致 computeItem 产生 NaN）
   function handleSaveReminderDays(item: ReplenishmentItem) {
-    const newValue = tempReminderDays === '' ? undefined : Number(tempReminderDays)
+    const parsed = Number(tempReminderDays)
+    const newValue = Number.isFinite(parsed) && parsed >= 0
+      ? Math.min(Math.max(0, item.cycleDays - 1), Math.round(parsed))
+      : item.bufferDays
     onQuickEdit(item, { bufferDays: newValue })
     setEditingReminderDays(false)
   }
