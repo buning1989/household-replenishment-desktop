@@ -18,7 +18,7 @@ import {
   updateItemFromDraft
 } from "./domain"
 import { loadState, persistState } from "./store"
-import type { AppState, ItemComputed, ItemDraft, PriceAnchor, Rating, RecentRestock, ReplenishmentItem } from "./types"
+import type { AppState, ItemComputed, ItemDraft, PriceAnchor, Rating, RecentRestock, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 
 const EMPTY_DRAFT: ItemDraft = {
@@ -32,6 +32,40 @@ const EMPTY_DRAFT: ItemDraft = {
   unit: "件",
   defaultQty: "",
   platform: ""
+}
+
+// 格式化物品状态栏文本
+function formatItemStatusText(item: ReplenishmentItem, computed: ItemComputed): string {
+  const parts: string[] = []
+  
+  // 1. 剩余天数
+  parts.push(`还剩约 ${Math.max(0, computed.daysUntilDepletion)} 天`)
+  
+  // 2. 补货间隔
+  if (item.cycleDays) {
+    parts.push(`每 ${item.cycleDays} 天补货`)
+  }
+  
+  // 3. 提前提醒
+  if (item.bufferDays) {
+    parts.push(`提前 ${item.bufferDays} 天提醒`)
+  }
+  
+  // 4. 上次补货日期
+  if (item.lastRestockedAt) {
+    const lastRestockDate = new Date(item.lastRestockedAt)
+    const month = lastRestockDate.getMonth() + 1
+    const day = lastRestockDate.getDate()
+    parts.push(`上次补货 ${month}月${day}日`)
+  }
+  
+  // 5. 默认购买量 + 计量单位
+  const unit = item.unit || "件"
+  if (item.defaultQty) {
+    parts.push(`默认 ${item.defaultQty} ${unit}`)
+  }
+  
+  return parts.join(' · ')
 }
 
 function cloneItem(item: ReplenishmentItem): ReplenishmentItem {
@@ -50,6 +84,12 @@ function App() {
   const [categoryDialog, setCategoryDialog] = useState<"rename" | "delete" | null>(null)
   const [detailItemId, setDetailItemId] = useState<string | null>(null)
   const [recentRestock, setRecentRestock] = useState<RecentRestock | null>(null)
+  // Restock modal state
+  const [restockModalOpen, setRestockModalOpen] = useState(false)
+  const [restockModalItemId, setRestockModalItemId] = useState<string | null>(null)
+  const [selectedPurchaseOption, setSelectedPurchaseOption] = useState<PurchaseOption | null>(null)
+  const [restockQty, setRestockQty] = useState<number | ''>('')
+  const [restockPrice, setRestockPrice] = useState<number | ''>('')
   const [now, setNow] = useState(() => Date.now())
   // Panel exit animation states
   const [categoryPanelClosing, setCategoryPanelClosing] = useState(false)
@@ -58,6 +98,17 @@ function App() {
   const [settingsClosing, setSettingsClosing] = useState(false)
   const [categoryCreatorClosing, setCategoryCreatorClosing] = useState(false)
   const [categoryManagerClosing, setCategoryManagerClosing] = useState(false)
+  // Item creator dialog state
+  const [isItemCreatorOpen, setIsItemCreatorOpen] = useState(false)
+  const [creatingCategory, setCreatingCategory] = useState<string | null>(null)
+  // Item editor dialog state
+  const [editingItemId, setEditingItemId] = useState<string | null>(null)
+  const [isItemEditorDialogOpen, setIsItemEditorDialogOpen] = useState(false)
+  // Purchase option management state
+  const [showAddPurchaseModal, setShowAddPurchaseModal] = useState(false)
+  const [addPurchaseOptionItemId, setAddPurchaseOptionItemId] = useState<string | null>(null)
+  const [editingPurchaseOption, setEditingPurchaseOption] = useState<PurchaseOption | null>(null)
+  const [editModalOpen, setEditModalOpen] = useState(false)
   function deferredClose(setClosing: (v: boolean) => void, actualClose: () => void, delay = 200) {
     setClosing(true)
     setTimeout(() => { setClosing(false); actualClose() }, delay)
@@ -66,7 +117,21 @@ function App() {
   const itemViews = useMemo(() => state.items
     .map((item) => ({ item, computed: computeItem(item, now) }))
     .sort((a, b) => a.computed.dueAt - b.computed.dueAt), [now, state.items])
-  const dueItems = itemViews.filter(({ item, computed }) => computed.isDue || (recentRestock && item.id === recentRestock.itemId))
+  const dueItems = useMemo(() => {
+    const filtered = itemViews.filter(({ item, computed }) =>
+      computed.isDue || (recentRestock && item.id === recentRestock.itemId)
+    )
+    // 刚补货的物品用补货前的快照 dueAt 排序，避免因 dueAt 重置而沉到列表底部
+    return filtered.sort((a, b) => {
+      const aDueAt = recentRestock?.itemId === a.item.id
+        ? computeItem(recentRestock.snapshot, now).dueAt
+        : a.computed.dueAt
+      const bDueAt = recentRestock?.itemId === b.item.id
+        ? computeItem(recentRestock.snapshot, now).dueAt
+        : b.computed.dueAt
+      return aDueAt - bDueAt
+    })
+  }, [itemViews, recentRestock, now])
   const detailItem = detailItemId ? state.items.find((item) => item.id === detailItemId) || null : null
   const categorySummaries = useMemo(() => state.categories.map((category) => {
     const views = itemViews.filter(({ item }) => item.category === category)
@@ -111,11 +176,10 @@ function App() {
         deferredClose(setEditorClosing, () => { setEditingItem(undefined); setNewItemCategory(undefined) })
       }
       else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
-      else if (activeCategory) deferredClose(setCategoryPanelClosing, () => setActiveCategory(null))
     }
     window.addEventListener("keydown", closeTopPanel)
     return () => window.removeEventListener("keydown", closeTopPanel)
-  }, [activeCategory, categoryCreatorOpen, categoryDialog, detailItemId, editingItem, settingsOpen])
+  }, [categoryCreatorOpen, categoryDialog, detailItemId, editingItem, settingsOpen])
 
   function commit(next: AppState) {
     setState({ ...next, updatedAt: Date.now() })
@@ -130,18 +194,12 @@ function App() {
   }
 
   function handleRestock(item: ReplenishmentItem) {
-    const snapshot = cloneItem(item)
-    updateItems([item.id], (current) => restockItem(current))
-    setRecentRestock({
-      itemId: item.id,
-      itemName: item.name,
-      amount: "",
-      qty: item.defaultQty ? String(item.defaultQty) : "",
-      platform: item.platform || "",
-      customPlatform: "",
-      linkDraft: item.link || "",
-      snapshot
-    })
+    // 打开补货弹窗，而不是展开内联输入卡
+    setRestockModalItemId(item.id)
+    setRestockModalOpen(true)
+    setSelectedPurchaseOption(null)
+    setRestockQty('')
+    setRestockPrice('')
   }
 
   function undoRestock() {
@@ -186,7 +244,7 @@ function App() {
     updateItems([item.id], (current) => calibrateRemainingDays(current, remainingDays))
   }
 
-  function quickEditItem(item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform">>) {
+  function quickEditItem(item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform" | "purchaseOptions">>) {
     updateItems([item.id], (current) => ({ ...current, ...patch, updatedAt: Date.now() }))
   }
 
@@ -252,6 +310,152 @@ function App() {
     setEditingItem(undefined)
   }
 
+  function renameItem(id: string, newName: string) {
+    setState(prev => ({
+      ...prev,
+      items: prev.items.map(item => 
+        item.id === id ? { ...item, name: newName } : item
+      ),
+      updatedAt: Date.now()
+    }))
+  }
+
+  function moveItemToCategory(id: string, newCategory: string) {
+    setState(prev => ({
+      ...prev,
+      items: prev.items.map(item => 
+        item.id === id ? { ...item, category: newCategory } : item
+      ),
+      updatedAt: Date.now()
+    }))
+  }
+
+  function deleteItemById(id: string) {
+    setState(prev => ({
+      ...prev,
+      items: prev.items.filter(item => item.id !== id),
+      updatedAt: Date.now()
+    }))
+  }
+
+  function handleRestockFromOption(itemId: string, option: PurchaseOption) {
+    const item = state.items.find(i => i.id === itemId)
+    if (!item) return
+    
+    // 使用采购选项的信息创建补货记录
+    const newRecord: RestockEvent = {
+      id: crypto.randomUUID(),
+      at: Date.now(),
+      price: option.price,
+      qty: item.defaultQty || 1,
+      platform: option.platform
+    }
+    
+    // 更新物品的 lastRestockAt 和 history
+    updateItems([itemId], (current) => ({
+      ...current,
+      lastRestockedAt: Date.now(),
+      history: [newRecord, ...(current.history || [])]
+    }))
+    
+    // 关闭详情面板
+    setDetailItemId(null)
+  }
+
+  function handleAddPurchaseOption(itemId: string, optionData: Omit<PurchaseOption, 'id'>) {
+    const option: PurchaseOption = {
+      id: crypto.randomUUID(),
+      ...optionData
+    }
+    
+    updateItems([itemId], (current) => ({
+      ...current,
+      purchaseOptions: [...(current.purchaseOptions || []), option]
+    }))
+    
+    // 关闭弹窗
+    setShowAddPurchaseModal(false)
+    setAddPurchaseOptionItemId(null)
+  }
+
+  // 保存编辑后的采购选项
+  function handleSaveEditedOption(editedOption: PurchaseOption) {
+    const item = state.items.find(i => i.purchaseOptions?.some(opt => opt.id === editedOption.id))
+    if (!item) return
+    
+    updateItems([item.id], (current) => ({
+      ...current,
+      purchaseOptions: (current.purchaseOptions || []).map(opt => 
+        opt.id === editedOption.id ? editedOption : opt
+      )
+    }))
+    
+    setEditModalOpen(false)
+    setEditingPurchaseOption(null)
+  }
+
+  // 编辑采购选项
+  function handleEditPurchaseOption(option: PurchaseOption) {
+    setEditingPurchaseOption(option)
+    setEditModalOpen(true)
+  }
+
+  // 删除采购选项
+  function handleDeletePurchaseOption(itemId: string, optionId: string) {
+    if (!window.confirm('确定要删除这个采购选项吗？')) return
+    
+    const item = state.items.find(i => i.id === itemId)
+    if (!item) return
+    
+    updateItems([itemId], (current) => ({
+      ...current,
+      purchaseOptions: (current.purchaseOptions || []).filter(opt => opt.id !== optionId)
+    }))
+  }
+
+  // 确认补货
+  function handleConfirmRestock() {
+    if (!restockModalItemId || !selectedPurchaseOption) return
+    
+    const item = state.items.find(i => i.id === restockModalItemId)
+    if (!item) return
+    
+    const qty = restockQty || 1
+    const price = restockPrice || selectedPurchaseOption.price || 0
+    
+    // 创建补货记录
+    const newRecord: RestockEvent = {
+      id: crypto.randomUUID(),
+      at: Date.now(),
+      price: price,
+      qty: qty,
+      platform: selectedPurchaseOption.platform
+    }
+    
+    // 更新物品状态
+    updateItems([item.id], (current) => ({
+      ...current,
+      lastRestockedAt: Date.now(),
+      history: [newRecord, ...(current.history || [])]
+    }))
+    
+    // 关闭弹窗并重置状态
+    setRestockModalOpen(false)
+    setRestockModalItemId(null)
+    setSelectedPurchaseOption(null)
+    setRestockQty('')
+    setRestockPrice('')
+  }
+
+  // 取消补货
+  function handleCancelRestock() {
+    setRestockModalOpen(false)
+    setRestockModalItemId(null)
+    setSelectedPurchaseOption(null)
+    setRestockQty('')
+    setRestockPrice('')
+  }
+
   function applyCycleSuggestion(item: ReplenishmentItem) {
     if (!item.suggestedCycleDays) return
     updateItems([item.id], (current) => ({
@@ -266,11 +470,11 @@ function App() {
     updateItems([item.id], (current) => ({ ...current, suggestedCycleDays: undefined, updatedAt: Date.now() }))
   }
 
-  function rateRestockEvent(itemId: string, eventId: string, rating: Rating, review?: string) {
+  function rateRestockEvent(itemId: string, eventId: string, rating?: Rating, review?: string) {
     updateItems([itemId], (item) => ({
       ...item,
       history: item.history.map((e) =>
-        e.id === eventId ? { ...e, rating, review: review?.trim() || undefined } : e
+        e.id === eventId ? { ...e, rating: rating ?? e.rating, review: review?.trim() || undefined } : e
       ),
       updatedAt: Date.now()
     }))
@@ -293,59 +497,78 @@ function App() {
 
   return (
     <div className="app-shell">
-      <header className="top-row">
-        <div className="brand-mark"><img src={catIcon} alt="403家庭管家" className="brand-cat" /></div>
-        <div className="top-actions">
-          <button className="icon-button" aria-label="提醒设置" onClick={() => setSettingsOpen(true)}><Icon name="settings" /></button>
-        </div>
+      <header className="topbar">
+        {/* Topbar 保留用于拖拽窗口 */}
       </header>
 
-      <main>
-        <CurrentTasks
-          items={dueItems}
-          recentRestock={recentRestock}
-          allItems={itemViews}
-          snoozeUntilHour={state.settings.snoozeUntilHour}
-          onRestock={handleRestock}
-          onSnooze={handleSnooze}
-          onUpdateRestock={(patch) => setRecentRestock((current) => current ? { ...current, ...patch } : current)}
-          onSaveRestock={saveRestockAmount}
-          onUndoRestock={undoRestock}
-          onDismissRestock={() => setRecentRestock(null)}
-          onApplySuggestion={applyCycleSuggestion}
-          onDismissSuggestion={dismissSuggestion}
-          onOpenItem={openItem}
+      <div className="app-body">
+        <Sidebar
+          dueCount={dueItems.length}
+          categorySummaries={categorySummaries}
+          activeCategory={activeCategory}
+          onSelectCategory={setActiveCategory}
+          onCreateCategory={() => setCategoryCreatorOpen(true)}
+          onOpenSettings={() => setSettingsOpen(true)}
+          onRenameCategory={renameCategory}
+          onDeleteCategory={(name) => deleteCategory(name)}
         />
+        <main className="work-area">
+          {activeCategory ? (
+            <CategoryWorkArea
+              category={activeCategory}
+              views={itemViews.filter(({ item }) => item.category === activeCategory)}
+              onAddItem={() => {
+                setCreatingCategory(activeCategory)
+                setIsItemCreatorOpen(true)
+              }}
+              onRename={() => setCategoryDialog("rename")}
+              onDelete={() => setCategoryDialog("delete")}
+              onEdit={editFromDetail}
+              onSnooze={handleSnooze}
+              onRestock={handleRestock}
+              onQuickEdit={quickEditItem}
+              onApplySuggestion={applyCycleSuggestion}
+              onDismissSuggestion={dismissSuggestion}
+              onRateEvent={rateRestockEvent}
+              onOpenItemEditor={(itemId) => {
+                setEditingItemId(itemId)
+                setIsItemEditorDialogOpen(true)
+              }}
+              onRestockFromOption={handleRestockFromOption}
+              showAddPurchaseModal={showAddPurchaseModal}
+              setShowAddPurchaseModal={setShowAddPurchaseModal}
+              addPurchaseOptionItemId={addPurchaseOptionItemId}
+              setAddPurchaseOptionItemId={setAddPurchaseOptionItemId}
+              onAddPurchaseOption={handleAddPurchaseOption}
+              editingPurchaseOption={editingPurchaseOption}
+              setEditingPurchaseOption={setEditingPurchaseOption}
+              editModalOpen={editModalOpen}
+              setEditModalOpen={setEditModalOpen}
+              onEditPurchaseOption={handleEditPurchaseOption}
+              onDeletePurchaseOption={handleDeletePurchaseOption}
+              onSaveEditedOption={handleSaveEditedOption}
+            />
+          ) : (
+            <CurrentTasks
+              items={dueItems}
+              recentRestock={recentRestock}
+              allItems={itemViews}
+              snoozeUntilHour={state.settings.snoozeUntilHour}
+              onRestock={handleRestock}
+              onSnooze={handleSnooze}
+              onUpdateRestock={(patch) => setRecentRestock((current) => current ? { ...current, ...patch } : current)}
+              onSaveRestock={saveRestockAmount}
+              onUndoRestock={undoRestock}
+              onDismissRestock={() => setRecentRestock(null)}
+              onApplySuggestion={applyCycleSuggestion}
+              onDismissSuggestion={dismissSuggestion}
+              onOpenItem={openItem}
+            />
+          )}
+        </main>
+      </div>
 
-        <section className="category-section home-category-section" aria-labelledby="category-title">
-          <div className="section-heading category-heading">
-            <h3 id="category-title">分类</h3>
-            <div className="category-heading-actions"><span>{state.categories.length} 组</span><button onClick={() => setCategoryCreatorOpen(true)}><Icon name="plus" size={15} />新建分类</button></div>
-          </div>
-          <div className="category-grid">
-            {categorySummaries.map((summary, i) => <CategoryCard key={summary.category} index={i} {...summary} onOpen={() => setActiveCategory(summary.category)} onRename={(name) => renameCategory(summary.category, name)} onDelete={() => deleteCategory(summary.category)} />)}
-          </div>
-        </section>
-      </main>
-
-      {(activeCategory || categoryPanelClosing) && (
-        <CategoryPanel
-          category={activeCategory || ""}
-          views={itemViews.filter(({ item }) => item.category === activeCategory)}
-          isClosing={categoryPanelClosing}
-          onClose={() => deferredClose(setCategoryPanelClosing, () => setActiveCategory(null))}
-          onAddItem={() => addItemToCategory(activeCategory || "")}
-          onEdit={editFromDetail}
-          onDeleteItem={deleteItem}
-          onSnooze={handleSnooze}
-          
-          onRestock={handleRestock}
-          onQuickEdit={quickEditItem}
-          onApplySuggestion={applyCycleSuggestion}
-          onDismissSuggestion={dismissSuggestion}
-          onRateEvent={rateRestockEvent}
-        />
-      )}
+      {/* overlays — 全部保留 */}
       {(detailItem || detailPanelClosing) && detailItem && (
         <ItemDetailPanel
           key={detailItem.id}
@@ -355,7 +578,6 @@ function App() {
           onClose={() => deferredClose(setDetailPanelClosing, () => setDetailItemId(null))}
           onEdit={editFromDetail}
           onSnooze={handleSnooze}
-          
           onRestock={handleRestock}
           onCalibrate={calibrateItem}
           onApplySuggestion={applyCycleSuggestion}
@@ -370,6 +592,41 @@ function App() {
         })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
       {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
+      {isItemCreatorOpen && (
+        <ItemCreatorDialog
+          category={creatingCategory || ''}
+          isOpen={isItemCreatorOpen}
+          onClose={() => {
+            setIsItemCreatorOpen(false)
+            setCreatingCategory(null)
+          }}
+          onCreate={(itemData) => {
+            console.log('App onCreate called with:', itemData)
+            const newItem = createItem({
+              name: itemData.name,
+              category: creatingCategory || '其他',
+              cycleDays: itemData.usageIntervalDays || 10,
+              bufferDays: 2,
+              unit: itemData.unit || '件',
+              defaultQty: itemData.initialStock ? String(itemData.initialStock) : '',
+              platform: itemData.platform || '',
+              link: '',
+              remainingDays: '',
+              learningEnabled: true,
+              price: itemData.price
+            })
+            console.log('Created newItem:', newItem)
+            commit({
+              ...state,
+              items: [...state.items, newItem],
+              categories: state.categories.includes(newItem.category)
+                ? state.categories
+                : [...state.categories, newItem.category]
+            })
+            console.log('State committed, new items count:', state.items.length + 1)
+          }}
+        />
+      )}
       {(categoryCreatorOpen || categoryCreatorClosing) && <CategoryCreator existingCategories={state.categories} isClosing={categoryCreatorClosing} onClose={() => deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)} onCreate={(name) => {
         const category = addCategory(name)
         if (!category) return false
@@ -377,6 +634,48 @@ function App() {
         return true
       }} />}
       {activeCategory && categoryDialog && <CategoryManagerDialog mode={categoryDialog} category={activeCategory} categories={state.categories} itemCount={state.items.filter((item) => item.category === activeCategory).length} isClosing={categoryManagerClosing} onClose={() => deferredClose(setCategoryManagerClosing, () => setCategoryDialog(null), 150)} onRename={(name) => renameCategory(activeCategory, name)} onDelete={(moveTo) => deleteCategory(activeCategory, moveTo)} />}
+      <ItemEditorDialog
+        item={state.items.find(i => i.id === editingItemId) || null}
+        categories={[...new Set(state.items.map(i => i.category))]}
+        isOpen={isItemEditorDialogOpen}
+        onClose={() => {
+          setIsItemEditorDialogOpen(false)
+          setEditingItemId(null)
+        }}
+        onRename={renameItem}
+        onMove={moveItemToCategory}
+        onDelete={deleteItemById}
+      />
+      
+      {/* 补货弹窗 */}
+      <RestockModal
+        isOpen={restockModalOpen}
+        onClose={handleCancelRestock}
+        item={restockModalItemId ? state.items.find(i => i.id === restockModalItemId) || null : null}
+        onConfirm={(itemId, option, qty, price) => {
+          const item = state.items.find(i => i.id === itemId)
+          if (!item) return
+          
+          // 创建补货记录
+          const newRecord: RestockEvent = {
+            id: crypto.randomUUID(),
+            at: Date.now(),
+            price: price,
+            qty: qty,
+            platform: option.platform
+          }
+          
+          // 更新物品状态
+          updateItems([item.id], (current) => ({
+            ...current,
+            lastRestockedAt: Date.now(),
+            history: [newRecord, ...(current.history || [])]
+          }))
+          
+          // 关闭弹窗并重置状态
+          handleCancelRestock()
+        }}
+      />
     </div>
   )
 }
@@ -485,7 +784,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
                     <span>
                       <strong>{item.name}</strong>
                       <small>
-                        {item.category} · {computed.remainingText}
+                        {formatItemStatusText(item, computed)}
                         {remainingQty && <span> · {remainingQty}</span>}
                       </small>
                     </span>
@@ -512,7 +811,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
 
       {!hasAny && (
         <div className="all-good-msg">
-          <Icon name="check" size={32} />
+          <img src={catIcon} alt="家庭管家" className="all-good-cat" />
           <span>家里的消耗品都很充足，继续保持！</span>
         </div>
       )}
@@ -751,7 +1050,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteIt
   onQuickEdit: (item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform">>) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
-  onRateEvent: (itemId: string, eventId: string, rating: Rating, review?: string) => void
+  onRateEvent: (itemId: string, eventId: string, rating?: Rating, review?: string) => void
   isClosing?: boolean
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null)
@@ -760,7 +1059,7 @@ function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteIt
   const [unitCustomId, setUnitCustomId] = useState<string | null>(null)
   const [ratingEventId, setRatingEventId] = useState<string | null>(null)
   const [ratingItemId, setRatingItemId] = useState<string | null>(null)
-  const [ratingDraft, setRatingDraft] = useState<{ rating: Rating | null; review: string }>({ rating: null, review: "" })
+  const [ratingDraft, setRatingDraft] = useState<{ review: string }>({ review: "" })
   const [itemDeleteId, setItemDeleteId] = useState<string | null>(null)
   const [savedFieldKey, setSavedFieldKey] = useState<string | null>(null)
   const urgent = views.filter(({ computed }) => computed.status === "urgent" && computed.isDue).length
@@ -831,11 +1130,11 @@ function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteIt
   }
 
   function submitRating(itemId: string, eventId: string) {
-    if (!ratingDraft.rating) return
-    onRateEvent(itemId, eventId, ratingDraft.rating, ratingDraft.review || undefined)
+    if (!ratingDraft.review.trim()) return
+    onRateEvent(itemId, eventId, undefined, ratingDraft.review)
     setRatingEventId(null)
     setRatingItemId(null)
-    setRatingDraft({ rating: null, review: "" })
+    setRatingDraft({ review: "" })
   }
 
   return (
@@ -867,34 +1166,6 @@ function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteIt
                       <TaskActions item={item} onRestock={onRestock} />
                     </div>
                   )}
-                  <div className="detail-facts-bar">
-                    <div className="detail-fact">
-                      <span>补货间隔</span>
-                      {editingField?.id === item.id && editingField.field === "cycleDays" ? (
-                        <div className="inline-edit">
-                          <div className="input-suffix"><input autoFocus type="number" min="1" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={() => saveEditing(item)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveEditing(item) } if (e.key === "Escape") setEditingField(null) }} /><b>天</b></div>
-                        </div>
-                      ) : (
-                        <button className="detail-fact-edit" onClick={() => startEditing(item.id, "cycleDays", item.cycleDays)}><strong>约 {item.cycleDays} 天</strong><Icon name="edit" size={13} /></button>
-                      )}
-                      {savedFieldKey === `${item.id}-cycleDays` && <small style={{ color: "var(--signal-normal)", fontSize: 11 }}>已保存</small>}
-                    </div>
-                    <div className="detail-fact">
-                      <span>提前提醒</span>
-                      {editingField?.id === item.id && editingField.field === "bufferDays" ? (
-                        <div className="inline-edit">
-                          <div className="input-suffix"><input autoFocus type="number" min="0" value={editValue} onChange={(e) => setEditValue(e.target.value)} onBlur={() => saveEditing(item)} onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); saveEditing(item) } if (e.key === "Escape") setEditingField(null) }} /><b>天</b></div>
-                        </div>
-                      ) : (
-                        <button className="detail-fact-edit" onClick={() => startEditing(item.id, "bufferDays", item.bufferDays)}><strong>{item.bufferDays} 天</strong><Icon name="edit" size={13} /></button>
-                      )}
-                      {savedFieldKey === `${item.id}-bufferDays` && <small style={{ color: "var(--signal-normal)", fontSize: 11 }}>已保存</small>}
-                    </div>
-                    <div className="detail-fact">
-                      <span>上次补货</span>
-                      <strong>{formatDate(item.lastRestockedAt)}</strong>
-                    </div>
-                  </div>
                   <div className="detail-purchase-info">
                     <h3 className="detail-section-title">补货设置</h3>
                     <div className="detail-link-row">
@@ -960,13 +1231,8 @@ function CategoryPanel({ category, views, onClose, onAddItem, onEdit, onDeleteIt
                             {ratingEventId === event.id && ratingItemId === item.id && (
                               <div className="rating-form">
                                 <span>这次买的怎么样？</span>
-                                <div className="rating-options">
-                                  <button className={ratingDraft.rating === 3 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 3 })}>👍 好评</button>
-                                  <button className={ratingDraft.rating === 2 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 2 })}>😐 一般</button>
-                                  <button className={ratingDraft.rating === 1 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 1 })}>👎 差评</button>
-                                </div>
-                                <input type="text" value={ratingDraft.review} onChange={(e) => setRatingDraft({ ...ratingDraft, review: e.target.value })} placeholder="备注（选填）" />
-                                <button className="primary-button compact" onClick={() => submitRating(item.id, event.id)} disabled={!ratingDraft.rating}>保存</button>
+                                <textarea className="review-textarea" value={ratingDraft.review} onChange={(e) => setRatingDraft({ review: e.target.value })} placeholder="请输入您的评价..." rows={4} />
+                                <button className="primary-button compact" onClick={() => submitRating(item.id, event.id)} disabled={!ratingDraft.review.trim()}>保存</button>
                                 <button className="quiet-button compact" onClick={() => { setRatingEventId(null); setRatingItemId(null) }}>取消</button>
                               </div>
                             )}
@@ -1071,13 +1337,13 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
   onCalibrate: (item: ReplenishmentItem, remainingDays: number) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
-  onRateEvent: (itemId: string, eventId: string, rating: Rating, review?: string) => void
+  onRateEvent: (itemId: string, eventId: string, rating?: Rating, review?: string) => void
   isClosing?: boolean
 }) {
   const [calibrating, setCalibrating] = useState(false)
   const [remainingDays, setRemainingDays] = useState(String(Math.max(0, computed.daysUntilDepletion)))
   const [ratingEventId, setRatingEventId] = useState<string | null>(null)
-  const [ratingDraft, setRatingDraft] = useState<{ rating: Rating | null; review: string }>({ rating: null, review: "" })
+  const [ratingDraft, setRatingDraft] = useState<{ review: string }>({ review: "" })
 
   const priceAnchor = calculatePriceAnchor(item.history)
   const consumption = calculateConsumption(item)
@@ -1093,10 +1359,10 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
   }
 
   function submitRating(eventId: string) {
-    if (!ratingDraft.rating) return
-    onRateEvent(item.id, eventId, ratingDraft.rating, ratingDraft.review || undefined)
+    if (!ratingDraft.review.trim()) return
+    onRateEvent(item.id, eventId, undefined, ratingDraft.review)
     setRatingEventId(null)
-    setRatingDraft({ rating: null, review: "" })
+    setRatingDraft({ review: "" })
   }
 
   return (
@@ -1129,18 +1395,6 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
 
         {/* 关键信息网格 */}
         <div className="detail-stats">
-          <div className="detail-stat">
-            <span className="detail-stat-label">补货间隔</span>
-            <strong className="detail-stat-value">约 {item.cycleDays} 天</strong>
-          </div>
-          <div className="detail-stat">
-            <span className="detail-stat-label">提前提醒</span>
-            <strong className="detail-stat-value">{item.bufferDays} 天</strong>
-          </div>
-          <div className="detail-stat">
-            <span className="detail-stat-label">上次补货</span>
-            <strong className="detail-stat-value">{formatDate(item.lastRestockedAt)}</strong>
-          </div>
           <div className="detail-stat">
             <span className="detail-stat-label">补货记录</span>
             <strong className="detail-stat-value">{item.history.length} 次</strong>
@@ -1231,15 +1485,10 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
                   {ratingEventId === event.id && (
                     <div className="rating-form">
                       <span>这次买的怎么样？</span>
-                      <div className="rating-options">
-                        <button className={ratingDraft.rating === 3 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 3 })}>👍 好评</button>
-                        <button className={ratingDraft.rating === 2 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 2 })}>😐 一般</button>
-                        <button className={ratingDraft.rating === 1 ? "active" : ""} onClick={() => setRatingDraft({ ...ratingDraft, rating: 1 })}>👎 差评</button>
-                      </div>
-                      <input type="text" value={ratingDraft.review} onChange={(e) => setRatingDraft({ ...ratingDraft, review: e.target.value })} placeholder="备注（选填）" />
+                      <textarea className="review-textarea" value={ratingDraft.review} onChange={(e) => setRatingDraft({ review: e.target.value })} placeholder="请输入您的评价..." rows={4} />
                       <div className="rating-form-actions">
                         <button className="quiet-button compact" onClick={() => setRatingEventId(null)}>取消</button>
-                        <button className="primary-button compact" onClick={() => submitRating(event.id)} disabled={!ratingDraft.rating}>保存</button>
+                        <button className="primary-button compact" onClick={() => submitRating(event.id)} disabled={!ratingDraft.review.trim()}>保存</button>
                       </div>
                     </div>
                   )}
@@ -1461,9 +1710,9 @@ function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppStat
   return (
     <div className={`overlay settings-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className={`settings-dialog ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-title">
-        <div className="settings-dialog-header"><h2 id="settings-title">提醒与预算</h2><button className="icon-button" aria-label="关闭" onClick={onClose}><Icon name="close" /></button></div>
+        <div className="settings-dialog-header"><h2 id="settings-title">提醒与预算</h2><button className="icon-button close-btn" aria-label="关闭" onClick={onClose}><Icon name="close" size={16} /></button></div>
         <div className="settings-body">
-          <div className="settings-row"><span className="settings-row-label">每月生活预算</span><div className="settings-row-control"><div className="input-prefix budget-input"><b>¥</b><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div></div>
+          <div className="settings-row"><span className="settings-row-label">每月生活预算</span><div className="settings-row-control"><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div>
           <div className="settings-row"><span className="settings-row-label">重复提醒间隔</span><div className="settings-row-control"><div className="segment-control"><button className={settings.reminderIntervalMinutes === 30 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 30 })}>30 分钟</button><button className={settings.reminderIntervalMinutes === 60 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 60 })}>60 分钟</button></div></div></div>
           <div className="settings-row"><span className="settings-row-label">勿扰时段</span><div className="settings-row-control"><div className="time-range"><input type="time" value={settings.quietStart} onChange={(event) => patch({ quietStart: event.target.value })} /><span>至</span><input type="time" value={settings.quietEnd} onChange={(event) => patch({ quietEnd: event.target.value })} /></div></div></div>
           <div className="settings-row"><span className="settings-row-label">明天几点提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="0" max="23" value={settings.snoozeUntilHour} onChange={(event) => patch({ snoozeUntilHour: Number(event.target.value) })} /><b>点</b></div></div></div>
@@ -1475,3 +1724,1434 @@ function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppStat
 }
 
 export default App
+
+// 补货弹窗组件
+interface RestockModalProps {
+  isOpen: boolean
+  onClose: () => void
+  item: ReplenishmentItem | null
+  onConfirm: (itemId: string, option: PurchaseOption, qty: number, price: number) => void
+}
+
+function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
+  const [selectedOption, setSelectedOption] = useState<PurchaseOption | null>(null)
+  const [qty, setQty] = useState<number | ''>('')
+  const [price, setPrice] = useState<number | ''>('')
+  
+  // 当选中选项时，自动填充默认值
+  useEffect(() => {
+    if (selectedOption) {
+      setQty(selectedOption.unit ? 1 : '')
+      setPrice(selectedOption.price || '')
+    } else {
+      setQty('')
+      setPrice('')
+    }
+  }, [selectedOption])
+  
+  if (!isOpen || !item) return null
+  
+  const purchaseOptions = item.purchaseOptions || []
+  
+  return (
+    <div className="restock-modal-overlay" onClick={onClose}>
+      <div className="restock-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>选择采购选项 - {item.name}</h3>
+          <button className="icon-button modal-close-btn" onClick={onClose}>
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        
+        <div className="modal-body">
+          {/* 采购选项列表 */}
+          {purchaseOptions.length > 0 ? (
+            <div className="purchase-option-list">
+              {purchaseOptions.map((option) => {
+                // 从补货记录中匹配该平台最近的有评价内容
+                const latestReview = (item.history || [])
+                  .find(e => e.platform === option.platform && e.review)
+                
+                return (
+                  <button
+                    key={option.id}
+                    className={`purchase-option-item ${selectedOption?.id === option.id ? 'is-selected' : ''}`}
+                    onClick={() => setSelectedOption(option)}
+                  >
+                    <div className="option-info">
+                      <span className="option-name-platform">{option.productName} · {option.platform}</span>
+                      {latestReview && <span className="option-review-text">{latestReview.review}</span>}
+                    </div>
+                    <div className="option-price">
+                      ¥{option.price ? formatPrice(option.price) : '0.00'}/{option.unit || '件'}
+                    </div>
+                  </button>
+                )
+              })}
+            </div>
+          ) : (
+            <p className="empty-hint">暂无采购选项，请先在详情中添加</p>
+          )}
+          
+          {/* 数量和价格输入 */}
+          {selectedOption && (
+            <div className="restock-inputs">
+              <div className="input-row">
+                <label>采购数量：</label>
+                <input
+                  type="number"
+                  min="1"
+                  value={qty}
+                  onChange={(e) => setQty(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="例如：2"
+                />
+                <span className="unit-text">{selectedOption.unit || '件'}</span>
+              </div>
+              
+              <div className="input-row">
+                <label>采购价格：</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={price}
+                  onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="例如：50"
+                />
+                <span className="unit-text">元</span>
+              </div>
+            </div>
+          )}
+        </div>
+        
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>取消</button>
+          <button 
+            className="btn btn-primary" 
+            onClick={() => {
+              if (selectedOption && qty) {
+                onConfirm(item.id, selectedOption, Number(qty), Number(price) || 0)
+              }
+            }}
+            disabled={!selectedOption || !qty}
+          >
+            确认补货
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ItemEditorDialog({
+  item,
+  categories,
+  isOpen,
+  onClose,
+  onRename,
+  onMove,
+  onDelete
+}: {
+  item: ReplenishmentItem | null
+  categories: string[]
+  isOpen: boolean
+  onClose: () => void
+  onRename: (id: string, newName: string) => void
+  onMove: (id: string, newCategory: string) => void
+  onDelete: (id: string) => void
+}) {
+  if (!isOpen || !item) return null
+  
+  const [name, setName] = useState(item.name)
+  const [category, setCategory] = useState(item.category)
+  
+  const handleSave = () => {
+    if (name !== item.name) {
+      onRename(item.id, name)
+    }
+    if (category !== item.category) {
+      onMove(item.id, category)
+    }
+    onClose()
+  }
+  
+  const handleDelete = () => {
+    if (window.confirm(`确定要删除"${item.name}"吗？`)) {
+      onDelete(item.id)
+      onClose()
+    }
+  }
+  
+  return (
+    <div className="dialog-overlay" onClick={onClose}>
+      <div className="dialog-container item-editor-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="dialog-header">
+          <h2>编辑物品</h2>
+          <button className="icon-button close-btn" onClick={onClose}>
+            <Icon name="close" size={16} />
+          </button>
+        </div>
+        
+        <div className="dialog-form">
+          <div className="form-group">
+            <label>名称</label>
+            <input 
+              type="text" 
+              value={name} 
+              onChange={(e) => setName(e.target.value)}
+              autoFocus
+            />
+          </div>
+          
+          <div className="form-group">
+            <label>分类</label>
+            <select value={category} onChange={(e) => setCategory(e.target.value)}>
+              {categories.map(cat => (
+                <option key={cat} value={cat}>{cat}</option>
+              ))}
+            </select>
+          </div>
+          
+          <div className="dialog-actions">
+            <button className="quiet-button danger" onClick={handleDelete}>删除</button>
+            <div style={{ flex: 1 }} />
+            <button className="quiet-button" onClick={onClose}>取消</button>
+            <button className="primary-button" onClick={handleSave}>保存</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ItemCreatorDialog({
+  category,
+  isOpen, 
+  onClose, 
+  onCreate 
+}: {
+  category: string
+  isOpen: boolean
+  onClose: () => void
+  onCreate: (item: { name: string; initialStock?: number; unit?: string; price?: number; platform?: string; usageIntervalDays?: number; reminderDaysAhead?: number }) => void
+}) {
+  const [name, setName] = useState('')
+  const [initialStock, setInitialStock] = useState(1)
+  const [unit, setUnit] = useState('个')
+  const [price, setPrice] = useState<number | ''>('')
+  const [platform, setPlatform] = useState('')
+  const [usageIntervalDays, setUsageIntervalDays] = useState<number | ''>(30)
+  const [reminderDaysAhead, setReminderDaysAhead] = useState<number | ''>('')
+  
+  if (!isOpen) return null
+  
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    onCreate({ 
+      name, 
+      initialStock, 
+      unit, 
+      price: price === '' ? undefined : price,
+      platform: platform || undefined,
+      usageIntervalDays: usageIntervalDays === '' ? undefined : usageIntervalDays,
+      reminderDaysAhead: reminderDaysAhead === '' ? undefined : reminderDaysAhead
+    })
+    onClose()
+  }
+  
+  return (
+    <div className="dialog-overlay" onClick={onClose}>
+      <div className="dialog-container item-creator-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="dialog-header">
+          <h2>添加消耗品</h2>
+          <button className="icon-button close-btn" onClick={onClose}>
+            <Icon name="close" size={16} />
+          </button>
+        </div>
+        
+        <form onSubmit={handleSubmit} className="dialog-form">
+          <div className="form-group">
+            <label>名称</label>
+            <input 
+              type="text" 
+              value={name} 
+              onChange={(e) => setName(e.target.value)}
+              placeholder="例如：猫砂、洗衣液"
+              autoFocus
+            />
+          </div>
+          
+          <div className="form-row">
+            <div className="form-group">
+              <label>初始数量</label>
+              <input 
+                type="number" 
+                min="1"
+                value={initialStock} 
+                onChange={(e) => setInitialStock(Number(e.target.value))}
+              />
+            </div>
+            
+            <div className="form-group">
+              <label>单位</label>
+              <select value={unit} onChange={(e) => setUnit(e.target.value)}>
+                <option value="个">个</option>
+                <option value="瓶">瓶</option>
+                <option value="袋">袋</option>
+                <option value="盒">盒</option>
+                <option value="包">包</option>
+                <option value="桶">桶</option>
+              </select>
+            </div>
+          </div>
+          
+          <div className="form-row">
+            <div className="form-group">
+              <label>价格（可选）</label>
+              <input 
+                type="number" 
+                min="0"
+                step="0.01"
+                value={price} 
+                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                placeholder="例如：29.9"
+              />
+            </div>
+            
+            <div className="form-group">
+              <label>购买平台（可选）</label>
+              <input 
+                type="text" 
+                value={platform} 
+                onChange={(e) => setPlatform(e.target.value)}
+                placeholder="例如：淘宝、京东"
+              />
+            </div>
+          </div>
+          
+          <div className="form-row">
+            <div className="form-group">
+              <label>消耗周期（天）</label>
+              <div className="input-with-unit">
+                <input 
+                  type="number" 
+                  min="1"
+                  value={usageIntervalDays} 
+                  onChange={(e) => setUsageIntervalDays(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="例如：30"
+                />
+                <span className="unit-label">天</span>
+              </div>
+            </div>
+            
+            <div className="form-group">
+              <label>提前提醒（天）</label>
+              <div className="input-with-unit">
+                <input 
+                  type="number" 
+                  min="0"
+                  value={reminderDaysAhead} 
+                  onChange={(e) => setReminderDaysAhead(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="例如：3"
+                />
+                <span className="unit-label">天</span>
+              </div>
+            </div>
+          </div>
+          
+          <div className="dialog-actions">
+            <button type="button" className="quiet-button" onClick={onClose}>取消</button>
+            <button type="submit" className="primary-button green">添加</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  )
+}
+
+interface EditPurchaseOptionModalProps {
+  isOpen: boolean
+  onClose: () => void
+  option: PurchaseOption | null
+  onSave: (editedOption: PurchaseOption) => void
+}
+
+interface AddPurchaseOptionModalProps {
+  isOpen: boolean
+  onClose: () => void
+  onSave: (option: Omit<PurchaseOption, 'id'>) => void
+}
+
+function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionModalProps) {
+  const [productName, setProductName] = useState('')
+  const [platform, setPlatform] = useState('')
+  const [unit, setUnit] = useState('')
+  const [unitCustom, setUnitCustom] = useState('')
+  const [price, setPrice] = useState<number | ''>('')
+  
+  const showUnitCustom = unit === '其他'
+
+  const handleSubmit = () => {
+    const finalUnit = showUnitCustom ? unitCustom : unit
+    if (!productName || !platform || !finalUnit) return
+    
+    onSave({
+      productName,
+      platform,
+      unit: finalUnit,
+      price: price !== '' ? Number(price) : undefined,
+      isDefault: false
+    })
+    
+    // 重置表单
+    setProductName('')
+    setPlatform('')
+    setUnit('')
+    setUnitCustom('')
+    setPrice('')
+    onClose()
+  }
+  
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSubmit()
+    } else if (e.key === 'Escape') {
+      onClose()
+    }
+  }
+  
+  if (!isOpen) return null
+  
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-container" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>添加采购选项</h3>
+          <button className="icon-button modal-close-btn" onClick={onClose}>
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        
+        <div className="modal-body">
+          <div className="form-row">
+            <div className="form-group">
+              <label>商品名称：</label>
+              <input
+                type="text"
+                value={productName}
+                onChange={(e) => setProductName(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="例如：维达超韧卫生纸"
+                autoFocus
+              />
+            </div>
+            
+            <div className="form-group">
+              <label>购买平台：</label>
+              <select
+                value={platform}
+                onChange={(e) => setPlatform(e.target.value)}
+                onKeyDown={handleKeyDown}
+              >
+                <option value="">选择平台</option>
+                {platforms.map((p) => (
+                  <option key={p} value={p}>{p}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          
+          <div className="form-row">
+            <div className="form-group">
+              <label>计量单位：</label>
+              <select
+                value={showUnitCustom ? '其他' : unit}
+                onChange={(e) => {
+                  setUnit(e.target.value)
+                  if (e.target.value !== '其他') setUnitCustom('')
+                }}
+                onKeyDown={handleKeyDown}
+              >
+                <option value="">选择单位</option>
+                {units.map((u) => (
+                  <option key={u} value={u}>{u}</option>
+                ))}
+              </select>
+              {showUnitCustom && (
+                <input
+                  type="text"
+                  value={unitCustom}
+                  onChange={(e) => setUnitCustom(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="输入自定义单位"
+                  style={{ marginTop: '8px' }}
+                />
+              )}
+            </div>
+            
+            <div className="form-group">
+              <label>采购价格：</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={price}
+                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                onKeyDown={handleKeyDown}
+                placeholder="例如：59.9"
+              />
+            </div>
+          </div>
+        </div>
+        
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>取消</button>
+          <button 
+            className="btn btn-primary" 
+            onClick={handleSubmit}
+            disabled={!productName || !platform || !(showUnitCustom ? unitCustom : unit)}
+          >
+            添加
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EditPurchaseOptionModal({ isOpen, onClose, option, onSave }: EditPurchaseOptionModalProps) {
+  const [productName, setProductName] = useState('')
+  const [platform, setPlatform] = useState('')
+  const [unit, setUnit] = useState('')
+  const [unitCustom, setUnitCustom] = useState('')
+  const [price, setPrice] = useState<number | ''>('')
+  const [link, setLink] = useState('')
+  
+  const showUnitCustom = unit === '其他' || (!!option?.unit && !units.includes(option.unit as typeof units[number]))
+
+  useEffect(() => {
+    if (option) {
+      setProductName(option.productName)
+      setPlatform(option.platform)
+      const isKnownUnit = units.includes(option.unit as typeof units[number])
+      if (isKnownUnit) {
+        setUnit(option.unit)
+        setUnitCustom('')
+      } else {
+        setUnit('其他')
+        setUnitCustom(option.unit)
+      }
+      setPrice(option.price || '')
+      setLink(option.link || '')
+    }
+  }, [option])
+  
+  if (!isOpen || !option) return null
+  
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-container" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>编辑采购选项</h3>
+          <button className="icon-button modal-close-btn" onClick={onClose}>
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        
+        <div className="modal-body">
+          <div className="form-group">
+            <label>商品名称：</label>
+            <input
+              type="text"
+              value={productName}
+              onChange={(e) => setProductName(e.target.value)}
+              placeholder="例如：维达超韧卫生纸"
+            />
+          </div>
+          
+          <div className="form-group">
+            <label>购买平台：</label>
+            <select
+              value={platform}
+              onChange={(e) => setPlatform(e.target.value)}
+            >
+              <option value="">选择平台</option>
+              {platforms.map((p) => (
+                <option key={p} value={p}>{p}</option>
+              ))}
+            </select>
+          </div>
+          
+          <div className="form-row">
+            <div className="form-group">
+              <label>计量单位：</label>
+              <select
+                value={showUnitCustom ? '其他' : unit}
+                onChange={(e) => {
+                  setUnit(e.target.value)
+                  if (e.target.value !== '其他') setUnitCustom('')
+                }}
+              >
+                <option value="">选择单位</option>
+                {units.map((u) => (
+                  <option key={u} value={u}>{u}</option>
+                ))}
+              </select>
+              {showUnitCustom && (
+                <input
+                  type="text"
+                  value={unitCustom}
+                  onChange={(e) => setUnitCustom(e.target.value)}
+                  placeholder="输入自定义单位"
+                  style={{ marginTop: '8px' }}
+                />
+              )}
+            </div>
+            
+            <div className="form-group">
+              <label>采购价格：</label>
+              <input
+                type="number"
+                min="0"
+                step="0.01"
+                value={price}
+                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
+                placeholder="例如：59.9"
+              />
+            </div>
+          </div>
+          
+          <div className="form-group">
+            <label>商品链接（可选）：</label>
+            <input
+              type="url"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              placeholder="https://..."
+            />
+          </div>
+        </div>
+        
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>取消</button>
+          <button 
+            className="btn btn-primary" 
+            onClick={() => {
+              const finalUnit = showUnitCustom ? unitCustom : unit
+              onSave({
+                ...option,
+                productName,
+                platform,
+                unit: finalUnit,
+                price: Number(price) || undefined,
+                link: link || undefined
+              })
+            }}
+          >
+            保存
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+interface ReviewEditModalProps {
+  isOpen: boolean
+  onClose: () => void
+  record: RestockEvent | null
+  itemName: string
+  initialReview: string
+  onSave: (review: string) => void
+}
+
+function ReviewEditModal({ isOpen, onClose, record, itemName, initialReview, onSave }: ReviewEditModalProps) {
+  const [reviewText, setReviewText] = useState(initialReview)
+  
+  useEffect(() => {
+    setReviewText(initialReview)
+  }, [initialReview])
+  
+  const handleSubmit = () => {
+    onSave(reviewText.trim())
+    onClose()
+  }
+  
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSubmit()
+    } else if (e.key === 'Escape') {
+      onClose()
+    }
+  }
+  
+  if (!isOpen || !record) return null
+  
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-container" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-header">
+          <h3>{record.review ? "编辑评价" : "添加评价"}</h3>
+          <button className="icon-button modal-close-btn" onClick={onClose}>
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+        
+        <div className="modal-body">
+          <div className="form-group">
+            <textarea
+              value={reviewText}
+              onChange={(e) => setReviewText(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="请输入您的评价..."
+              autoFocus
+              className="review-textarea"
+            />
+          </div>
+        </div>
+        
+        <div className="modal-footer">
+          <button className="btn btn-secondary" onClick={onClose}>取消</button>
+          <button 
+            className="btn btn-primary" 
+            onClick={handleSubmit}
+          >
+            确认
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEdit, onSnooze, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent, onOpenItemEditor, onRestockFromOption, showAddPurchaseModal, setShowAddPurchaseModal, addPurchaseOptionItemId, setAddPurchaseOptionItemId, onAddPurchaseOption, editingPurchaseOption, setEditingPurchaseOption, editModalOpen, setEditModalOpen, onEditPurchaseOption, onDeletePurchaseOption, onSaveEditedOption }: {
+  category: string
+  views: ItemView[]
+  onAddItem: () => void
+  onRename: () => void
+  onDelete: () => void
+  onEdit: (item: ReplenishmentItem) => void
+  onSnooze: (item: ReplenishmentItem) => void
+  onRestock: (item: ReplenishmentItem) => void
+  onQuickEdit: (item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform" | "purchaseOptions">>) => void
+  onApplySuggestion: (item: ReplenishmentItem) => void
+  onDismissSuggestion: (item: ReplenishmentItem) => void
+  onRateEvent: (itemId: string, eventId: string, rating?: Rating, review?: string) => void
+  onOpenItemEditor: (itemId: string) => void
+  onRestockFromOption: (itemId: string, option: PurchaseOption) => void
+  showAddPurchaseModal: boolean
+  setShowAddPurchaseModal: React.Dispatch<React.SetStateAction<boolean>>
+  addPurchaseOptionItemId: string | null
+  setAddPurchaseOptionItemId: React.Dispatch<React.SetStateAction<string | null>>
+  onAddPurchaseOption: (itemId: string, optionData: Omit<PurchaseOption, 'id'>) => void
+  editingPurchaseOption: PurchaseOption | null
+  setEditingPurchaseOption: React.Dispatch<React.SetStateAction<PurchaseOption | null>>
+  editModalOpen: boolean
+  setEditModalOpen: React.Dispatch<React.SetStateAction<boolean>>
+  onEditPurchaseOption: (option: PurchaseOption) => void
+  onDeletePurchaseOption: (itemId: string, optionId: string) => void
+  onSaveEditedOption: (editedOption: PurchaseOption) => void
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null)
+  const [editingField, setEditingField] = useState<{ id: string; field: "cycleDays" | "bufferDays" | "link" | "defaultQty" | "unit" | "platform" } | null>(null)
+  const [editValue, setEditValue] = useState("")
+  const [unitCustomId, setUnitCustomId] = useState<string | null>(null)
+  const [ratingEventId, setRatingEventId] = useState<string | null>(null)
+  const [ratingItemId, setRatingItemId] = useState<string | null>(null)
+  const [ratingDraft, setRatingDraft] = useState<{ review: string }>({ review: "" })
+  const [savedFieldKey, setSavedFieldKey] = useState<string | null>(null)
+  const [hoveredItemId, setHoveredItemId] = useState<string | null>(null)
+  const [editingUsageInterval, setEditingUsageInterval] = useState(false)
+  const [editingReminderDays, setEditingReminderDays] = useState(false)
+  const [tempUsageInterval, setTempUsageInterval] = useState<string | number>('')
+  const [tempReminderDays, setTempReminderDays] = useState<string | number>('')
+  const [editingReviewId, setEditingReviewId] = useState<string | null>(null)
+  const [tempReview, setTempReview] = useState('')
+  const [showActionMenu, setShowActionMenu] = useState<string | null>(null) // 操作菜单显示状态
+  const [historyExpanded, setHistoryExpanded] = useState<Set<string>>(new Set())
+  
+  // 评价弹窗状态
+  const [reviewModalOpen, setReviewModalOpen] = useState(false)
+  const [selectedRecord, setSelectedRecord] = useState<RestockEvent | null>(null)
+  const [editingReviewText, setEditingReviewText] = useState('')
+  const [currentItemName, setCurrentItemName] = useState('')
+  const [currentItemId, setCurrentItemId] = useState<string | null>(null)
+
+  // Escape key to collapse expanded item
+  useEffect(() => {
+    if (expandedId === null) return
+    function handleKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setExpandedId(null)
+        setEditingField(null)
+      }
+    }
+    document.addEventListener("keydown", handleKeyDown)
+    return () => document.removeEventListener("keydown", handleKeyDown)
+  }, [expandedId])
+
+  // 点击外部关闭操作菜单
+  useEffect(() => {
+    if (!showActionMenu) return
+    
+    function handleClickOutside(event: MouseEvent) {
+      const target = event.target as HTMLElement
+      // 如果点击的不是操作菜单或其子元素，则关闭菜单
+      if (!target.closest('.action-menu') && !target.closest('.edit-option-btn')) {
+        setShowActionMenu(null)
+      }
+    }
+    
+    document.addEventListener('mousedown', handleClickOutside)
+    return () => document.removeEventListener('mousedown', handleClickOutside)
+  }, [showActionMenu])
+
+  function toggleExpand(item: ReplenishmentItem, computed: ItemComputed) {
+    if (expandedId === item.id) {
+      setExpandedId(null)
+      setEditingField(null)
+      setUnitCustomId(null)
+    } else {
+      setExpandedId(item.id)
+      setEditingField(null)
+      setUnitCustomId(null)
+    }
+  }
+
+  function startEditing(itemId: string, field: "cycleDays" | "bufferDays" | "link" | "defaultQty" | "unit" | "platform", currentValue: number | string) {
+    setEditingField({ id: itemId, field })
+    setEditValue(String(currentValue))
+  }
+
+  function flashSaved(key: string) {
+    setSavedFieldKey(key)
+    setTimeout(() => setSavedFieldKey(null), 1200)
+  }
+
+  function saveEditing(item: ReplenishmentItem) {
+    if (!editingField) return
+    if (editingField.field === "link") {
+      onQuickEdit(item, { link: editValue || undefined })
+      flashSaved(`${item.id}-link`)
+      setEditingField(null)
+      return
+    }
+    if (editingField.field === "defaultQty") {
+      const trimmed = editValue.trim()
+      const num = Number(trimmed)
+      onQuickEdit(item, { defaultQty: trimmed && Number.isFinite(num) && num > 0 ? Math.round(num) : undefined })
+      flashSaved(`${item.id}-defaultQty`)
+      setEditingField(null)
+      return
+    }
+    const num = Number(editValue)
+    if (isNaN(num) || num < 1) { setEditingField(null); return }
+    if (editingField.field === "cycleDays") {
+      onQuickEdit(item, { cycleDays: Math.max(1, num) })
+      flashSaved(`${item.id}-cycleDays`)
+    } else {
+      onQuickEdit(item, { bufferDays: Math.max(0, num) })
+      flashSaved(`${item.id}-bufferDays`)
+    }
+    setEditingField(null)
+  }
+
+  function submitRating(itemId: string, eventId: string) {
+    if (!ratingDraft.review.trim()) return
+    onRateEvent(itemId, eventId, undefined, ratingDraft.review)
+    setRatingEventId(null)
+    setRatingItemId(null)
+    setRatingDraft({ review: "" })
+  }
+
+  // 开始编辑补货间隔
+  function handleStartEditUsageInterval(item: ReplenishmentItem) {
+    setTempUsageInterval(item.cycleDays || '')
+    setEditingUsageInterval(true)
+  }
+
+  // 保存补货间隔
+  function handleSaveUsageInterval(item: ReplenishmentItem) {
+    const newValue = tempUsageInterval === '' ? undefined : Number(tempUsageInterval)
+    onQuickEdit(item, { cycleDays: newValue })
+    setEditingUsageInterval(false)
+  }
+
+  // 开始编辑提前提醒
+  function handleStartEditReminderDays(item: ReplenishmentItem) {
+    setTempReminderDays(item.bufferDays || '')
+    setEditingReminderDays(true)
+  }
+
+  // 保存提前提醒
+  function handleSaveReminderDays(item: ReplenishmentItem) {
+    const newValue = tempReminderDays === '' ? undefined : Number(tempReminderDays)
+    onQuickEdit(item, { bufferDays: newValue })
+    setEditingReminderDays(false)
+  }
+
+  // 取消编辑
+  function handleCancelEdit() {
+    setEditingUsageInterval(false)
+    setEditingReminderDays(false)
+    setTempUsageInterval('')
+    setTempReminderDays('')
+  }
+
+  // 开始编辑评价
+  function handleStartEditReview(recordId: string, currentReview: string | undefined) {
+    setTempReview(currentReview || '')
+    setEditingReviewId(recordId)
+  }
+
+  // 保存评价
+  function handleSaveReview(itemId: string, recordId: string) {
+    const newReview = tempReview.trim() === '' ? undefined : tempReview
+    // 更新补货记录的评价
+    onRateEvent(itemId, recordId, undefined, newReview)
+    setEditingReviewId(null)
+    setTempReview('')
+  }
+
+  // 取消编辑评价
+  function handleCancelEditReview() {
+    setEditingReviewId(null)
+    setTempReview('')
+  }
+
+  // 打开评价弹窗
+  function handleOpenReviewModal(record: RestockEvent, itemName: string, itemId: string) {
+    setSelectedRecord(record)
+    setCurrentItemName(itemName)
+    setCurrentItemId(itemId)
+    setEditingReviewText(record.review || '')
+    setReviewModalOpen(true)
+  }
+
+  // 关闭评价弹窗
+  function handleCloseReviewModal() {
+    setReviewModalOpen(false)
+    setSelectedRecord(null)
+    setCurrentItemName('')
+    setCurrentItemId(null)
+    setEditingReviewText('')
+  }
+
+  // 从弹窗保存评价
+  function handleSaveReviewFromModal(review: string) {
+    if (!selectedRecord || !currentItemId) return
+    
+    const newReview = review.trim() || undefined
+    onRateEvent(currentItemId, selectedRecord.id, undefined, newReview)
+    
+    handleCloseReviewModal()
+  }
+
+  return (
+    <div className="category-work-area">
+      {/* header */}
+      <div className="work-header">
+        <div className="work-header-left">
+          <h2 className="work-title">{category}</h2>
+          <span className="work-meta">{views.length} 项</span>
+        </div>
+        <button className="primary-button green" onClick={onAddItem}>添加消耗品</button>
+      </div>
+
+      {/* item list */}
+      <div className="work-item-list">
+        {views.map(({ item, computed }) => (
+          <div 
+            key={item.id} 
+            className={`category-item-group ${expandedId === item.id ? "is-expanded" : ""}`}
+            onMouseEnter={() => setHoveredItemId(item.id)}
+            onMouseLeave={() => setHoveredItemId(null)}
+          >
+            <button className={`category-item ${expandedId === item.id ? "is-expanded" : ""}`} onClick={() => toggleExpand(item, computed)}>
+              {/* 左侧状态圆点 */}
+              <span className={`status-dot ${computed.displayStatus}`} />
+              <div className="category-item-copy">
+                {/* 标题行：名称和编辑按钮并排 */}
+                <div className="item-title-row">
+                  <strong>{item.name}</strong>
+                  {hoveredItemId === item.id && (
+                    <button 
+                      className="icon-button item-edit-btn-inline"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onOpenItemEditor(item.id)
+                      }}
+                      aria-label="编辑物品"
+                    >
+                      <Icon name="edit" size={14} />
+                    </button>
+                  )}
+                </div>
+                <small>
+                  {formatItemStatusText(item, computed)}
+                </small>
+              </div>
+              <span className={`status-label ${computed.displayStatus}`}>{computed.statusLabel}</span>
+              <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
+            </button>
+            {expandedId === item.id && (
+              <div className="category-item-detail">
+                {/* 区块1：消耗设置 */}
+                <div className="detail-section">
+                  <h4 className="section-title">消耗设置</h4>
+                  <div className="settings-inline-row">
+                    {/* 补货间隔 */}
+                    <div className="setting-row inline-setting">
+                      <span className="setting-label">间隔：</span>
+                      {editingUsageInterval ? (
+                        <input
+                          type="number"
+                          min="1"
+                          value={tempUsageInterval}
+                          onChange={(e) => setTempUsageInterval(e.target.value === '' ? '' : Number(e.target.value))}
+                          onBlur={() => handleSaveUsageInterval(item)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              handleSaveUsageInterval(item)
+                            } else if (e.key === 'Escape') {
+                              handleCancelEdit()
+                            }
+                          }}
+                          autoFocus
+                          className="inline-input"
+                        />
+                      ) : (
+                        <button 
+                          className="editable-value"
+                          onClick={() => handleStartEditUsageInterval(item)}
+                        >
+                          {item.cycleDays || '未设置'} 天
+                          <svg 
+                            className="edit-icon-svg" 
+                            width="14" 
+                            height="14" 
+                            viewBox="0 0 24 24" 
+                            fill="none" 
+                            stroke="currentColor" 
+                            strokeWidth="2" 
+                            strokeLinecap="round" 
+                            strokeLinejoin="round"
+                          >
+                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                            <path d="m15 5 4 4" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+
+                    {/* 提前提醒 */}
+                    <div className="setting-row inline-setting">
+                      <span className="setting-label">提醒：</span>
+                      {editingReminderDays ? (
+                        <input
+                          type="number"
+                          min="0"
+                          value={tempReminderDays}
+                          onChange={(e) => setTempReminderDays(e.target.value === '' ? '' : Number(e.target.value))}
+                          onBlur={() => handleSaveReminderDays(item)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              handleSaveReminderDays(item)
+                            } else if (e.key === 'Escape') {
+                              handleCancelEdit()
+                            }
+                          }}
+                          autoFocus
+                          className="inline-input"
+                        />
+                      ) : (
+                        <button 
+                          className="editable-value"
+                          onClick={() => handleStartEditReminderDays(item)}
+                        >
+                          {item.bufferDays || '未设置'} 天
+                          <svg 
+                            className="edit-icon-svg" 
+                            width="14" 
+                            height="14" 
+                            viewBox="0 0 24 24" 
+                            fill="none" 
+                            stroke="currentColor" 
+                            strokeWidth="2" 
+                            strokeLinecap="round" 
+                            strokeLinejoin="round"
+                          >
+                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                            <path d="m15 5 4 4" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                
+                {/* 区块2：补货设置（采购选项） */}
+                <div className="detail-section">
+                  <h4 className="section-title">补货设置</h4>
+                  <div className="section-content">
+                    {item.purchaseOptions && item.purchaseOptions.length > 0 ? (
+                      <div className="purchase-options-list">
+                        {item.purchaseOptions.map(option => (
+                          <div 
+                            key={option.id} 
+                            className="purchase-option-card"
+                            onDoubleClick={() => onRestockFromOption(item.id, option)}
+                            title="双击记录补货"
+                          >
+                            <div className="option-info">
+                              <strong>{option.productName}</strong>
+                              <span className="option-meta">
+                                {option.platform} · {option.unit}
+                                {option.price && ` · ¥${option.price}`}
+                              </span>
+                            </div>
+                            <div className="option-actions-wrapper">
+                              {/* 编辑按钮 */}
+                              <button 
+                                className="icon-button edit-option-btn"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  setShowActionMenu(showActionMenu === option.id ? null : option.id)
+                                }}
+                                title="操作"
+                              >
+                                <svg 
+                                  className="action-icon" 
+                                  width="16" 
+                                  height="16" 
+                                  viewBox="0 0 24 24" 
+                                  fill="none" 
+                                  stroke="currentColor" 
+                                  strokeWidth="2" 
+                                  strokeLinecap="round" 
+                                  strokeLinejoin="round"
+                                >
+                                  <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                                  <path d="m15 5 4 4" />
+                                </svg>
+                              </button>
+                              
+                              {/* 操作菜单 */}
+                              {showActionMenu === option.id && (
+                                <div className="action-menu">
+                                  <button 
+                                    className="action-menu-item"
+                                    onClick={() => {
+                                      onEditPurchaseOption(option)
+                                      setShowActionMenu(null)
+                                    }}
+                                  >
+                                    编辑
+                                  </button>
+                                  <button 
+                                    className="action-menu-item danger"
+                                    onClick={() => {
+                                      if (window.confirm('确定要删除这个采购选项吗？')) {
+                                        onDeletePurchaseOption(item.id, option.id)
+                                      }
+                                      setShowActionMenu(null)
+                                    }}
+                                  >
+                                    删除
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                        {/* 添加新选项的按钮 */}
+                        <button 
+                          className="secondary-button add-option-inline-btn"
+                          onClick={() => {
+                            setAddPurchaseOptionItemId(item.id)
+                            setShowAddPurchaseModal(true)
+                          }}
+                        >
+                          + 添加采购选项
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="empty-purchase-options">
+                        <p className="empty-hint">暂无采购选项</p>
+                        <button 
+                          className="primary-button green add-option-btn"
+                          onClick={() => {
+                            setAddPurchaseOptionItemId(item.id)
+                            setShowAddPurchaseModal(true)
+                          }}
+                        >
+                          添加采购选项
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                
+                {/* 区块3：补货记录 */}
+                <div className="detail-section">
+                  <h4 className="section-title">补货记录</h4>
+                  <div className="section-content">
+                    {item.history && item.history.length > 0 ? (
+                      <div className="restock-history-list">
+                        {(() => {
+                          const sorted = item.history.slice().reverse()
+                          const isExpanded = historyExpanded.has(item.id)
+                          const visibleRecords = isExpanded ? sorted : sorted.slice(0, 5)
+                          const hasMore = sorted.length > 5
+                          return (
+                            <>
+                              {visibleRecords.map((record) => {
+                                return (
+                                  <div key={record.id} className="restock-record compact">
+                                    {/* 左侧：所有关键信息 */}
+                                    <div className="record-info">
+                                      <span className="record-date">{formatDate(record.at)}</span>
+                                      <span className="record-separator">·</span>
+                                      <span className="record-product">{item.name}</span>
+                                      <span className="record-separator">·</span>
+                                      <span className="record-platform">{record.platform || '—'}</span>
+                                      {record.qty && (
+                                        <>
+                                          <span className="record-separator">·</span>
+                                          <span className="record-qty">{record.qty} {item.unit || '件'}</span>
+                                        </>
+                                      )}
+                                      <span className="record-separator">·</span>
+                                      <span className="record-price">¥{record.price?.toFixed(2) || '0.00'}</span>
+                                      <span className="record-separator">·</span>
+                                      <span className="record-review-text">{record.review || '暂无评价'}</span>
+                                    </div>
+                                    
+                                    {/* 右侧：评价按钮 */}
+                                    <button 
+                                      className="icon-button review-btn"
+                                      onClick={() => handleOpenReviewModal(record, item.name, item.id)}
+                                      title={record.review ? "编辑评价" : "添加评价"}
+                                    >
+                                      <svg 
+                                        className="action-icon" 
+                                        width="16" 
+                                        height="16" 
+                                        viewBox="0 0 24 24" 
+                                        fill="none" 
+                                        stroke="currentColor" 
+                                        strokeWidth="2" 
+                                        strokeLinecap="round" 
+                                        strokeLinejoin="round"
+                                      >
+                                        <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                                        <path d="m15 5 4 4" />
+                                      </svg>
+                                    </button>
+                                  </div>
+                                )
+                              })}
+                              {hasMore && (
+                                <button
+                                  className="history-toggle-btn"
+                                  onClick={() => {
+                                    setHistoryExpanded(prev => {
+                                      const next = new Set(prev)
+                                      if (next.has(item.id)) {
+                                        next.delete(item.id)
+                                      } else {
+                                        next.add(item.id)
+                                      }
+                                      return next
+                                    })
+                                  }}
+                                >
+                                  {isExpanded ? '收起' : `查看更多 (${sorted.length - 5})`}
+                                </button>
+                              )}
+                            </>
+                          )
+                        })()}
+                      </div>
+                    ) : (
+                      <p className="empty-hint">暂无补货记录</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        ))}
+        {!views.length && <div className="empty-category">这个分类还没有记录</div>}
+      </div>
+      
+      {/* 添加采购选项弹窗 */}
+      <AddPurchaseOptionModal
+        isOpen={showAddPurchaseModal}
+        onClose={() => {
+          setShowAddPurchaseModal(false)
+          setAddPurchaseOptionItemId(null)
+        }}
+        onSave={(optionData) => {
+          if (addPurchaseOptionItemId) {
+            onAddPurchaseOption(addPurchaseOptionItemId, optionData)
+          }
+        }}
+      />
+      
+      {/* 编辑采购选项弹窗 */}
+      <EditPurchaseOptionModal
+        isOpen={editModalOpen}
+        onClose={() => {
+          setEditModalOpen(false)
+          setEditingPurchaseOption(null)
+        }}
+        option={editingPurchaseOption}
+        onSave={onSaveEditedOption}
+      />
+      
+      {/* 评价编辑弹窗 */}
+      <ReviewEditModal
+        isOpen={reviewModalOpen}
+        onClose={handleCloseReviewModal}
+        record={selectedRecord}
+        itemName={currentItemName}
+        initialReview={editingReviewText}
+        onSave={handleSaveReviewFromModal}
+      />
+    </div>
+  )
+}
+
+function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onDeleteCategory }: {
+  dueCount: number
+  categorySummaries: Array<{ category: string; views: ItemView[]; urgent: number; warning: number }>
+  activeCategory: string | null
+  onSelectCategory: (category: string | null) => void
+  onCreateCategory: () => void
+  onOpenSettings: () => void
+  onRenameCategory: (oldName: string, newName: string) => void
+  onDeleteCategory: (name: string) => void
+}) {
+  const [editingCategory, setEditingCategory] = useState<string | null>(null)
+  const [editName, setEditName] = useState("")
+  const [hoveredCategory, setHoveredCategory] = useState<string | null>(null)
+  return (
+    <nav className="sidebar">
+      <button
+        className={`sidebar-home ${!activeCategory ? "is-active" : ""}`}
+        onClick={() => onSelectCategory(null)}
+      >
+        <span className="sidebar-home-icon">
+          {dueCount > 0
+            ? <span className="sidebar-due-badge">{dueCount}</span>
+            : <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>
+          }
+        </span>
+        <span className="sidebar-home-label">
+          {dueCount > 0 ? `${dueCount} 项待处理` : "今天不用补货"}
+        </span>
+      </button>
+
+      <div className="sidebar-divider" />
+      <span className="sidebar-section-label">分类</span>
+
+      {categorySummaries.map(({ category, views, urgent, warning }) => {
+        const dotStatus = urgent ? "urgent" : warning ? "warning" : "normal"
+        const isEditing = editingCategory === category
+        const isHovered = hoveredCategory === category
+        
+        return (
+          <div 
+            key={category}
+            className={`sidebar-item-wrapper ${activeCategory === category ? "is-active" : ""}`}
+            onMouseEnter={() => setHoveredCategory(category)}
+            onMouseLeave={() => setHoveredCategory(null)}
+          >
+            {/* 分类项主体 - 点击切换分类 */}
+            {!isEditing && (
+              <button
+                className="sidebar-item-main"
+                onClick={() => onSelectCategory(category)}
+              >
+                <span className={`sidebar-dot ${dotStatus}`} />
+                <span className="sidebar-item-name">{category}</span>
+                <span className="sidebar-item-count">{views.length}</span>
+              </button>
+            )}
+            
+            {/* Hover 时显示的编辑按钮 */}
+            {isHovered && !isEditing && (
+              <button 
+                className="sidebar-item-edit-btn"
+                onClick={(e) => {
+                  e.stopPropagation()
+                  setEditingCategory(category)
+                  setEditName(category)
+                }}
+                aria-label="编辑分类"
+              >
+                <Icon name="edit" size={12} />
+              </button>
+            )}
+            
+            {/* 编辑模式 */}
+            {isEditing && (
+              <div className="sidebar-item-edit-mode">
+                <input
+                  autoFocus
+                  value={editName}
+                  onChange={(e) => setEditName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      if (editName.trim() && editName !== category) {
+                        onRenameCategory(category, editName.trim())
+                      }
+                      setEditingCategory(null)
+                    }
+                    if (e.key === 'Escape') {
+                      setEditingCategory(null)
+                    }
+                  }}
+                  onBlur={() => {
+                    if (editName.trim() && editName !== category) {
+                      onRenameCategory(category, editName.trim())
+                    }
+                    setEditingCategory(null)
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                />
+                <button 
+                  className="sidebar-item-delete-btn"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    if (window.confirm(`确定要删除分类"${category}"吗？该分类下的所有物品将被移至"其他"分类。`)) {
+                      onDeleteCategory(category)
+                      setEditingCategory(null)
+                    }
+                  }}
+                  aria-label="删除分类"
+                >
+                  <Icon name="trash" size={12} />
+                </button>
+              </div>
+            )}
+          </div>
+        )
+      })}
+
+      <div className="sidebar-divider" />
+      <button className="sidebar-add" onClick={onCreateCategory}>
+        <Icon name="plus" size={13} />
+        新建分类
+      </button>
+      
+      <button className="sidebar-settings" onClick={onOpenSettings}>
+        <Icon name="settings" size={13} />
+        设置
+      </button>
+    </nav>
+  )
+}
