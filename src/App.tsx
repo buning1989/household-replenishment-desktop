@@ -2751,18 +2751,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                 
                 {/* 区块2：补货设置（采购选项） */}
                 <div className="detail-section">
-                  <div className="section-title-row">
-                    <h4 className="section-title">补货设置</h4>
-                    <button 
-                      className="secondary-button add-option-inline-btn"
-                      onClick={() => {
-                        setAddPurchaseOptionItemId(item.id)
-                        setShowAddPurchaseModal(true)
-                      }}
-                    >
-                      + 添加
-                    </button>
-                  </div>
+                  <h4 className="section-title">补货设置</h4>
                   <div className="section-content">
                     {item.purchaseOptions && item.purchaseOptions.length > 0 ? (
                       <div className="purchase-options-list">
@@ -2834,6 +2823,16 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                             </div>
                           </div>
                         ))}
+                        {/* 添加新选项的按钮 */}
+                        <button 
+                          className="secondary-button add-option-inline-btn"
+                          onClick={() => {
+                            setAddPurchaseOptionItemId(item.id)
+                            setShowAddPurchaseModal(true)
+                          }}
+                        >
+                          + 添加采购选项
+                        </button>
                       </div>
                     ) : (
                       <div className="empty-purchase-options">
