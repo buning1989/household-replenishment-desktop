@@ -147,10 +147,6 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
     link: asString(raw.link),
     price: asFiniteNumber(raw.price),
     snoozeUntil: asFiniteNumber(raw.snoozeUntil),
-    orderedAt: (() => {
-      const v = asFiniteNumber(raw.orderedAt)
-      return v !== undefined && v > 0 ? v : undefined
-    })(),
     suggestedCycleDays: asFiniteNumber(raw.suggestedCycleDays),
     learningEnabled: raw.learningEnabled !== false,
     unit: asString(raw.unit),

@@ -183,7 +183,6 @@ export function restockItem(
     price: price ?? item.price,
     platform: platform || item.platform,
     snoozeUntil: undefined,
-    orderedAt: undefined,
     suggestedCycleDays: undefined,
     updatedAt: now
   }

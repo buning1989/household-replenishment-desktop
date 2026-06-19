@@ -37,7 +37,6 @@ export type ReplenishmentItem = {
   link?: string
   price?: number
   snoozeUntil?: number
-  orderedAt?: number
   suggestedCycleDays?: number
   learningEnabled?: boolean
   unit?: string
