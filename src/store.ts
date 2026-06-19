@@ -89,6 +89,7 @@ function migrateHistoryEvent(raw: unknown): RestockEvent | null {
     qty: qty !== undefined && qty > 0 ? qty : undefined,
     platform: asString(raw.platform),
     purchaseProductName: asString(raw.purchaseProductName),
+    purchaseUnit: asString(raw.purchaseUnit),
     rating,
     review: asString(raw.review)
   }

@@ -145,7 +145,8 @@ export function restockItem(
   price?: number,
   qty?: number,
   platform?: string,
-  purchaseProductName?: string
+  purchaseProductName?: string,
+  purchaseUnit?: string
 ): ReplenishmentItem {
   const actualInterval = item.anchorEstimated
     ? undefined
@@ -162,7 +163,8 @@ export function restockItem(
       price,
       qty: safeQty,
       platform,
-      purchaseProductName: purchaseProductName?.trim() || undefined
+      purchaseProductName: purchaseProductName?.trim() || undefined,
+      purchaseUnit: purchaseUnit?.trim() || undefined
     }
   ]
 

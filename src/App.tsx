@@ -69,12 +69,24 @@ function formatItemStatusText(
   }
   
   // 5. 默认购买量 + 计量单位
-  const unit = item.unit || "件"
+  const unit = getDisplayPurchaseUnit(item)
   if (item.defaultQty) {
     parts.push(`默认 ${item.defaultQty} ${unit}`)
   }
   
   return parts.join(' · ')
+}
+
+// 获取用于展示的采购选项单位
+function getDisplayPurchaseUnit(item: ReplenishmentItem): string {
+  const defaultOption = item.purchaseOptions?.find(opt => opt.isDefault)
+  if (defaultOption?.unit) {
+    return defaultOption.unit
+  }
+  if (item.purchaseOptions?.length && item.purchaseOptions[0].unit) {
+    return item.purchaseOptions[0].unit
+  }
+  return item.unit || "件"
 }
 
 function cloneItem(item: ReplenishmentItem): ReplenishmentItem {
@@ -215,8 +227,8 @@ function App() {
 
   // 统一补货入口：所有补货流程都经由 domain.restockItem 完成状态迁移
   // （append history、计算 intervalDays、清除 snoozeUntil、周期学习等均由 domain 负责）
-  function performRestock(itemId: string, qty?: number, price?: number, platform?: string, purchaseProductName?: string) {
-    updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseProductName))
+  function performRestock(itemId: string, qty?: number, price?: number, platform?: string, purchaseProductName?: string, purchaseUnit?: string) {
+    updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseProductName, purchaseUnit))
   }
 
   function undoRestock() {
@@ -359,7 +371,7 @@ function App() {
     const item = state.items.find(i => i.id === itemId)
     if (!item) return
     // 经由 domain.restockItem 完成补货，避免手写 patch 绕过学习/状态机
-    performRestock(itemId, item.defaultQty || 1, option.price, option.platform, option.productName)
+    performRestock(itemId, item.defaultQty || 1, option.price, option.platform, option.productName, option.unit)
     setDetailItemId(null)
   }
 
@@ -628,7 +640,7 @@ function App() {
         onClose={handleCancelRestock}
         item={restockModalItemId ? state.items.find(i => i.id === restockModalItemId) || null : null}
         onConfirm={(itemId, option, qty, price) => {
-          performRestock(itemId, qty, price || undefined, option?.platform, option?.productName)
+          performRestock(itemId, qty, price || undefined, option?.platform, option?.productName, option?.unit)
           handleCancelRestock()
         }}
         onAddPurchaseOption={(itemId) => {
@@ -823,7 +835,8 @@ function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave,
   onDismissSuggestion: (item: ReplenishmentItem) => void
 }) {
   const priceAnchor = calculatePriceAnchor(item.history)
-  const unit = item.unit || "件"
+  const latestRestockEvent = item.history[item.history.length - 1]
+  const unit = latestRestockEvent?.purchaseUnit || getDisplayPurchaseUnit(item)
 
   // 计算当前单价和比价提示
   const currentPrice = recentRestock.amount ? Number(recentRestock.amount) : 0
@@ -2994,6 +3007,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                             <>
                               {visibleRecords.map((record) => {
                                 const recordProductName = record.purchaseProductName || item.name
+                                const recordUnit = record.purchaseUnit || item.unit || '件'
                                 return (
                                   <div key={record.id} className="restock-record compact">
                                     {/* 左侧：所有关键信息 */}
@@ -3006,7 +3020,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                                       {record.qty && (
                                         <>
                                           <span className="record-separator">·</span>
-                                          <span className="record-qty">{record.qty} {item.unit || '件'}</span>
+                                          <span className="record-qty">{record.qty} {recordUnit}</span>
                                         </>
                                       )}
                                       <span className="record-separator">·</span>
