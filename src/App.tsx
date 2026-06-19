@@ -566,7 +566,7 @@ function App() {
               name: itemData.name,
               category: creatingCategory || '其他',
               cycleDays: itemData.usageIntervalDays || 10,
-              bufferDays: 2,
+              bufferDays: itemData.bufferDays !== undefined ? itemData.bufferDays : 2,
               unit: itemData.unit || '件',
               defaultQty: itemData.initialStock ? String(itemData.initialStock) : '',
               platform: itemData.platform || '',
@@ -1897,7 +1897,7 @@ function ItemCreatorDialog({
   category: string
   isOpen: boolean
   onClose: () => void
-  onCreate: (item: { name: string; initialStock?: number; unit?: string; price?: number; platform?: string; usageIntervalDays?: number; reminderDaysAhead?: number }) => void
+  onCreate: (item: { name: string; initialStock?: number; unit?: string; price?: number; platform?: string; usageIntervalDays?: number; bufferDays?: number }) => void
 }) {
   const [name, setName] = useState('')
   const [initialStock, setInitialStock] = useState(1)
@@ -1905,7 +1905,7 @@ function ItemCreatorDialog({
   const [price, setPrice] = useState<number | ''>('')
   const [platform, setPlatform] = useState('')
   const [usageIntervalDays, setUsageIntervalDays] = useState<number | ''>(30)
-  const [reminderDaysAhead, setReminderDaysAhead] = useState<number | ''>('')
+  const [bufferDays, setBufferDays] = useState<number | ''>('')
   
   if (!isOpen) return null
   
@@ -1918,7 +1918,7 @@ function ItemCreatorDialog({
       price: price === '' ? undefined : price,
       platform: platform || undefined,
       usageIntervalDays: usageIntervalDays === '' ? undefined : usageIntervalDays,
-      reminderDaysAhead: reminderDaysAhead === '' ? undefined : reminderDaysAhead
+      bufferDays: bufferDays === '' ? undefined : bufferDays
     })
     onClose()
   }
@@ -2014,8 +2014,8 @@ function ItemCreatorDialog({
                 <input 
                   type="number" 
                   min="0"
-                  value={reminderDaysAhead} 
-                  onChange={(e) => setReminderDaysAhead(e.target.value === '' ? '' : Number(e.target.value))}
+                  value={bufferDays} 
+                  onChange={(e) => setBufferDays(e.target.value === '' ? '' : Number(e.target.value))}
                   placeholder="例如：3"
                 />
                 <span className="unit-label">天</span>

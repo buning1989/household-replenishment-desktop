@@ -43,6 +43,7 @@ export type ReplenishmentItem = {
   unit?: string
   platform?: string
   defaultQty?: number
+  /** @deprecated 仅用于旧数据迁移，不参与业务计算。使用 bufferDays 代替。 */
   reminderDaysAhead?: number
   createdAt: number
   updatedAt: number
@@ -91,7 +92,6 @@ export type ItemDraft = {
   platform: string
   price?: number
   usageIntervalDays?: number
-  reminderDaysAhead?: number
   purchaseOptions?: PurchaseOption[]  // 新增：采购选项列表
 }
 
