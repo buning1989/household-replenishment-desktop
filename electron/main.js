@@ -261,7 +261,7 @@ function sendNotification(items, isTest = false) {
   const title = isTest
     ? "提醒功能工作正常"
     : urgent
-      ? `${item?.name || "物品"}需要补货了`
+      ? `${item?.name || "物品"}预计已用完了`
       : `${item?.name || "物品"}快用完了`
   const body = isTest
     ? "通知已开启"
