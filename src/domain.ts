@@ -134,18 +134,49 @@ function weightedCycle(intervals: number[], currentCycle: number): number | unde
   return Math.max(1, Math.round(weightedTotal / weightTotal))
 }
 
-export function restockItem(item: ReplenishmentItem, now = Date.now(), price?: number, qty?: number, platform?: string): ReplenishmentItem {
-  const actualInterval = item.anchorEstimated ? undefined : Math.max(1, differenceInDays(now, item.lastRestockedAt))
+
+function safeRestockQty(value: number | undefined): number {
+  return Number.isFinite(value) && value! >= 1 ? Math.round(value!) : 1
+}
+
+export function restockItem(
+  item: ReplenishmentItem,
+  now = Date.now(),
+  price?: number,
+  qty?: number,
+  platform?: string
+): ReplenishmentItem {
+  const actualInterval = item.anchorEstimated
+    ? undefined
+    : Math.max(1, differenceInDays(now, item.lastRestockedAt))
+
+  const safeQty = safeRestockQty(qty)
+
   const history = [
     ...item.history,
-    { id: id("restock"), at: now, intervalDays: actualInterval, price, qty, platform }
+    { id: id("restock"), at: now, intervalDays: actualInterval, price, qty: safeQty, platform }
   ]
-  const intervals = history.flatMap((event) => event.intervalDays ? [event.intervalDays] : [])
-  const candidate = item.learningEnabled !== false ? weightedCycle(intervals, item.cycleDays) : undefined
-  const meaningfulChange = candidate && Math.abs(candidate - item.cycleDays) >= Math.max(2, item.cycleDays * 0.15)
+
+  const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)
+  const currentSingleItemCycle = Math.max(1, Math.round(item.cycleDays / previousQty))
+
+  const singleItemIntervals = history.flatMap((event, index) => {
+    if (!event.intervalDays) return []
+    const batchQty = index > 0 ? safeRestockQty(history[index - 1]?.qty) : 1
+    return [Math.max(1, event.intervalDays / batchQty)]
+  })
+
+  const singleItemCandidate = item.learningEnabled !== false
+    ? weightedCycle(singleItemIntervals, currentSingleItemCycle)
+    : undefined
+
+  const newCycleDays = singleItemCandidate
+    ? Math.max(1, Math.round(singleItemCandidate * safeQty))
+    : item.cycleDays
 
   return {
     ...item,
+    cycleDays: newCycleDays,
     lastRestockedAt: startOfDay(now),
     anchorEstimated: false,
     history,
@@ -153,7 +184,7 @@ export function restockItem(item: ReplenishmentItem, now = Date.now(), price?: n
     platform: platform || item.platform,
     snoozeUntil: undefined,
     orderedAt: undefined,
-    suggestedCycleDays: meaningfulChange ? candidate : undefined,
+    suggestedCycleDays: undefined,
     updatedAt: now
   }
 }
