@@ -35,9 +35,18 @@ const EMPTY_DRAFT: ItemDraft = {
 }
 
 // 格式化物品状态栏文本
-function formatItemStatusText(item: ReplenishmentItem, computed: ItemComputed): string {
+function formatItemStatusText(
+  item: ReplenishmentItem,
+  computed: ItemComputed,
+  options?: { includeCategory?: boolean }
+): string {
   const parts: string[] = []
-  
+
+  // 0. 所属大类（仅在“当前待处理”等跨分类列表中显示，分类页内不重复）
+  if (options?.includeCategory) {
+    parts.push(item.category || "未分类")
+  }
+
   // 1. 剩余天数
   parts.push(`还剩约 ${Math.max(0, computed.daysUntilDepletion)} 天`)
   
@@ -109,6 +118,8 @@ function App() {
   const [addPurchaseOptionItemId, setAddPurchaseOptionItemId] = useState<string | null>(null)
   const [editingPurchaseOption, setEditingPurchaseOption] = useState<PurchaseOption | null>(null)
   const [editModalOpen, setEditModalOpen] = useState(false)
+  // 当从补货弹窗中录入新采购选项后，用于在 RestockModal 中自动选中该选项
+  const [preferredPurchaseOptionId, setPreferredPurchaseOptionId] = useState<string | null>(null)
   function deferredClose(setClosing: (v: boolean) => void, actualClose: () => void, delay = 200) {
     setClosing(true)
     setTimeout(() => { setClosing(false); actualClose() }, delay)
@@ -357,15 +368,20 @@ function App() {
       id: crypto.randomUUID(),
       ...optionData
     }
-    
+
     updateItems([itemId], (current) => ({
       ...current,
       purchaseOptions: [...(current.purchaseOptions || []), option]
     }))
-    
-    // 关闭弹窗
+
+    // 关闭录入弹窗
     setShowAddPurchaseModal(false)
     setAddPurchaseOptionItemId(null)
+
+    // 如果当前正在给同一个 item 补货，则让 RestockModal 自动选中刚录入的选项，并保持补货弹窗打开
+    if (restockModalOpen && restockModalItemId === itemId) {
+      setPreferredPurchaseOptionId(option.id)
+    }
   }
 
   // 保存编辑后的采购选项
@@ -495,7 +511,6 @@ function App() {
               setShowAddPurchaseModal={setShowAddPurchaseModal}
               addPurchaseOptionItemId={addPurchaseOptionItemId}
               setAddPurchaseOptionItemId={setAddPurchaseOptionItemId}
-              onAddPurchaseOption={handleAddPurchaseOption}
               editingPurchaseOption={editingPurchaseOption}
               setEditingPurchaseOption={setEditingPurchaseOption}
               editModalOpen={editModalOpen}
@@ -616,6 +631,32 @@ function App() {
           performRestock(itemId, qty, price || undefined, option?.platform)
           handleCancelRestock()
         }}
+        onAddPurchaseOption={(itemId) => {
+          // 不关闭 RestockModal，仅打开采购选项录入弹窗
+          setAddPurchaseOptionItemId(itemId)
+          setShowAddPurchaseModal(true)
+        }}
+        preferredPurchaseOptionId={preferredPurchaseOptionId}
+        onPreferredPurchaseOptionConsumed={() => setPreferredPurchaseOptionId(null)}
+        onViewHistory={(itemId) => {
+          // 关闭补货弹窗，打开该商品的详情面板（补货记录区）
+          handleCancelRestock()
+          setDetailItemId(itemId)
+        }}
+      />
+
+      {/* 添加采购选项弹窗（统一在 App 根部渲染，供分类页与补货弹窗复用） */}
+      <AddPurchaseOptionModal
+        isOpen={showAddPurchaseModal}
+        onClose={() => {
+          setShowAddPurchaseModal(false)
+          setAddPurchaseOptionItemId(null)
+        }}
+        onSave={(optionData) => {
+          if (addPurchaseOptionItemId) {
+            handleAddPurchaseOption(addPurchaseOptionItemId, optionData)
+          }
+        }}
       />
     </div>
   )
@@ -727,7 +768,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
                     <span>
                       <strong>{item.name}</strong>
                       <small>
-                        {formatItemStatusText(item, computed)}
+                        {formatItemStatusText(item, computed, { includeCategory: true })}
                         {remainingQty && <span> · {remainingQty}</span>}
                       </small>
                     </span>
@@ -1681,19 +1722,33 @@ interface RestockModalProps {
   onClose: () => void
   item: ReplenishmentItem | null
   onConfirm: (itemId: string, option: PurchaseOption | null, qty: number, price: number) => void
+  // 无采购选项时，点击“录入常用采购信息”触发；不关闭本弹窗
+  onAddPurchaseOption: (itemId: string) => void
+  // 从补货弹窗录入新采购选项后，App 传入新选项 id，由本弹窗自动选中并填值
+  preferredPurchaseOptionId?: string | null
+  // 自动选中完成后回调，用于清空 preferred 状态，避免反复选中
+  onPreferredPurchaseOptionConsumed?: () => void
+  // 点击“查看补货记录”时触发，通常关闭本弹窗并打开商品详情面板
+  onViewHistory?: (itemId: string) => void
 }
 
-function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
+function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, preferredPurchaseOptionId, onPreferredPurchaseOptionConsumed, onViewHistory }: RestockModalProps) {
   const [selectedOption, setSelectedOption] = useState<PurchaseOption | null>(null)
   const [qty, setQty] = useState<number | ''>('')
   const [price, setPrice] = useState<number | ''>('')
+  // 标记当前选中是由 preferredPurchaseOptionId 触发，避免被通用的选中 effect 覆盖为默认值
+  const preferredSelectingRef = useRef(false)
 
   // 选中采购选项时自动填充默认数量与价格；取消选择时保留用户已输入的内容
   useEffect(() => {
-    if (selectedOption) {
-      setQty(1)
-      setPrice(selectedOption.price || '')
+    if (!selectedOption) return
+    if (preferredSelectingRef.current) {
+      // preferred 路径已在专用 effect 中填好 qty/price，这里不再覆盖
+      preferredSelectingRef.current = false
+      return
     }
+    setQty(1)
+    setPrice(selectedOption.price || '')
   }, [selectedOption])
 
   // 每次打开弹窗或切换物品时重置内部状态，避免显示上一次补货的残留值
@@ -1702,14 +1757,32 @@ function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
       setSelectedOption(null)
       setQty('')
       setPrice('')
+      preferredSelectingRef.current = false
     }
   }, [isOpen, item?.id])
+
+  // 监听 preferredPurchaseOptionId：当对应采购选项出现在 item.purchaseOptions 中时自动选中并填值
+  useEffect(() => {
+    if (!preferredPurchaseOptionId || !item) return
+    const option = (item.purchaseOptions || []).find((o) => o.id === preferredPurchaseOptionId)
+    if (!option) return
+    preferredSelectingRef.current = true
+    setSelectedOption(option)
+    setQty(item.defaultQty || 1)
+    setPrice(option.price || '')
+    onPreferredPurchaseOptionConsumed?.()
+  }, [preferredPurchaseOptionId, item, onPreferredPurchaseOptionConsumed])
 
   if (!isOpen || !item) return null
 
   const purchaseOptions = item.purchaseOptions || []
   const unitText = selectedOption?.unit || item.unit || '件'
   const canConfirm = !!qty && Number(qty) >= 1
+  // 取最近一条有评价内容的补货记录（只读摘要，不允许在此编辑）
+  const latestReviewEvent = (item.history || [])
+    .slice()
+    .reverse()
+    .find((e) => e.review?.trim())
 
   return (
     <div className="restock-modal-overlay" onClick={onClose}>
@@ -1726,9 +1799,11 @@ function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
           {purchaseOptions.length > 0 ? (
             <div className="purchase-option-list">
               {purchaseOptions.map((option) => {
-                // 从补货记录中匹配该平台最近的有评价内容
+                // 从补货记录中匹配该平台最近一条有评价内容（取最新，而非最早）
                 const latestReview = (item.history || [])
-                  .find(e => e.platform === option.platform && e.review)
+                  .slice()
+                  .reverse()
+                  .find((e) => e.platform === option.platform && e.review?.trim())
 
                 return (
                   <button
@@ -1748,7 +1823,32 @@ function RestockModal({ isOpen, onClose, item, onConfirm }: RestockModalProps) {
               })}
             </div>
           ) : (
-            <p className="empty-hint">暂无采购选项，可直接填写下方数量与价格完成补货</p>
+            <div className="restock-empty-hint">
+              <p className="restock-empty-hint-text">还没有常用采购信息。你可以先录入常买规格，之后补货会更快；也可以仅记录本次补货。</p>
+              <button
+                type="button"
+                className="btn btn-secondary restock-empty-hint-btn"
+                onClick={() => onAddPurchaseOption(item.id)}
+              >
+                录入常用采购信息
+              </button>
+            </div>
+          )}
+
+          {/* 最近评价摘要（只读）+ 查看补货记录入口 */}
+          {latestReviewEvent && (
+            <div className="restock-review-summary">
+              <span className="restock-review-text">上次评价：{latestReviewEvent.review}</span>
+              {onViewHistory && (
+                <button
+                  type="button"
+                  className="quiet-button restock-view-history-btn"
+                  onClick={() => onViewHistory(item.id)}
+                >
+                  查看补货记录
+                </button>
+              )}
+            </div>
           )}
 
           {/* 数量和价格输入：无论是否选择采购选项都可填写，保证无选项时也能补货 */}
@@ -2052,6 +2152,7 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
   const [unit, setUnit] = useState('')
   const [unitCustom, setUnitCustom] = useState('')
   const [price, setPrice] = useState<number | ''>('')
+  const [link, setLink] = useState('')
   
   const showUnitCustom = unit === '其他'
 
@@ -2064,6 +2165,7 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
       platform,
       unit: finalUnit,
       price: price !== '' ? Number(price) : undefined,
+      link: link.trim() || undefined,
       isDefault: false
     })
     
@@ -2073,6 +2175,7 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
     setUnit('')
     setUnitCustom('')
     setPrice('')
+    setLink('')
     onClose()
   }
   
@@ -2166,6 +2269,17 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
                 placeholder="例如：59.9"
               />
             </div>
+          </div>
+
+          <div className="form-group">
+            <label>购买链接（选填）：</label>
+            <input
+              type="url"
+              value={link}
+              onChange={(e) => setLink(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="https://..."
+            />
           </div>
         </div>
         
@@ -2390,7 +2504,7 @@ function ReviewEditModal({ isOpen, onClose, record, itemName, initialReview, onS
   )
 }
 
-function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEdit, onSnooze, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent, onOpenItemEditor, onRestockFromOption, showAddPurchaseModal, setShowAddPurchaseModal, addPurchaseOptionItemId, setAddPurchaseOptionItemId, onAddPurchaseOption, editingPurchaseOption, setEditingPurchaseOption, editModalOpen, setEditModalOpen, onEditPurchaseOption, onDeletePurchaseOption, onSaveEditedOption }: {
+function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEdit, onSnooze, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent, onOpenItemEditor, onRestockFromOption, showAddPurchaseModal, setShowAddPurchaseModal, addPurchaseOptionItemId, setAddPurchaseOptionItemId, editingPurchaseOption, setEditingPurchaseOption, editModalOpen, setEditModalOpen, onEditPurchaseOption, onDeletePurchaseOption, onSaveEditedOption }: {
   category: string
   views: ItemView[]
   onAddItem: () => void
@@ -2409,7 +2523,6 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
   setShowAddPurchaseModal: React.Dispatch<React.SetStateAction<boolean>>
   addPurchaseOptionItemId: string | null
   setAddPurchaseOptionItemId: React.Dispatch<React.SetStateAction<string | null>>
-  onAddPurchaseOption: (itemId: string, optionData: Omit<PurchaseOption, 'id'>) => void
   editingPurchaseOption: PurchaseOption | null
   setEditingPurchaseOption: React.Dispatch<React.SetStateAction<PurchaseOption | null>>
   editModalOpen: boolean
@@ -2956,21 +3069,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
         ))}
         {!views.length && <div className="empty-category">这个分类还没有记录</div>}
       </div>
-      
-      {/* 添加采购选项弹窗 */}
-      <AddPurchaseOptionModal
-        isOpen={showAddPurchaseModal}
-        onClose={() => {
-          setShowAddPurchaseModal(false)
-          setAddPurchaseOptionItemId(null)
-        }}
-        onSave={(optionData) => {
-          if (addPurchaseOptionItemId) {
-            onAddPurchaseOption(addPurchaseOptionItemId, optionData)
-          }
-        }}
-      />
-      
+
       {/* 编辑采购选项弹窗 */}
       <EditPurchaseOptionModal
         isOpen={editModalOpen}

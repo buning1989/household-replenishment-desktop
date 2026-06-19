@@ -1843,6 +1843,59 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
   margin: 0;
 }
 
+/* 补货弹窗：无采购选项时的提示区（文案 + 录入入口） */
+.restock-empty-hint {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  padding: 24px 16px;
+  margin-bottom: 16px;
+  text-align: center;
+  background: var(--surface);
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+}
+
+.restock-empty-hint-text {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+
+.restock-empty-hint-btn {
+  align-self: center;
+}
+
+/* 补货弹窗：最近评价只读摘要 + 查看补货记录入口 */
+.restock-review-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  background: var(--surface);
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+
+.restock-review-summary .restock-review-text {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--muted);
+  flex: 1;
+  min-width: 0;
+  word-break: break-word;
+}
+
+.restock-view-history-btn {
+  flex-shrink: 0;
+  padding: 6px 12px;
+  font-size: 12px;
+}
+
 /* 数量和价格输入区域 */
 .restock-inputs {
   display: flex;
