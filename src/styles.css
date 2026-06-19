@@ -1843,29 +1843,54 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
   margin: 0;
 }
 
-/* 补货弹窗：无采购选项时的提示区（文案 + 录入入口） */
+/* 补货弹窗：无采购选项时的提示区 */
 .restock-empty-hint {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 14px;
-  padding: 24px 16px;
+  justify-content: center;
+  padding: 20px 16px;
   margin-bottom: 16px;
-  text-align: center;
   background: var(--surface);
   border: 1px dashed var(--line);
   border-radius: 8px;
 }
 
-.restock-empty-hint-text {
-  margin: 0;
+.restock-add-purchase-btn {
+  min-height: 38px;
+  padding: 0 16px;
+  border-radius: var(--radius-small);
   font-size: 13px;
-  line-height: 1.6;
-  color: var(--muted);
+  font-weight: 700;
+  cursor: pointer;
 }
 
-.restock-empty-hint-btn {
-  align-self: center;
+/* 当前待处理：标题行（名称 + 分类 badge） */
+.current-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.current-card-title-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.current-category-badge {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(45, 125, 79, 0.1);
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 /* 补货弹窗：最近评价只读摘要 + 查看补货记录入口 */

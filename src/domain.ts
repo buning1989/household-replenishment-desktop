@@ -144,7 +144,8 @@ export function restockItem(
   now = Date.now(),
   price?: number,
   qty?: number,
-  platform?: string
+  platform?: string,
+  purchaseProductName?: string
 ): ReplenishmentItem {
   const actualInterval = item.anchorEstimated
     ? undefined
@@ -154,7 +155,15 @@ export function restockItem(
 
   const history = [
     ...item.history,
-    { id: id("restock"), at: now, intervalDays: actualInterval, price, qty: safeQty, platform }
+    {
+      id: id("restock"),
+      at: now,
+      intervalDays: actualInterval,
+      price,
+      qty: safeQty,
+      platform,
+      purchaseProductName: purchaseProductName?.trim() || undefined
+    }
   ]
 
   const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)

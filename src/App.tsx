@@ -215,8 +215,8 @@ function App() {
 
   // 统一补货入口：所有补货流程都经由 domain.restockItem 完成状态迁移
   // （append history、计算 intervalDays、清除 snoozeUntil、周期学习等均由 domain 负责）
-  function performRestock(itemId: string, qty?: number, price?: number, platform?: string) {
-    updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform))
+  function performRestock(itemId: string, qty?: number, price?: number, platform?: string, purchaseProductName?: string) {
+    updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseProductName))
   }
 
   function undoRestock() {
@@ -359,7 +359,7 @@ function App() {
     const item = state.items.find(i => i.id === itemId)
     if (!item) return
     // 经由 domain.restockItem 完成补货，避免手写 patch 绕过学习/状态机
-    performRestock(itemId, item.defaultQty || 1, option.price, option.platform)
+    performRestock(itemId, item.defaultQty || 1, option.price, option.platform, option.productName)
     setDetailItemId(null)
   }
 
@@ -628,7 +628,7 @@ function App() {
         onClose={handleCancelRestock}
         item={restockModalItemId ? state.items.find(i => i.id === restockModalItemId) || null : null}
         onConfirm={(itemId, option, qty, price) => {
-          performRestock(itemId, qty, price || undefined, option?.platform)
+          performRestock(itemId, qty, price || undefined, option?.platform, option?.productName)
           handleCancelRestock()
         }}
         onAddPurchaseOption={(itemId) => {
@@ -766,9 +766,12 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
                   <div className="current-card-copy">
                     <span className={`status-dot ${computed.status}`} />
                     <span>
-                      <strong>{item.name}</strong>
+                      <div className="current-card-title-row">
+                        <strong>{item.name}</strong>
+                        <span className="current-category-badge">{item.category || "未分类"}</span>
+                      </div>
                       <small>
-                        {formatItemStatusText(item, computed, { includeCategory: true })}
+                        {formatItemStatusText(item, computed)}
                         {remainingQty && <span> · {remainingQty}</span>}
                       </small>
                     </span>
@@ -1824,13 +1827,12 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
             </div>
           ) : (
             <div className="restock-empty-hint">
-              <p className="restock-empty-hint-text">还没有常用采购信息。你可以先录入常买规格，之后补货会更快；也可以仅记录本次补货。</p>
               <button
                 type="button"
-                className="btn btn-secondary restock-empty-hint-btn"
+                className="primary-button green restock-add-purchase-btn"
                 onClick={() => onAddPurchaseOption(item.id)}
               >
-                录入常用采购信息
+                填写采购信息
               </button>
             </div>
           )}
@@ -2991,13 +2993,14 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                           return (
                             <>
                               {visibleRecords.map((record) => {
+                                const recordProductName = record.purchaseProductName || item.name
                                 return (
                                   <div key={record.id} className="restock-record compact">
                                     {/* 左侧：所有关键信息 */}
                                     <div className="record-info">
                                       <span className="record-date">{formatDate(record.at)}</span>
                                       <span className="record-separator">·</span>
-                                      <span className="record-product">{item.name}</span>
+                                      <span className="record-product">{recordProductName}</span>
                                       <span className="record-separator">·</span>
                                       <span className="record-platform">{record.platform || '—'}</span>
                                       {record.qty && (
@@ -3015,7 +3018,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                                     {/* 右侧：评价按钮 */}
                                     <button 
                                       className="icon-button review-btn"
-                                      onClick={() => handleOpenReviewModal(record, item.name, item.id)}
+                                      onClick={() => handleOpenReviewModal(record, recordProductName, item.id)}
                                       title={record.review ? "编辑评价" : "添加评价"}
                                     >
                                       <svg 

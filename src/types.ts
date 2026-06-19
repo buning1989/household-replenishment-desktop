@@ -19,6 +19,7 @@ export type RestockEvent = {
   price?: number
   qty?: number
   platform?: string
+  purchaseProductName?: string  // 本次补货对应的具体采购商品名称快照
   rating?: Rating
   review?: string
 }
