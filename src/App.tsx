@@ -519,6 +519,10 @@ function App() {
               onApplySuggestion={applyCycleSuggestion}
               onDismissSuggestion={dismissSuggestion}
               onOpenItem={openItem}
+              onAddItem={() => {
+                setCreatingCategory(state.categories[0] || null)
+                setIsItemCreatorOpen(true)
+              }}
             />
           )}
         </main>
@@ -672,7 +676,7 @@ function TaskActions({ item, onRestock, onUndo, isExpanded }: {
   )
 }
 
-function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onRestock, onSnooze, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem }: {
+function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onRestock, onSnooze, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem }: {
   items: ItemView[]
   recentRestock: RecentRestock | null
   allItems: ItemView[]
@@ -686,6 +690,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onOpenItem: (item: ReplenishmentItem) => void
+  onAddItem: () => void
 }) {
   const [snoozedMap, setSnoozedMap] = useState<Map<string, number>>(new Map())
 
@@ -701,6 +706,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
   const restockItem = recentRestock ? items.find(({ item }) => item.id === recentRestock.itemId) : null
 
   const hasAny = items.length > 0
+  const hasNoItemsAtAll = allItems.length === 0
 
   return (
     <section className="current-section" aria-labelledby="current-title">
@@ -746,7 +752,14 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
         </div>
       )}
 
-      {!hasAny && (
+      {hasNoItemsAtAll ? (
+        <div className="all-good-msg">
+          <img src={catIcon} alt="家庭管家" className="all-good-cat" />
+          <strong style={{ fontSize: 18, color: "var(--ink)" }}>先添加一个你家经常忘记补货的东西</strong>
+          <span style={{ color: "var(--faint)" }}>例如：纸巾、洗衣液、牙膏、猫粮</span>
+          <button className="primary-button green" style={{ marginTop: 12 }} onClick={onAddItem}>添加消耗品</button>
+        </div>
+      ) : !hasAny && (
         <div className="all-good-msg">
           <img src={catIcon} alt="家庭管家" className="all-good-cat" />
           <span>家里的消耗品都很充足，继续保持！</span>
