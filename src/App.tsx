@@ -871,7 +871,7 @@ function CategoryCard({ category, views, urgent, warning, index = 0, onOpen, onR
   const signal = !views.length
     ? { tone: "empty" as const, label: "暂无记录" }
     : urgent
-      ? { tone: "urgent" as const, label: `${urgent} 项需要补货` }
+      ? { tone: "urgent" as const, label: `${urgent} 项预计已用完` }
       : warning
         ? { tone: "warning" as const, label: `${warning} 项快用完` }
         : { tone: "normal" as const, label: "充足" }
