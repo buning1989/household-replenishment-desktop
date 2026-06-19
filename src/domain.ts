@@ -1353,12 +1353,11 @@ function generateDemoData(): ReplenishmentItem[] {
 
 export function createInitialState(): AppState {
   const now = Date.now()
-  const demoItems = generateDemoData()
 
   return {
     version: 2,
     categories: ["卫生间", "厨房", "洗衣清洁", "宠物用品", "日常护理", "饮品零食", "其他用品"],
-    items: demoItems,
+    items: [],
     settings: {
       reminderIntervalMinutes: 60,
       quietStart: "22:00",

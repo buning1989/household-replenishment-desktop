@@ -2,60 +2,9 @@ import { createInitialState } from "./domain"
 import type { AppState, PurchaseOption, Rating, ReplenishmentItem, ReminderSettings, RestockEvent } from "./types"
 
 const STORAGE_KEY = "household_replenishment_desktop_v1"
-const CARD_STATES_DEMO_KEY = "household_replenishment_card_states_demo_v2"
 
-function demoItem(name: string, category: string, cycleDays: number, bufferDays: number, elapsedDays: number): ReplenishmentItem {
-  const now = Date.now()
-  const lastRestockedAt = new Date(now)
-  lastRestockedAt.setDate(lastRestockedAt.getDate() - elapsedDays)
-  lastRestockedAt.setHours(0, 0, 0, 0)
-  return {
-    id: `demo_${name}_${now}_${Math.random().toString(36).slice(2, 7)}`,
-    name,
-    category,
-    type: "learning",
-    cycleDays,
-    bufferDays,
-    lastRestockedAt: lastRestockedAt.getTime(),
-    anchorEstimated: true,
-    purchaseOptions: [],
-    history: [],
-    learningEnabled: true,
-    createdAt: now,
-    updatedAt: now
-  }
-}
-
-function addCardStateDemoItems(state: AppState): AppState {
-  // getItem 失败（localStorage 被禁用/异常）按“没有 demo key”处理，继续注入 demo
-  let hasDemoKey = false
-  try {
-    hasDemoKey = Boolean(localStorage.getItem(CARD_STATES_DEMO_KEY))
-  } catch (readError) {
-    console.warn("Unable to read card states demo key", readError)
-  }
-  if (hasDemoKey) return state
-  const findCategory = (...keywords: string[]) => state.categories.find((category) => keywords.some((keyword) => category.includes(keyword)))
-  const kitchen = findCategory("厨房") || state.categories[0]
-  const bathroom = findCategory("卫生", "浴室") || state.categories[1] || state.categories[0]
-  const laundry = findCategory("洗衣") || state.categories[2] || state.categories[0]
-  const additions = [
-    kitchen && demoItem("食用油", kitchen, 30, 5, 36),
-    bathroom && demoItem("洗手液", bathroom, 30, 5, 28),
-    laundry && demoItem("洗衣凝珠", laundry, 32, 5, 30),
-    bathroom && demoItem("沐浴露", bathroom, 45, 5, 42),
-    kitchen && demoItem("保鲜膜", kitchen, 25, 3, 26),
-    laundry && demoItem("柔顺剂", laundry, 40, 5, 38),
-  ].filter((item): item is ReplenishmentItem => Boolean(item))
-    .filter((item) => !state.items.some((current) => current.name === item.name && current.category === item.category))
-  // setItem 失败（配额超限/被禁用）仅 warn，不阻断返回 state
-  try {
-    localStorage.setItem(CARD_STATES_DEMO_KEY, "1")
-  } catch (writeError) {
-    console.warn("Unable to persist card states demo key", writeError)
-  }
-  return additions.length ? { ...state, items: [...state.items, ...additions], updatedAt: Date.now() } : state
-}
+// addCardStateDemoItems removed: demo items are no longer auto-seeded into real state.
+// CARD_STATES_DEMO_KEY and demoItem() removed along with it.
 
 // ---------- 运行时校验工具 ----------
 
@@ -221,7 +170,7 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
  */
 function migrateState(raw: unknown): AppState {
   if (!isObject(raw)) {
-    return addCardStateDemoItems(createInitialState())
+    return createInitialState()
   }
   const categories = asArray(raw.categories)
     .map(asString)
@@ -230,13 +179,13 @@ function migrateState(raw: unknown): AppState {
     .map(migrateItem)
     .filter((item): item is ReplenishmentItem => item !== null)
 
-  return addCardStateDemoItems({
+  return {
     version: 2,
     categories: categories.length ? categories : createInitialState().categories,
     items,
     settings: migrateSettings(raw.settings),
     updatedAt: asFiniteNumber(raw.updatedAt) ?? Date.now()
-  })
+  }
 }
 
 /**
@@ -263,7 +212,7 @@ export function loadState(): AppState {
         // JSON.parse 失败：备份原始 raw，返回安全初始状态，不在本函数内覆盖原 key
         console.warn("Unable to parse local state JSON, backing up raw value", parseError)
         backupCorruptRaw(raw)
-        return addCardStateDemoItems(createInitialState())
+        return createInitialState()
       }
       return migrateState(saved)
     }
@@ -271,7 +220,7 @@ export function loadState(): AppState {
     // localStorage 读取本身失败（隐私模式 / 配额 / 被禁用等）
     console.warn("Unable to read local state", error)
   }
-  return addCardStateDemoItems(createInitialState())
+  return createInitialState()
 }
 
 /**
