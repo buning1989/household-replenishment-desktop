@@ -3017,24 +3017,11 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                                     
                                     {/* 右侧：评价按钮 */}
                                     <button 
-                                      className="icon-button review-btn"
+                                      className="review-btn"
                                       onClick={() => handleOpenReviewModal(record, recordProductName, item.id)}
                                       title={record.review ? "编辑评价" : "添加评价"}
                                     >
-                                      <svg 
-                                        className="action-icon" 
-                                        width="16" 
-                                        height="16" 
-                                        viewBox="0 0 24 24" 
-                                        fill="none" 
-                                        stroke="currentColor" 
-                                        strokeWidth="2" 
-                                        strokeLinecap="round" 
-                                        strokeLinejoin="round"
-                                      >
-                                        <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                                        <path d="m15 5 4 4" />
-                                      </svg>
+                                      评价
                                     </button>
                                   </div>
                                 )
