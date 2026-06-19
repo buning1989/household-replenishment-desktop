@@ -2090,7 +2090,7 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 1000;
+  z-index: 1100;
 }
 
 .modal-container {

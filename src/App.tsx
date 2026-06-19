@@ -1747,9 +1747,9 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
       preferredSelectingRef.current = false
       return
     }
-    setQty(1)
+    setQty(item?.defaultQty || 1)
     setPrice(selectedOption.price || '')
-  }, [selectedOption])
+  }, [selectedOption, item?.defaultQty])
 
   // 每次打开弹窗或切换物品时重置内部状态，避免显示上一次补货的残留值
   useEffect(() => {
