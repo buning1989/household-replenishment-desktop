@@ -110,10 +110,14 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
   const cycleDaysRaw = asFiniteNumber(raw.cycleDays)
   const cycleDays = cycleDaysRaw !== undefined && cycleDaysRaw >= 1 ? Math.round(cycleDaysRaw) : 1
 
+  // 优先使用 bufferDays；如果缺失但 reminderDaysAhead 存在，则迁移为 bufferDays
   const bufferDaysRaw = asFiniteNumber(raw.bufferDays)
+  const reminderDaysAheadRaw = asFiniteNumber(raw.reminderDaysAhead)
   const bufferDays = bufferDaysRaw !== undefined && bufferDaysRaw >= 0
     ? Math.min(Math.max(0, cycleDays - 1), Math.round(bufferDaysRaw))
-    : Math.max(0, cycleDays - 1)
+    : reminderDaysAheadRaw !== undefined && reminderDaysAheadRaw >= 0
+      ? Math.min(Math.max(0, cycleDays - 1), Math.round(reminderDaysAheadRaw))
+      : Math.max(0, cycleDays - 1)
 
   const historyEvents = asArray(raw.history)
     .map(migrateHistoryEvent)
@@ -155,7 +159,6 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
       const v = asFiniteNumber(raw.defaultQty)
       return v !== undefined && v > 0 ? v : undefined
     })(),
-    reminderDaysAhead: asFiniteNumber(raw.reminderDaysAhead),
     createdAt,
     updatedAt
   }
