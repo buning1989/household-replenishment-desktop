@@ -260,6 +260,65 @@ function getDueItems(state, now = Date.now()) {
   }).sort((a, b) => depletionAt(a) - depletionAt(b))
 }
 
+let lastBudgetNotificationLevel = ""
+
+function getMonthlySpending(state) {
+  if (!state || !Array.isArray(state.items)) return 0
+  const now = new Date()
+  const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+  let total = 0
+  for (const item of state.items) {
+    if (!Array.isArray(item.history)) continue
+    for (const event of item.history) {
+      if (event.at >= currentMonthStart && Number.isFinite(Number(event.price))) {
+        total += Number(event.price)
+      }
+    }
+  }
+  return total
+}
+
+function getBudgetLevel(percent) {
+  if (percent >= 100) return "urgent"
+  if (percent >= 90) return "urgent"
+  if (percent >= 75) return "warning"
+  if (percent >= 50) return "info"
+  return null
+}
+
+function getBudgetReminderText(percent) {
+  if (percent >= 100) return "本月预算已用完，下个月再买吧"
+  if (percent >= 90) return "本月预算即将用完，谨慎消费"
+  if (percent >= 75) return "本月预算已用四分之三，注意控制开销"
+  if (percent >= 50) return "本月预算已使用一半，继续保持"
+  return ""
+}
+
+function sendBudgetNotification(percent, spent, budget) {
+  if (!Notification.isSupported()) return
+  const level = getBudgetLevel(percent)
+  if (!level) return
+  if (level === lastBudgetNotificationLevel) return
+  lastBudgetNotificationLevel = level
+  const title = level === "urgent" ? "预算提醒" : "预算进度"
+  const body = `${getBudgetReminderText(percent)}（已用 ¥${spent.toFixed(0)} / ¥${budget.toFixed(0)}）`
+  const notification = new Notification({ title, body, closeButtonText: "关闭" })
+  notification.on("click", () => showWindow())
+  notification.show()
+}
+
+function checkBudgetNotification(state) {
+  if (!state) return
+  const budget = Number(state.settings?.monthlyBudget || 0)
+  if (budget <= 0) {
+    lastBudgetNotificationLevel = ""
+    return
+  }
+  const spent = getMonthlySpending(state)
+  const percent = Math.round((spent / budget) * 100)
+  sendBudgetNotification(percent, spent, budget)
+}
+
 function sendNotification(items, isTest = false) {
   if (!Notification.isSupported()) return
   const item = items[0]
@@ -339,8 +398,14 @@ app.whenReady().then(() => {
   loadState()
   createWindow()
   createTray()
-  setInterval(() => checkReminders(false), 60 * 1000)
-  setTimeout(() => checkReminders(false), 2500)
+  setInterval(() => {
+    checkReminders(false)
+    checkBudgetNotification(latestState)
+  }, 60 * 1000)
+  setTimeout(() => {
+    checkReminders(false)
+    checkBudgetNotification(latestState)
+  }, 2500)
 })
 
 app.on("activate", showWindow)
@@ -360,6 +425,7 @@ ipcMain.handle("state:sync", (_event, state) => {
   latestState = state
   const saved = saveState(state)
   checkReminders(false)
+  checkBudgetNotification(state)
   return saved
     ? { ok: true }
     : { ok: false, error: "数据已保存在当前窗口，但桌面备份文件写入失败。请重试并建议复制当前数据备份。" }

@@ -73,6 +73,7 @@ export interface PurchaseOption {
   link?: string        // 商品链接（可选）
   review?: string      // 对该具体商品的评价
   isDefault?: boolean  // 是否为默认选项
+  image?: string       // 商品图片（base64）
 }
 
 export type RestockEvent = {

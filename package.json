@@ -12,7 +12,8 @@
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
     "start": "electron .",
-    "package:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg"
+    "package:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg",
+    "package:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "motion": "^12.40.0",
