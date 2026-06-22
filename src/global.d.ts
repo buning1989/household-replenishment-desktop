@@ -8,7 +8,7 @@ type NotificationAction = {
 declare global {
   interface Window {
     desktop?: {
-      syncState: (state: AppState) => void
+      syncState: (state: AppState) => Promise<{ ok: boolean; error?: string }>
       openExternal: (url: string) => Promise<void>
       showWindow: () => void
       testNotification: () => void
@@ -18,4 +18,3 @@ declare global {
 }
 
 export {}
-

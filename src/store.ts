@@ -1,7 +1,37 @@
 import { createInitialState } from "./domain"
-import type { AppState, PurchaseOption, Rating, ReplenishmentItem, ReminderSettings, RestockEvent } from "./types"
+import type {
+  AppState,
+  ChildSituation,
+  CookingFrequency,
+  HomeSize,
+  HouseholdProfile,
+  InventoryStatus,
+  LaundryFrequency,
+  ModelConfidence,
+  OnboardingState,
+  PetSituation,
+  PurchaseOption,
+  Rating,
+  ReplenishmentItem,
+  ReminderSettings,
+  ResidentCount,
+  RestockEvent
+} from "./types"
 
 const STORAGE_KEY = "household_replenishment_desktop_v1"
+
+export type PersistenceIssue = {
+  kind: "read" | "write" | "sync"
+  message: string
+}
+
+let pendingLoadIssue: PersistenceIssue | null = null
+
+export function takePendingLoadIssue(): PersistenceIssue | null {
+  const issue = pendingLoadIssue
+  pendingLoadIssue = null
+  return issue
+}
 
 // addCardStateDemoItems removed: demo items are no longer auto-seeded into real state.
 // CARD_STATES_DEMO_KEY and demoItem() removed along with it.
@@ -23,6 +53,19 @@ function asString(value: unknown): string | undefined {
 
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
+}
+
+function asStringArray(value: unknown): string[] {
+  return asArray(value).map(asString).filter((item): item is string => Boolean(item))
+}
+
+function migrateInventoryStatuses(value: unknown): Record<string, InventoryStatus> {
+  if (!isObject(value)) return {}
+  return Object.fromEntries(Object.entries(value).flatMap(([templateId, status]) =>
+    ["justRestocked", "plenty", "half", "low", "unknown"].includes(String(status))
+      ? [[templateId, status as InventoryStatus]]
+      : []
+  ))
 }
 
 const DEFAULT_SETTINGS: ReminderSettings = {
@@ -68,6 +111,7 @@ function migratePurchaseOption(raw: unknown): PurchaseOption | null {
     unit,
     price: price !== undefined && price > 0 ? price : undefined,
     link: asString(raw.link),
+    review: asString(raw.review),
     isDefault: raw.isDefault === true
   }
 }
@@ -92,6 +136,84 @@ function migrateHistoryEvent(raw: unknown): RestockEvent | null {
     purchaseUnit: asString(raw.purchaseUnit),
     rating,
     review: asString(raw.review)
+  }
+}
+
+function migrateHouseholdProfile(raw: unknown): HouseholdProfile | null {
+  if (!isObject(raw)) return null
+  const residentCount = [1, 2, 3, 4].includes(Number(raw.residentCount))
+    ? Number(raw.residentCount) as ResidentCount
+    : 2
+  const children: ChildSituation = ["none", "infant", "schoolAge", "teen"].includes(String(raw.children))
+    ? raw.children as ChildSituation
+    : "none"
+  const pets: PetSituation = ["none", "cat", "dog", "catAndDog", "other"].includes(String(raw.pets))
+    ? raw.pets as PetSituation
+    : "none"
+  const cookingFrequency: CookingFrequency = ["rarely", "sometimes", "often", "daily"].includes(String(raw.cookingFrequency))
+    ? raw.cookingFrequency as CookingFrequency
+    : "sometimes"
+  const laundryFrequency: LaundryFrequency = ["low", "medium", "daily"].includes(String(raw.laundryFrequency))
+    ? raw.laundryFrequency as LaundryFrequency
+    : "medium"
+  const homeSize: HomeSize = ["oneBedroom", "twoBedroom", "threePlus"].includes(String(raw.homeSize))
+    ? raw.homeSize as HomeSize
+    : "twoBedroom"
+  const now = Date.now()
+  const bathroomCount = asFiniteNumber(raw.bathroomCount)
+  return {
+    residentCount,
+    children,
+    pets,
+    cookingFrequency,
+    laundryFrequency,
+    homeSize,
+    bathroomCount: bathroomCount !== undefined && bathroomCount > 0 ? Math.round(bathroomCount) : undefined,
+    createdAt: asFiniteNumber(raw.createdAt) ?? now,
+    updatedAt: asFiniteNumber(raw.updatedAt) ?? now
+  }
+}
+
+function migrateOnboarding(raw: unknown, legacyState: boolean, hasItems: boolean): OnboardingState {
+  const now = Date.now()
+  if (legacyState) {
+    return {
+      completed: true,
+      rerun: false,
+      currentStep: 5,
+      skippedProfile: false,
+      skipped: false,
+      managedTemplateIds: [],
+      notUsedTemplateIds: [],
+      deferredTemplateIds: [],
+      createdTemplateIds: [],
+      inventoryStatuses: {},
+      completedAt: now
+    }
+  }
+  if (!isObject(raw)) {
+    return {
+      ...createInitialState().onboarding,
+      completed: hasItems,
+      currentStep: hasItems ? 5 : 1,
+      completedAt: hasItems ? now : undefined
+    }
+  }
+  const step = asFiniteNumber(raw.currentStep)
+  const currentStep = step !== undefined && step >= 1 && step <= 5 ? Math.round(step) as OnboardingState["currentStep"] : 1
+  return {
+    completed: raw.completed === true,
+    rerun: raw.rerun === true,
+    currentStep,
+    skippedProfile: raw.skippedProfile === true,
+    skipped: raw.skipped === true,
+    managedTemplateIds: asStringArray(raw.managedTemplateIds),
+    notUsedTemplateIds: asStringArray(raw.notUsedTemplateIds),
+    deferredTemplateIds: asStringArray(raw.deferredTemplateIds),
+    createdTemplateIds: asStringArray(raw.createdTemplateIds),
+    inventoryStatuses: migrateInventoryStatuses(raw.inventoryStatuses),
+    startedAt: asFiniteNumber(raw.startedAt),
+    completedAt: asFiniteNumber(raw.completedAt)
   }
 }
 
@@ -128,10 +250,34 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
   // 统计函数“末尾为最新”的假设保持一致；修复历史数据中被新流程 prepend 反序的记录
   historyEvents.sort((a, b) => a.at - b.at)
 
+  const purchaseOptions = asArray(raw.purchaseOptions)
+    .map(migratePurchaseOption)
+    .filter((option): option is PurchaseOption => option !== null)
+  const purchaseOptionsWithReview = purchaseOptions.map((option) => {
+    if (option.review?.trim()) return option
+    const matchingHistoryReview = historyEvents
+      .slice()
+      .reverse()
+      .find((event) => event.review?.trim() && (
+        event.purchaseProductName === option.productName ||
+        (!event.purchaseProductName && purchaseOptions.length === 1)
+      ))
+    return matchingHistoryReview?.review
+      ? { ...option, review: matchingHistoryReview.review }
+      : option
+  })
+
   const now = Date.now()
   const createdAt = asFiniteNumber(raw.createdAt) ?? now
   const updatedAt = asFiniteNumber(raw.updatedAt) ?? createdAt
   const lastRestockedAt = asFiniteNumber(raw.lastRestockedAt) ?? createdAt
+  const source = raw.source === "onboarding" || raw.source === "imported" ? raw.source : "manual"
+  const confidence: ModelConfidence = raw.confidence === "low" || raw.confidence === "medium" || raw.confidence === "high"
+    ? raw.confidence
+    : source === "onboarding" ? "low" : "high"
+  const inventoryStatus: InventoryStatus | undefined = ["justRestocked", "plenty", "half", "low", "unknown"].includes(String(raw.inventoryStatus))
+    ? raw.inventoryStatus as InventoryStatus
+    : undefined
 
   return {
     id,
@@ -141,16 +287,22 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
     cycleDays,
     bufferDays,
     lastRestockedAt,
+    inventoryDepletionAt: asFiniteNumber(raw.inventoryDepletionAt),
     anchorEstimated: raw.anchorEstimated !== false,
-    purchaseOptions: asArray(raw.purchaseOptions)
-      .map(migratePurchaseOption)
-      .filter((option): option is PurchaseOption => option !== null),
+    purchaseOptions: purchaseOptionsWithReview,
     history: historyEvents,
     link: asString(raw.link),
     price: asFiniteNumber(raw.price),
     snoozeUntil: asFiniteNumber(raw.snoozeUntil),
     suggestedCycleDays: asFiniteNumber(raw.suggestedCycleDays),
     learningEnabled: raw.learningEnabled !== false,
+    source,
+    templateId: asString(raw.templateId),
+    confidence,
+    inventoryStatus,
+    modelNote: asString(raw.modelNote),
+    lastFeedbackAt: asFiniteNumber(raw.lastFeedbackAt),
+    feedbackCount: Math.max(0, Math.round(asFiniteNumber(raw.feedbackCount) ?? 0)),
     unit: asString(raw.unit),
     platform: asString(raw.platform),
     defaultQty: (() => {
@@ -179,12 +331,15 @@ function migrateState(raw: unknown): AppState {
   const items = asArray(raw.items)
     .map(migrateItem)
     .filter((item): item is ReplenishmentItem => item !== null)
+  const legacyState = asFiniteNumber(raw.version) !== 3
 
   return {
-    version: 2,
+    version: 3,
     categories: categories.length ? categories : createInitialState().categories,
     items,
     settings: migrateSettings(raw.settings),
+    householdProfile: migrateHouseholdProfile(raw.householdProfile),
+    onboarding: migrateOnboarding(raw.onboarding, legacyState, items.length > 0),
     updatedAt: asFiniteNumber(raw.updatedAt) ?? Date.now()
   }
 }
@@ -193,12 +348,14 @@ function migrateState(raw: unknown): AppState {
  * 解析失败时把原始 raw 备份到带时间戳的 key，避免后续 persist 立刻覆盖用户数据。
  * 备份失败也只 warn，不阻断应用启动。
  */
-function backupCorruptRaw(raw: string): void {
+function backupCorruptRaw(raw: string): boolean {
   try {
     const backupKey = `${STORAGE_KEY}_corrupt_backup_${Date.now()}`
     localStorage.setItem(backupKey, raw)
+    return true
   } catch (backupError) {
     console.warn("Unable to back up corrupt state", backupError)
+    return false
   }
 }
 
@@ -212,7 +369,13 @@ export function loadState(): AppState {
       } catch (parseError) {
         // JSON.parse 失败：备份原始 raw，返回安全初始状态，不在本函数内覆盖原 key
         console.warn("Unable to parse local state JSON, backing up raw value", parseError)
-        backupCorruptRaw(raw)
+        const backupCreated = backupCorruptRaw(raw)
+        pendingLoadIssue = {
+          kind: "read",
+          message: backupCreated
+            ? "本地数据读取失败，已保留损坏数据备份并启用安全状态。建议暂缓大量录入，并尽快备份当前数据。"
+            : "本地数据读取失败，且无法创建损坏数据备份。请暂缓录入并尽快备份当前数据。"
+        }
         return createInitialState()
       }
       return migrateState(saved)
@@ -220,6 +383,10 @@ export function loadState(): AppState {
   } catch (error) {
     // localStorage 读取本身失败（隐私模式 / 配额 / 被禁用等）
     console.warn("Unable to read local state", error)
+    pendingLoadIssue = {
+      kind: "read",
+      message: "无法读取本地数据，当前显示的是安全初始状态。请重启应用后重试，并尽快备份当前数据。"
+    }
   }
   return createInitialState()
 }
@@ -227,18 +394,40 @@ export function loadState(): AppState {
 /**
  * 持久化容错：
  * - localStorage.setItem 失败（配额超限 / 被禁用）不再导致应用崩溃；
- * - window.desktop?.syncState 失败同样 catch；
- * - 两处失败均只 console.warn，不弹复杂 UI。
+ * - Electron 主进程返回桌面备份文件是否写入成功；
+ * - 返回结构化问题，由界面提供可见提示与重试。
  */
-export function persistState(state: AppState): void {
+export async function persistState(state: AppState): Promise<PersistenceIssue | null> {
+  let issue: PersistenceIssue | null = null
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
   } catch (storageError) {
     console.warn("Unable to persist state to localStorage", storageError)
+    issue = {
+      kind: "write",
+      message: "数据保存失败。请重试；如果问题持续，建议复制当前数据备份后再关闭应用。"
+    }
   }
-  try {
-    window.desktop?.syncState(state)
-  } catch (syncError) {
-    console.warn("Unable to sync state to desktop main process", syncError)
+
+  if (window.desktop) {
+    try {
+      const result = await window.desktop.syncState(state)
+      if (!result.ok && !issue) {
+        issue = {
+          kind: "sync",
+          message: result.error || "数据已保存在当前窗口，但桌面备份文件同步失败。请重试并建议复制当前数据备份。"
+        }
+      }
+    } catch (syncError) {
+      console.warn("Unable to sync state to desktop main process", syncError)
+      if (!issue) {
+        issue = {
+          kind: "sync",
+          message: "数据已保存在当前窗口，但桌面备份文件同步失败。请重试并建议复制当前数据备份。"
+        }
+      }
+    }
   }
+
+  return issue
 }

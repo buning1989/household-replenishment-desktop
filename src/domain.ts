@@ -1,4 +1,5 @@
 import type { AppState, ConsumptionInfo, ItemComputed, ItemDraft, ItemUrgency, PriceAnchor, ReplenishmentItem } from "./types"
+import { createInitialOnboardingState } from "./model/onboarding"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -40,7 +41,9 @@ export function differenceInDays(later: number, earlier: number): number {
 }
 
 export function computeItem(item: ReplenishmentItem, now = Date.now()): ItemComputed {
-  const depletionAt = addDays(item.lastRestockedAt, item.cycleDays)
+  const depletionAt = Number.isFinite(item.inventoryDepletionAt)
+    ? startOfDay(item.inventoryDepletionAt!)
+    : addDays(item.lastRestockedAt, item.cycleDays)
   const dueAt = addDays(depletionAt, -item.bufferDays)
   const daysUntilDue = differenceInDays(dueAt, now)
   const daysUntilDepletion = differenceInDays(depletionAt, now)
@@ -50,14 +53,19 @@ export function computeItem(item: ReplenishmentItem, now = Date.now()): ItemComp
     : daysUntilDue <= 0
       ? "warning"
       : "normal"
-  const statusLabel = status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
+  const isLowConfidence = item.source === "onboarding" && item.confidence === "low"
+  const statusLabel: ItemComputed["statusLabel"] = isLowConfidence
+    ? status === "normal" ? "初始估算中" : "可能快到补货周期了"
+    : status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
   const displayStatus = status
   const isDue = !isSnoozed && status !== "normal"
 
-  let remainingText = `还剩约 ${Math.max(0, daysUntilDepletion)} 天`
-  let statusText = statusLabel
-  if (daysUntilDepletion < 0) remainingText = `预计已用完 ${Math.abs(daysUntilDepletion)} 天`
-  if (daysUntilDepletion === 0) remainingText = "预计今天用完"
+  let remainingText = isLowConfidence
+    ? status === "normal" ? `约 ${Math.max(0, daysUntilDepletion)} 天后再看看` : "现在还够用吗？"
+    : `还剩约 ${Math.max(0, daysUntilDepletion)} 天`
+  let statusText: string = statusLabel
+  if (!isLowConfidence && daysUntilDepletion < 0) remainingText = `预计已用完 ${Math.abs(daysUntilDepletion)} 天`
+  if (!isLowConfidence && daysUntilDepletion === 0) remainingText = "预计今天用完"
   if (isSnoozed && status !== "normal") statusText = `${statusLabel} · 已推迟至 ${formatDateTime(item.snoozeUntil!)}`
 
   return {
@@ -185,34 +193,46 @@ export function restockItem(
     ? Math.max(1, Math.round(singleItemCandidate * safeQty))
     : item.cycleDays
 
+  const confidence = item.source === "onboarding"
+    ? history.length >= 2 ? "high" : "medium"
+    : item.confidence
+
   return {
     ...item,
     cycleDays: newCycleDays,
     lastRestockedAt: startOfDay(now),
+    inventoryDepletionAt: undefined,
     anchorEstimated: false,
     history,
     price: price ?? item.price,
     platform: platform || item.platform,
     snoozeUntil: undefined,
     suggestedCycleDays: undefined,
+    confidence,
+    inventoryStatus: "justRestocked",
+    modelNote: item.source === "onboarding"
+      ? history.length >= 2 ? "已根据多次真实补货记录学习周期" : "已记录首次真实补货，继续观察中"
+      : item.modelNote,
     updatedAt: now
   }
 }
 
 export function calibrateRemainingDays(item: ReplenishmentItem, remainingDays: number, now = Date.now()): ReplenishmentItem {
-  const normalizedRemainingDays = Math.min(item.cycleDays, Math.max(0, Math.round(remainingDays)))
+  const normalizedRemainingDays = Math.max(0, Math.round(remainingDays))
   return {
     ...item,
-    lastRestockedAt: addDays(now, -(item.cycleDays - normalizedRemainingDays)),
+    inventoryDepletionAt: addDays(now, normalizedRemainingDays),
     anchorEstimated: true,
     updatedAt: now
   }
 }
 
 export function createItem(draft: ItemDraft, now = Date.now()): ReplenishmentItem {
-  const remainingDays = draft.remainingDays === "" ? draft.cycleDays : Number(draft.remainingDays)
-  const anchorOffset = Math.max(0, draft.cycleDays - Math.max(0, remainingDays))
   const cycleDays = Math.max(1, Number(draft.cycleDays))
+  const parsedInventoryDays = Number(draft.remainingDays)
+  const inventoryDays = draft.remainingDays === "" || !Number.isFinite(parsedInventoryDays)
+    ? undefined
+    : Math.max(0, Math.round(parsedInventoryDays))
   return {
     id: id("item"),
     name: draft.name.trim(),
@@ -221,7 +241,8 @@ export function createItem(draft: ItemDraft, now = Date.now()): ReplenishmentIte
     learningEnabled: draft.learningEnabled,
     cycleDays,
     bufferDays: Math.min(Math.max(0, cycleDays - 1), Math.max(0, Number(draft.bufferDays))),
-    lastRestockedAt: addDays(now, -anchorOffset),
+    lastRestockedAt: startOfDay(now),
+    inventoryDepletionAt: inventoryDays === undefined ? undefined : addDays(now, inventoryDays),
     anchorEstimated: true,
     purchaseOptions: draft.purchaseOptions || [],
     history: [],
@@ -230,6 +251,8 @@ export function createItem(draft: ItemDraft, now = Date.now()): ReplenishmentIte
     unit: draft.unit.trim() || undefined,
     platform: draft.platform.trim() || undefined,
     defaultQty: draft.defaultQty ? Math.max(1, Number(draft.defaultQty)) : undefined,
+    source: "manual",
+    confidence: "medium",
     createdAt: now,
     updatedAt: now
   }
@@ -237,6 +260,11 @@ export function createItem(draft: ItemDraft, now = Date.now()): ReplenishmentIte
 
 export function updateItemFromDraft(item: ReplenishmentItem, draft: ItemDraft): ReplenishmentItem {
   const cycleDays = Math.max(1, Number(draft.cycleDays))
+  const now = Date.now()
+  const parsedInventoryDays = Number(draft.remainingDays)
+  const inventoryDays = draft.remainingDays === "" || !Number.isFinite(parsedInventoryDays)
+    ? undefined
+    : Math.max(0, Math.round(parsedInventoryDays))
   return {
     ...item,
     name: draft.name.trim(),
@@ -245,13 +273,17 @@ export function updateItemFromDraft(item: ReplenishmentItem, draft: ItemDraft): 
     learningEnabled: draft.learningEnabled,
     cycleDays,
     bufferDays: Math.min(Math.max(0, cycleDays - 1), Math.max(0, Number(draft.bufferDays))),
+    inventoryDepletionAt: inventoryDays === undefined ? item.inventoryDepletionAt : addDays(now, inventoryDays),
     link: draft.link.trim() || undefined,
     unit: draft.unit.trim() || undefined,
     platform: draft.platform.trim() || undefined,
     defaultQty: draft.defaultQty ? Math.max(1, Number(draft.defaultQty)) : undefined,
-    purchaseOptions: draft.purchaseOptions || item.purchaseOptions,
+    purchaseOptions: (draft.purchaseOptions || item.purchaseOptions).map((option) => ({
+      ...option,
+      unit: draft.unit.trim() || option.unit || "件"
+    })),
     suggestedCycleDays: undefined,
-    updatedAt: Date.now()
+    updatedAt: now
   }
 }
 
@@ -1396,7 +1428,7 @@ export function createInitialState(): AppState {
   const now = Date.now()
 
   return {
-    version: 2,
+    version: 3,
     categories: ["卫生间", "厨房", "洗衣清洁", "宠物用品", "日常护理", "饮品零食", "其他用品"],
     items: [],
     settings: {
@@ -1405,6 +1437,8 @@ export function createInitialState(): AppState {
       quietEnd: "08:00",
       snoozeUntilHour: 8
     },
+    householdProfile: null,
+    onboarding: createInitialOnboardingState(now),
     updatedAt: now
   }
 }

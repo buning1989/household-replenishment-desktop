@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react"
 import { AnimatedIcon as Icon } from "./AnimatedIcon"
+import { OnboardingWizard, type OnboardingCompletion } from "./OnboardingWizard"
 import catIcon from "./assets/cat-icon.png"
 import {
   calibrateRemainingDays,
@@ -17,8 +18,9 @@ import {
   restockItem,
   updateItemFromDraft
 } from "./domain"
-import { loadState, persistState } from "./store"
-import type { AppState, ItemComputed, ItemDraft, PriceAnchor, Rating, RecentRestock, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
+import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
+import { loadState, persistState, takePendingLoadIssue, type PersistenceIssue } from "./store"
+import type { AppState, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PriceAnchor, Rating, RecentRestock, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 
 const EMPTY_DRAFT: ItemDraft = {
@@ -50,28 +52,12 @@ function formatItemStatusText(
   // 1. 剩余天数
   parts.push(`还剩约 ${Math.max(0, computed.daysUntilDepletion)} 天`)
   
-  // 2. 补货间隔
-  if (item.cycleDays) {
-    parts.push(`每 ${item.cycleDays} 天补货`)
-  }
-  
-  // 3. 提前提醒
-  if (item.bufferDays) {
-    parts.push(`提前 ${item.bufferDays} 天提醒`)
-  }
-  
-  // 4. 上次补货日期
+  // 2. 上次补货日期
   if (item.lastRestockedAt) {
     const lastRestockDate = new Date(item.lastRestockedAt)
     const month = lastRestockDate.getMonth() + 1
     const day = lastRestockDate.getDate()
-    parts.push(`上次补货 ${month}月${day}日`)
-  }
-  
-  // 5. 默认购买量 + 计量单位
-  const unit = getDisplayPurchaseUnit(item)
-  if (item.defaultQty) {
-    parts.push(`默认 ${item.defaultQty} ${unit}`)
+    parts.push(`上次补货 ${month} 月 ${day} 日`)
   }
   
   return parts.join(' · ')
@@ -79,6 +65,7 @@ function formatItemStatusText(
 
 // 获取用于展示的采购选项单位
 function getDisplayPurchaseUnit(item: ReplenishmentItem): string {
+  if (item.unit) return item.unit
   const defaultOption = item.purchaseOptions?.find(opt => opt.isDefault)
   if (defaultOption?.unit) {
     return defaultOption.unit
@@ -86,7 +73,7 @@ function getDisplayPurchaseUnit(item: ReplenishmentItem): string {
   if (item.purchaseOptions?.length && item.purchaseOptions[0].unit) {
     return item.purchaseOptions[0].unit
   }
-  return item.unit || "件"
+  return "件"
 }
 
 function cloneItem(item: ReplenishmentItem): ReplenishmentItem {
@@ -95,8 +82,34 @@ function cloneItem(item: ReplenishmentItem): ReplenishmentItem {
 
 type ItemViewType = { item: ReplenishmentItem; computed: ItemComputed }
 
+function PersistenceAlert({ issue, backupState, onRetry, onCopyBackup, onDismiss }: {
+  issue: PersistenceIssue
+  backupState: "idle" | "copied" | "failed"
+  onRetry: () => void
+  onCopyBackup: () => void
+  onDismiss: () => void
+}) {
+  return (
+    <div className="persistence-alert" role="alert">
+      <div className="persistence-alert-copy">
+        <strong>数据保存需要注意</strong>
+        <span>{issue.message}</span>
+        {backupState === "failed" && <span className="persistence-alert-detail">复制备份失败，请保持应用开启后重试。</span>}
+      </div>
+      <div className="persistence-alert-actions">
+        {issue.kind !== "read" && <button type="button" onClick={onRetry}>重试保存</button>}
+        <button type="button" onClick={onCopyBackup}>{backupState === "copied" ? "已复制备份" : "复制当前数据"}</button>
+        <button type="button" className="persistence-alert-dismiss" onClick={onDismiss} aria-label="关闭数据保存提示"><Icon name="close" size={14} /></button>
+      </div>
+    </div>
+  )
+}
+
 function App() {
   const [state, setState] = useState<AppState>(() => loadState())
+  const [persistenceIssue, setPersistenceIssue] = useState<PersistenceIssue | null>(() => takePendingLoadIssue())
+  const [backupCopyState, setBackupCopyState] = useState<"idle" | "copied" | "failed">("idle")
+  const persistenceSequence = useRef(0)
   const [editingItem, setEditingItem] = useState<ReplenishmentItem | null | undefined>(undefined)
   const [newItemCategory, setNewItemCategory] = useState<string | undefined>(undefined)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -130,7 +143,7 @@ function App() {
   const [addPurchaseOptionItemId, setAddPurchaseOptionItemId] = useState<string | null>(null)
   const [editingPurchaseOption, setEditingPurchaseOption] = useState<PurchaseOption | null>(null)
   const [editModalOpen, setEditModalOpen] = useState(false)
-  // 当从补货弹窗中录入新采购选项后，用于在 RestockModal 中自动选中该选项
+  // 当从补货弹窗中录入新商品后，用于在 RestockModal 中自动选中该商品
   const [preferredPurchaseOptionId, setPreferredPurchaseOptionId] = useState<string | null>(null)
   function deferredClose(setClosing: (v: boolean) => void, actualClose: () => void, delay = 200) {
     setClosing(true)
@@ -167,7 +180,12 @@ function App() {
   }), [itemViews, state.categories])
 
   useEffect(() => {
-    persistState(state)
+    const sequence = ++persistenceSequence.current
+    void persistState(state).then((issue) => {
+      if (sequence !== persistenceSequence.current) return
+      setPersistenceIssue((current) => issue ?? (current?.kind === "read" ? current : null))
+      if (issue) setBackupCopyState("idle")
+    })
   }, [state])
 
   useEffect(() => {
@@ -195,9 +213,6 @@ function App() {
       if (categoryDialog) setCategoryDialog(null)
       else if (detailItemId) deferredClose(setDetailPanelClosing, () => setDetailItemId(null))
       else if (settingsOpen) deferredClose(setSettingsClosing, () => setSettingsOpen(false))
-      else if (editingItem !== undefined) {
-        deferredClose(setEditorClosing, () => { setEditingItem(undefined); setNewItemCategory(undefined) })
-      }
       else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
     }
     window.addEventListener("keydown", closeTopPanel)
@@ -269,15 +284,31 @@ function App() {
     updateItems([item.id], (current) => ({ ...current, snoozeUntil, updatedAt: Date.now() }))
   }
 
+  function handleColdStartFeedback(item: ReplenishmentItem, feedback: ColdStartFeedback) {
+    const snoozeUntil = feedback === "later" ? nextSnoozeTime(state.settings.snoozeUntilHour) : undefined
+    updateItems([item.id], (current) => applyColdStartFeedback(current, feedback, Date.now(), snoozeUntil))
+  }
+
   function calibrateItem(item: ReplenishmentItem, remainingDays: number) {
     updateItems([item.id], (current) => calibrateRemainingDays(current, remainingDays))
   }
 
   function quickEditItem(item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform" | "purchaseOptions">>) {
-    updateItems([item.id], (current) => ({ ...current, ...patch, updatedAt: Date.now() }))
+    updateItems([item.id], (current) => {
+      const nextUnit = patch.unit?.trim()
+      return {
+        ...current,
+        ...patch,
+        purchaseOptions: nextUnit
+          ? (current.purchaseOptions || []).map((option) => ({ ...option, unit: nextUnit }))
+          : patch.purchaseOptions ?? current.purchaseOptions,
+        updatedAt: Date.now()
+      }
+    })
   }
 
   function saveItem(draft: ItemDraft) {
+    if (!draft.name.trim()) return
     const nextItem = editingItem ? updateItemFromDraft(editingItem, draft) : createItem(draft)
     const exists = state.items.some((item) => item.id === nextItem.id)
     const categories = state.categories.includes(nextItem.category)
@@ -340,10 +371,12 @@ function App() {
   }
 
   function renameItem(id: string, newName: string) {
+    const normalizedName = newName.trim()
+    if (!normalizedName) return
     setState(prev => ({
       ...prev,
       items: prev.items.map(item => 
-        item.id === id ? { ...item, name: newName } : item
+        item.id === id ? { ...item, name: normalizedName } : item
       ),
       updatedAt: Date.now()
     }))
@@ -370,15 +403,18 @@ function App() {
   function handleRestockFromOption(itemId: string, option: PurchaseOption) {
     const item = state.items.find(i => i.id === itemId)
     if (!item) return
-    // 经由 domain.restockItem 完成补货，避免手写 patch 绕过学习/状态机
-    performRestock(itemId, item.defaultQty || 1, option.price, option.platform, option.productName, option.unit)
-    setDetailItemId(null)
+    setRestockModalItemId(itemId)
+    setPreferredPurchaseOptionId(option.id)
+    setRestockModalOpen(true)
   }
 
-  function handleAddPurchaseOption(itemId: string, optionData: Omit<PurchaseOption, 'id'>) {
+  function handleAddPurchaseOption(itemId: string, optionData: Omit<PurchaseOption, 'id' | 'unit'>) {
+    const item = state.items.find((current) => current.id === itemId)
+    if (!item) return
     const option: PurchaseOption = {
       id: crypto.randomUUID(),
-      ...optionData
+      ...optionData,
+      unit: item.unit || '件'
     }
 
     updateItems([itemId], (current) => ({
@@ -396,7 +432,7 @@ function App() {
     }
   }
 
-  // 保存编辑后的采购选项
+  // 保存编辑后的商品
   function handleSaveEditedOption(editedOption: PurchaseOption) {
     const item = state.items.find(i => i.purchaseOptions?.some(opt => opt.id === editedOption.id))
     if (!item) return
@@ -404,7 +440,7 @@ function App() {
     updateItems([item.id], (current) => ({
       ...current,
       purchaseOptions: (current.purchaseOptions || []).map(opt => 
-        opt.id === editedOption.id ? editedOption : opt
+        opt.id === editedOption.id ? { ...editedOption, unit: current.unit || editedOption.unit || '件' } : opt
       )
     }))
     
@@ -412,15 +448,15 @@ function App() {
     setEditingPurchaseOption(null)
   }
 
-  // 编辑采购选项
+  // 编辑商品
   function handleEditPurchaseOption(option: PurchaseOption) {
     setEditingPurchaseOption(option)
     setEditModalOpen(true)
   }
 
-  // 删除采购选项
+  // 删除商品
   function handleDeletePurchaseOption(itemId: string, optionId: string) {
-    if (!window.confirm('确定要删除这个采购选项吗？')) return
+    if (!window.confirm('确定要删除这个商品吗？')) return
     
     const item = state.items.find(i => i.id === itemId)
     if (!item) return
@@ -479,8 +515,151 @@ function App() {
     setEditingItem(null)
   }
 
+  function handleOnboardingProgress(profile: HouseholdProfile, patch: Partial<OnboardingState>) {
+    setState((current) => ({
+      ...current,
+      householdProfile: profile,
+      onboarding: { ...current.onboarding, ...patch },
+      updatedAt: Date.now()
+    }))
+  }
+
+  function handleOnboardingSkip() {
+    const completedAt = Date.now()
+    const isRerun = state.onboarding.rerun
+    setState((current) => ({
+      ...current,
+      onboarding: {
+        ...current.onboarding,
+        completed: true,
+        rerun: false,
+        currentStep: 5,
+        skipped: isRerun ? current.onboarding.skipped : true,
+        completedAt
+      },
+      updatedAt: completedAt
+    }))
+    if (!isRerun) {
+      setCreatingCategory(state.categories[0] || null)
+      setIsItemCreatorOpen(true)
+    }
+  }
+
+  function startOnboardingRerun() {
+    const startedAt = Date.now()
+    setSettingsOpen(false)
+    setSettingsClosing(false)
+    setState((current) => ({
+      ...current,
+      onboarding: {
+        ...current.onboarding,
+        completed: false,
+        rerun: true,
+        currentStep: 1,
+        skipped: false,
+        startedAt,
+        completedAt: undefined
+      },
+      updatedAt: startedAt
+    }))
+  }
+
+  function handleOnboardingComplete(result: OnboardingCompletion) {
+    const now = Date.now()
+    const createdItems = createColdStartItems(
+      result.profile,
+      result.selections.map(({ template, inventoryStatus }) => ({ template, inventoryStatus })),
+      now
+    )
+    const selectedTemplateIds = createdItems.flatMap((item) => item.templateId ? [item.templateId] : [])
+    const notUsedTemplateIds = Object.entries(result.decisions).filter(([, decision]) => decision === "notUsed").map(([id]) => id)
+    const deferredTemplateIds = Object.entries(result.decisions).filter(([, decision]) => decision === "defer").map(([id]) => id)
+    setState((current) => {
+      const existingTemplateIds = new Set(current.items.flatMap((item) => item.templateId ? [item.templateId] : []))
+      const existingNames = new Set(current.items.map((item) => item.name.trim().toLocaleLowerCase("zh-CN")))
+      const uniqueItems = createdItems.filter((item) =>
+        (!item.templateId || !existingTemplateIds.has(item.templateId)) &&
+        !existingNames.has(item.name.trim().toLocaleLowerCase("zh-CN"))
+      )
+      const newlyCreatedTemplateIds = uniqueItems.flatMap((item) => item.templateId ? [item.templateId] : [])
+      const categories = [...new Set([...current.categories, ...uniqueItems.map((item) => item.category)])]
+      return {
+        ...current,
+        categories,
+        items: [...current.items, ...uniqueItems],
+        householdProfile: { ...result.profile, updatedAt: now },
+        onboarding: {
+          ...current.onboarding,
+          completed: true,
+          rerun: false,
+          currentStep: 5,
+          skipped: false,
+          skippedProfile: result.skippedProfile,
+          managedTemplateIds: selectedTemplateIds,
+          notUsedTemplateIds,
+          deferredTemplateIds,
+          createdTemplateIds: [...new Set([...(current.onboarding.createdTemplateIds ?? []), ...newlyCreatedTemplateIds])],
+          inventoryStatuses: Object.fromEntries(result.selections.map(({ template, inventoryStatus }) => [template.id, inventoryStatus])),
+          completedAt: now
+        },
+        updatedAt: now
+      }
+    })
+  }
+
+  function retryPersistence() {
+    const sequence = ++persistenceSequence.current
+    void persistState(state).then((issue) => {
+      if (sequence !== persistenceSequence.current) return
+      setPersistenceIssue(issue)
+      setBackupCopyState("idle")
+    })
+  }
+
+  function copyCurrentDataBackup() {
+    setBackupCopyState("idle")
+    if (!navigator.clipboard?.writeText) {
+      setBackupCopyState("failed")
+      return
+    }
+    void navigator.clipboard.writeText(JSON.stringify(state, null, 2)).then(
+      () => setBackupCopyState("copied"),
+      () => setBackupCopyState("failed")
+    )
+  }
+
+  const persistenceAlert = persistenceIssue ? (
+    <PersistenceAlert
+      issue={persistenceIssue}
+      backupState={backupCopyState}
+      onRetry={retryPersistence}
+      onCopyBackup={copyCurrentDataBackup}
+      onDismiss={() => {
+        setPersistenceIssue(null)
+        setBackupCopyState("idle")
+      }}
+    />
+  ) : null
+
+  if (!state.onboarding.completed) {
+    return (
+      <>
+        {persistenceAlert}
+        <OnboardingWizard
+          initialProfile={state.householdProfile}
+          onboarding={state.onboarding}
+          isRerun={state.onboarding.rerun}
+          onProgress={handleOnboardingProgress}
+          onSkip={handleOnboardingSkip}
+          onComplete={handleOnboardingComplete}
+        />
+      </>
+    )
+  }
+
   return (
     <div className="app-shell">
+      {persistenceAlert}
       <header className="topbar">
         {/* Topbar 保留用于拖拽窗口 */}
       </header>
@@ -494,7 +673,7 @@ function App() {
           onCreateCategory={() => setCategoryCreatorOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onRenameCategory={renameCategory}
-          onDeleteCategory={(name) => deleteCategory(name)}
+          onConfirmDeleteCategory={(name) => deleteCategory(name)}
         />
         <main className="work-area">
           {activeCategory ? (
@@ -506,14 +685,14 @@ function App() {
                 setIsItemCreatorOpen(true)
               }}
               onRename={() => setCategoryDialog("rename")}
-              onDelete={() => setCategoryDialog("delete")}
+              onDelete={() => deleteCategory(activeCategory)}
               onEdit={editFromDetail}
               onSnooze={handleSnooze}
               onRestock={handleRestock}
+              onCalibrate={calibrateItem}
               onQuickEdit={quickEditItem}
               onApplySuggestion={applyCycleSuggestion}
               onDismissSuggestion={dismissSuggestion}
-              onRateEvent={rateRestockEvent}
               onOpenItemEditor={(itemId) => {
                 setEditingItemId(itemId)
                 setIsItemEditorDialogOpen(true)
@@ -539,6 +718,7 @@ function App() {
               snoozeUntilHour={state.settings.snoozeUntilHour}
               onRestock={handleRestock}
               onSnooze={handleSnooze}
+              onColdStartFeedback={handleColdStartFeedback}
               onUpdateRestock={(patch) => setRecentRestock((current) => current ? { ...current, ...patch } : current)}
               onSaveRestock={saveRestockAmount}
               onUndoRestock={undoRestock}
@@ -569,7 +749,6 @@ function App() {
           onCalibrate={calibrateItem}
           onApplySuggestion={applyCycleSuggestion}
           onDismissSuggestion={dismissSuggestion}
-          onRateEvent={rateRestockEvent}
         />
       )}
       {(editingItem !== undefined || editorClosing) && (
@@ -578,7 +757,7 @@ function App() {
           setNewItemCategory(undefined)
         })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
-      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
+      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} onRestartOnboarding={startOnboardingRerun} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
       {isItemCreatorOpen && (
         <ItemCreatorDialog
           category={creatingCategory || ''}
@@ -595,12 +774,11 @@ function App() {
               cycleDays: itemData.usageIntervalDays || 10,
               bufferDays: itemData.bufferDays !== undefined ? itemData.bufferDays : 2,
               unit: itemData.unit || '件',
-              defaultQty: itemData.initialStock ? String(itemData.initialStock) : '',
-              platform: itemData.platform || '',
+              defaultQty: '',
+              platform: '',
               link: '',
-              remainingDays: '',
-              learningEnabled: true,
-              price: itemData.price
+              remainingDays: itemData.inventoryDays === undefined ? '' : String(itemData.inventoryDays),
+              learningEnabled: true
             })
             console.log('Created newItem:', newItem)
             commit({
@@ -623,7 +801,7 @@ function App() {
       {activeCategory && categoryDialog && <CategoryManagerDialog mode={categoryDialog} category={activeCategory} categories={state.categories} itemCount={state.items.filter((item) => item.category === activeCategory).length} isClosing={categoryManagerClosing} onClose={() => deferredClose(setCategoryManagerClosing, () => setCategoryDialog(null), 150)} onRename={(name) => renameCategory(activeCategory, name)} onDelete={(moveTo) => deleteCategory(activeCategory, moveTo)} />}
       <ItemEditorDialog
         item={state.items.find(i => i.id === editingItemId) || null}
-        categories={[...new Set(state.items.map(i => i.category))]}
+        categories={[...new Set([...state.categories, ...state.items.map((item) => item.category)])]}
         isOpen={isItemEditorDialogOpen}
         onClose={() => {
           setIsItemEditorDialogOpen(false)
@@ -640,25 +818,21 @@ function App() {
         onClose={handleCancelRestock}
         item={restockModalItemId ? state.items.find(i => i.id === restockModalItemId) || null : null}
         onConfirm={(itemId, option, qty, price) => {
-          performRestock(itemId, qty, price || undefined, option?.platform, option?.productName, option?.unit)
+          const itemUnit = state.items.find((item) => item.id === itemId)?.unit
+          performRestock(itemId, qty, price || undefined, option?.platform, option?.productName, itemUnit || option?.unit)
           handleCancelRestock()
         }}
         onAddPurchaseOption={(itemId) => {
-          // 不关闭 RestockModal，仅打开采购选项录入弹窗
+          // 不关闭 RestockModal，仅打开商品录入弹窗
           setAddPurchaseOptionItemId(itemId)
           setShowAddPurchaseModal(true)
         }}
         preferredPurchaseOptionId={preferredPurchaseOptionId}
         onPreferredPurchaseOptionConsumed={() => setPreferredPurchaseOptionId(null)}
-        onViewHistory={(itemId) => {
-          // 关闭补货弹窗，打开该商品的详情面板（补货记录区）
-          handleCancelRestock()
-          setDetailItemId(itemId)
-        }}
       />
 
-      {/* 添加采购选项弹窗（统一在 App 根部渲染，供分类页与补货弹窗复用） */}
-      <AddPurchaseOptionModal
+      {/* 添加商品弹窗（统一在 App 根部渲染，供分类页与补货弹窗复用） */}
+      <PurchaseOptionModal
         isOpen={showAddPurchaseModal}
         onClose={() => {
           setShowAddPurchaseModal(false)
@@ -670,6 +844,7 @@ function App() {
           }
         }}
       />
+
     </div>
   )
 }
@@ -729,13 +904,14 @@ function TaskActions({ item, onRestock, onUndo, isExpanded }: {
   )
 }
 
-function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onRestock, onSnooze, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem }: {
+function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onRestock, onSnooze, onColdStartFeedback, onUpdateRestock, onSaveRestock, onUndoRestock, onDismissRestock, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem }: {
   items: ItemView[]
   recentRestock: RecentRestock | null
   allItems: ItemView[]
   snoozeUntilHour: number
   onRestock: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
+  onColdStartFeedback: (item: ReplenishmentItem, feedback: ColdStartFeedback) => void
   onUpdateRestock: (patch: Partial<RecentRestock>) => void
   onSaveRestock: () => void
   onUndoRestock: () => void
@@ -762,7 +938,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
   const hasNoItemsAtAll = allItems.length === 0
 
   return (
-    <section className="current-section" aria-labelledby="current-title">
+    <section className={`current-section${!hasAny ? " is-empty" : ""}`} aria-labelledby="current-title">
       {hasAny && (
         <div className="current-heading"><h2 id="current-title">当前待处理</h2><span>{items.length > 0 ? `${items.length} 项` : ""}</span></div>
       )}
@@ -772,6 +948,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
           {items.map(({ item, computed }, i) => {
             const remainingQty = estimateRemainingQty(item)
             const snoozeHour = snoozedMap.get(item.id)
+            const isLowConfidence = item.source === "onboarding" && item.confidence === "low"
             return (
               <div key={item.id} className="current-card-group" style={{ "--index": i } as React.CSSProperties}>
                 <article className={`current-card ${computed.status}`}>
@@ -779,17 +956,29 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
                     <span className={`status-dot ${computed.status}`} />
                     <span>
                       <div className="current-card-title-row">
-                        <strong>{item.name}</strong>
+                        <button type="button" className="current-item-detail-link" onClick={() => onOpenItem(item)} aria-label={`查看${item.name}详情`}>{item.name}</button>
                         <span className="current-category-badge">{item.category || "未分类"}</span>
                       </div>
+                      {isLowConfidence && <span className="cold-start-prompt"><b>可能快到补货周期了</b><em>现在还够用吗？</em></span>}
                       <small>
                         {formatItemStatusText(item, computed)}
                         {remainingQty && <span> · {remainingQty}</span>}
                       </small>
                     </span>
                   </div>
-                  <button className={`task-snooze-link ${snoozeHour ? "is-snoozed" : ""}`} onClick={() => handleSnoozeWithFeedback(item)}>{snoozeHour ? `已推迟到 ${snoozeHour} 点` : "稍后提醒"}</button>
-                  <TaskActions item={item} onRestock={onRestock} isExpanded={recentRestock?.itemId === item.id} onUndo={recentRestock?.itemId === item.id ? onUndoRestock : undefined} />
+                  {isLowConfidence ? (
+                    <div className="cold-start-feedback" aria-label={`${item.name}库存反馈`}>
+                      <button onClick={() => onColdStartFeedback(item, "plenty")}>还很多</button>
+                      <button onClick={() => onColdStartFeedback(item, "low")}>快没了</button>
+                      <button className="is-primary" onClick={() => onRestock(item)}>已补货</button>
+                      <button onClick={() => onColdStartFeedback(item, "later")}>稍后提醒</button>
+                    </div>
+                  ) : (
+                    <>
+                      <button className={`task-snooze-link ${snoozeHour ? "is-snoozed" : ""}`} onClick={() => handleSnoozeWithFeedback(item)}>{snoozeHour ? `已推迟到 ${snoozeHour} 点` : "稍后提醒"}</button>
+                      <TaskActions item={item} onRestock={onRestock} isExpanded={recentRestock?.itemId === item.id} onUndo={recentRestock?.itemId === item.id ? onUndoRestock : undefined} />
+                    </>
+                  )}
                 </article>
                 {recentRestock && item.id === recentRestock.itemId && restockItem && (
                   <RestockReceiptInline
@@ -1334,7 +1523,7 @@ function CategoryManagerDialog({ mode, category, categories, itemCount, onClose,
   )
 }
 
-function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock, onCalibrate, onApplySuggestion, onDismissSuggestion, onRateEvent, isClosing }: {
+function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock, onCalibrate, onApplySuggestion, onDismissSuggestion, isClosing }: {
   item: ReplenishmentItem
   computed: ItemComputed
   onClose: () => void
@@ -1344,13 +1533,10 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
   onCalibrate: (item: ReplenishmentItem, remainingDays: number) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
-  onRateEvent: (itemId: string, eventId: string, rating?: Rating, review?: string) => void
   isClosing?: boolean
 }) {
   const [calibrating, setCalibrating] = useState(false)
   const [remainingDays, setRemainingDays] = useState(String(Math.max(0, computed.daysUntilDepletion)))
-  const [ratingEventId, setRatingEventId] = useState<string | null>(null)
-  const [ratingDraft, setRatingDraft] = useState<{ review: string }>({ review: "" })
 
   const priceAnchor = calculatePriceAnchor(item.history)
   const consumption = calculateConsumption(item)
@@ -1363,13 +1549,6 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
     if (remainingDays === "") return
     onCalibrate(item, Number(remainingDays))
     setCalibrating(false)
-  }
-
-  function submitRating(eventId: string) {
-    if (!ratingDraft.review.trim()) return
-    onRateEvent(item.id, eventId, undefined, ratingDraft.review)
-    setRatingEventId(null)
-    setRatingDraft({ review: "" })
   }
 
   return (
@@ -1419,6 +1598,14 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
             </div>
           )}
         </div>
+
+        {item.source === "onboarding" && (
+          <div className="model-info-card">
+            <div><span>当前预测周期</span><strong>约 {item.cycleDays} 天</strong></div>
+            <div><span>模型置信度</span><strong>{item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}</strong></div>
+            <div className="model-info-note"><span>校准说明</span><strong>{item.modelNote || (item.anchorEstimated ? "基于家庭画像估算" : "已使用真实补货时间")}</strong><small>{item.history.length < 2 ? `再记录 ${2 - item.history.length} 次补货后，会更接近你家的真实周期。` : "已开始根据你家的真实补货行为学习。"}</small></div>
+          </div>
+        )}
 
         {/* 校准入口 */}
         <div className="detail-calibrate">
@@ -1485,20 +1672,7 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
                   <div className="history-item-tags">
                     {event.platform && <span className="platform-tag">{event.platform}</span>}
                     {event.rating && <span className={`rating-tag rating-${event.rating}`}>{event.rating === 3 ? "👍" : event.rating === 2 ? "😐" : "👎"}</span>}
-                    {!event.rating && (
-                      <button className="rate-button" onClick={() => setRatingEventId(event.id)}>评价</button>
-                    )}
                   </div>
-                  {ratingEventId === event.id && (
-                    <div className="rating-form">
-                      <span>这次买的怎么样？</span>
-                      <textarea className="review-textarea" value={ratingDraft.review} onChange={(e) => setRatingDraft({ review: e.target.value })} placeholder="请输入您的评价..." rows={4} />
-                      <div className="rating-form-actions">
-                        <button className="quiet-button compact" onClick={() => setRatingEventId(null)}>取消</button>
-                        <button className="primary-button compact" onClick={() => submitRating(event.id)} disabled={!ratingDraft.review.trim()}>保存</button>
-                      </div>
-                    </div>
-                  )}
                 </div>
               ))}
             </div>
@@ -1507,7 +1681,7 @@ function ItemDetailPanel({ item, computed, onClose, onEdit, onSnooze, onRestock,
 
         {/* 底部操作 */}
         <div className="detail-footer">
-          <button className="quiet-button" onClick={() => onEdit(item)}><Icon name="edit" />修改补货设置</button>
+          <button className="quiet-button" onClick={() => onEdit(item)}><Icon name="edit" />修改消耗品设置</button>
         </div>
       </aside>
     </div>
@@ -1528,6 +1702,8 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   const [newGroupName, setNewGroupName] = useState("")
   const [groupAdded, setGroupAdded] = useState(false)
   const [unitCustom, setUnitCustom] = useState(false)
+  const [nameError, setNameError] = useState("")
+  const nameInputRef = useRef<HTMLInputElement>(null)
   const cycleManuallyChanged = useRef(false)
   const [draft, setDraft] = useState<ItemDraft>(() => {
     const base: ItemDraft = item ? {
@@ -1536,7 +1712,7 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
       cycleDays: item.cycleDays,
       bufferDays: item.bufferDays,
       link: item.link || "",
-      remainingDays: "",
+      remainingDays: String(Math.max(0, computeItem(item, Date.now()).daysUntilDepletion)),
       learningEnabled: item.learningEnabled !== false,
       unit: item.unit || "件",
       defaultQty: item.defaultQty ? String(item.defaultQty) : "",
@@ -1555,6 +1731,7 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   }
 
   function handleName(value: string) {
+    if (nameError && value.trim()) setNameError("")
     const matched = Object.entries(DEFAULT_CYCLES).find(([name]) => value.includes(name))
     setDraft((current) => ({
       ...current,
@@ -1596,8 +1773,13 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
 
   function submit(event: FormEvent) {
     event.preventDefault()
-    if (!draft.name.trim() || !draft.category.trim()) return
-    onSave(draft)
+    if (!draft.name.trim()) {
+      setNameError("请输入消耗品名称")
+      nameInputRef.current?.focus()
+      return
+    }
+    if (!draft.category.trim()) return
+    onSave({ ...draft, name: draft.name.trim() })
   }
 
   return (
@@ -1630,7 +1812,11 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
           {/* 基本信息 */}
           <div className="editor-section">
             <h3 className="editor-section-title">基本信息</h3>
-            <label className="field field-wide"><span>消耗品名称</span><input autoFocus={Boolean(item)} value={draft.name} onChange={(event) => handleName(event.target.value)} placeholder="例如：卫生纸" /></label>
+            <label className="field field-wide">
+              <span>消耗品名称</span>
+              <input ref={nameInputRef} autoFocus={Boolean(item)} value={draft.name} onChange={(event) => handleName(event.target.value)} placeholder="例如：卫生纸" aria-invalid={Boolean(nameError)} aria-describedby={nameError ? "item-editor-name-error" : undefined} />
+              {nameError && <small id="item-editor-name-error" className="field-error" role="alert">{nameError}</small>}
+            </label>
             <div className="field-row">
               <label className="field">
                 <span>计量单位</span>
@@ -1659,20 +1845,26 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
             </div>
           </div>
 
-          {/* 补货设置 */}
+          {/* 消耗设置 */}
           <div className="editor-section">
-            <h3 className="editor-section-title">补货设置</h3>
-            <div className="field-row">
+            <h3 className="editor-section-title">消耗设置</h3>
+            <div className="field-row three-cycle-fields">
               <label className="field">
-                <span>大约多久补一次</span>
-                <div className="input-suffix"><input type="number" min="1" value={draft.cycleDays} onChange={(event) => handleCycle(Number(event.target.value))} /><b>天</b></div>
+                <span>库存周期</span>
+                <div className="input-suffix"><input type="number" min="0" value={draft.remainingDays} onChange={(event) => set("remainingDays", event.target.value)} placeholder="当前还能用几天" /><b>天</b></div>
+                <small>当前库存可消耗天数</small>
               </label>
               <label className="field">
-                <span>提前几天提醒</span>
+                <span>消耗周期</span>
+                <div className="input-suffix"><input type="number" min="1" value={draft.cycleDays} onChange={(event) => handleCycle(Number(event.target.value))} /><b>天</b></div>
+                <small>单次补货可消耗天数</small>
+              </label>
+              <label className="field">
+                <span>提醒天数</span>
                 <div className="input-suffix"><input type="number" min="0" max={Math.max(0, draft.cycleDays - 1)} value={Math.min(draft.bufferDays, Math.max(0, draft.cycleDays - 1))} onChange={(event) => set("bufferDays", Number(event.target.value))} /><b>天</b></div>
+                <small>预计用完前提醒</small>
               </label>
             </div>
-            {!item && <label className="field field-wide"><span>手头这些大概还能用多久 <em>选填</em></span><div className="input-suffix"><input type="number" min="0" value={draft.remainingDays} onChange={(event) => set("remainingDays", event.target.value)} placeholder="不确定就留空" /><b>天</b></div></label>}
           </div>
 
           {/* 高级选项 */}
@@ -1709,21 +1901,80 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   )
 }
 
-function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onClose: () => void; isClosing?: boolean }) {
+function SettingsPanel({ state, onChange, onRestartOnboarding, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onRestartOnboarding: () => void; onClose: () => void; isClosing?: boolean }) {
   const settings = state.settings
+
   function patch(values: Partial<typeof settings>) {
     onChange({ ...state, settings: { ...settings, ...values } })
   }
+
+  function getCurrentMonthSpending(): number {
+    const now = new Date()
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+    let total = 0
+    for (const item of state.items) {
+      for (const event of item.history) {
+        if (event.at >= currentMonthStart && event.price) {
+          total += event.price
+        }
+      }
+    }
+    return total
+  }
+
+  const currentMonthSpending = getCurrentMonthSpending()
+  const budgetPercent = settings.monthlyBudget && settings.monthlyBudget > 0
+    ? Math.round((currentMonthSpending / settings.monthlyBudget) * 100)
+    : 0
+
+  function getBudgetReminder(): { text: string; level: 'info' | 'warning' | 'urgent' } | null {
+    if (budgetPercent >= 100) {
+      return { text: '本月预算已用完，下个月再买吧', level: 'urgent' }
+    } else if (budgetPercent >= 90) {
+      return { text: '本月预算即将用完，谨慎消费~', level: 'urgent' }
+    } else if (budgetPercent >= 75) {
+      return { text: '本月预算已用四分之三，注意控制开销哦', level: 'warning' }
+    } else if (budgetPercent >= 50) {
+      return { text: '本月预算已使用一半，继续保持~', level: 'info' }
+    }
+    return null
+  }
+
+  const budgetReminder = getBudgetReminder()
+
   return (
     <div className={`overlay settings-overlay ${isClosing ? "is-closing" : ""}`} onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
       <div className={`settings-dialog ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-title">
-        <div className="settings-dialog-header"><h2 id="settings-title">提醒与预算</h2><button className="icon-button close-btn" aria-label="关闭" onClick={onClose}><Icon name="close" size={16} /></button></div>
+        <div className="settings-dialog-header"><h2 id="settings-title">设置</h2><button className="icon-button close-btn" aria-label="关闭" onClick={onClose}><Icon name="close" size={16} /></button></div>
         <div className="settings-body">
           <div className="settings-row"><span className="settings-row-label">每月生活预算</span><div className="settings-row-control"><input aria-label="每月生活预算" type="number" min="0" step="100" value={settings.monthlyBudget ?? ""} onChange={(event) => patch({ monthlyBudget: event.target.value === "" ? undefined : Math.max(0, Number(event.target.value)) })} placeholder="未设置" /></div></div>
+          {settings.monthlyBudget && settings.monthlyBudget > 0 && (
+            <div className="settings-row budget-usage">
+              <span className="settings-row-label">本月消耗占比</span>
+              <div className="settings-row-control">
+                <div className="budget-bar">
+                  <div className="budget-bar-fill" style={{ width: `${Math.min(budgetPercent, 100)}%` }}></div>
+                </div>
+                <span className="budget-percent">{budgetPercent}%</span>
+                <span className="budget-detail">¥{currentMonthSpending.toFixed(0)} / ¥{settings.monthlyBudget}</span>
+                {budgetReminder && (
+                  <span className={`budget-reminder budget-reminder-${budgetReminder.level}`}>
+                    {budgetReminder.text}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
           <div className="settings-row"><span className="settings-row-label">重复提醒间隔</span><div className="settings-row-control"><div className="segment-control"><button className={settings.reminderIntervalMinutes === 30 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 30 })}>30 分钟</button><button className={settings.reminderIntervalMinutes === 60 ? "active" : ""} onClick={() => patch({ reminderIntervalMinutes: 60 })}>60 分钟</button></div></div></div>
           <div className="settings-row"><span className="settings-row-label">勿扰时段</span><div className="settings-row-control"><div className="time-range"><input type="time" value={settings.quietStart} onChange={(event) => patch({ quietStart: event.target.value })} /><span>至</span><input type="time" value={settings.quietEnd} onChange={(event) => patch({ quietEnd: event.target.value })} /></div></div></div>
           <div className="settings-row"><span className="settings-row-label">明天几点提醒</span><div className="settings-row-control"><div className="input-suffix short"><input type="number" min="0" max="23" value={settings.snoozeUntilHour} onChange={(event) => patch({ snoozeUntilHour: Number(event.target.value) })} /><b>点</b></div></div></div>
           <div className="settings-row"><span className="settings-row-label">系统通知</span><div className="settings-row-control"><button className="quiet-button" onClick={() => window.desktop?.testNotification()}>发送测试</button></div></div>
+          <div className="settings-guide-card">
+            <img src={catIcon} alt="" />
+            <div className="settings-guide-copy"><strong>重新运行初始化向导</strong><span>重新回答家庭画像、推荐清单和库存状态。</span></div>
+            <button className="settings-guide-button" onClick={onRestartOnboarding}>开始向导 <span>→</span></button>
+          </div>
+          <p className="settings-guide-note">已有物品不会被删除或重复创建，只会补充新选择的物品。</p>
         </div>
       </div>
     </div>
@@ -1738,17 +1989,15 @@ interface RestockModalProps {
   onClose: () => void
   item: ReplenishmentItem | null
   onConfirm: (itemId: string, option: PurchaseOption | null, qty: number, price: number) => void
-  // 无采购选项时，点击“录入常用采购信息”触发；不关闭本弹窗
+  // 无常购商品时，点击“添加商品”触发；不关闭本弹窗
   onAddPurchaseOption: (itemId: string) => void
-  // 从补货弹窗录入新采购选项后，App 传入新选项 id，由本弹窗自动选中并填值
+  // 从补货弹窗录入新商品后，App 传入新商品 id，由本弹窗自动选中并填值
   preferredPurchaseOptionId?: string | null
   // 自动选中完成后回调，用于清空 preferred 状态，避免反复选中
   onPreferredPurchaseOptionConsumed?: () => void
-  // 点击“查看补货记录”时触发，通常关闭本弹窗并打开商品详情面板
-  onViewHistory?: (itemId: string) => void
 }
 
-function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, preferredPurchaseOptionId, onPreferredPurchaseOptionConsumed, onViewHistory }: RestockModalProps) {
+function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, preferredPurchaseOptionId, onPreferredPurchaseOptionConsumed }: RestockModalProps) {
   const [selectedOption, setSelectedOption] = useState<PurchaseOption | null>(null)
   const [qty, setQty] = useState<number | ''>('')
   const [price, setPrice] = useState<number | ''>('')
@@ -1792,20 +2041,15 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
   if (!isOpen || !item) return null
 
   const purchaseOptions = item.purchaseOptions || []
-  const unitText = selectedOption?.unit || item.unit || '件'
+  const unitText = item.unit || selectedOption?.unit || '件'
   const canConfirm = !!qty && Number(qty) >= 1
-  // 取最近一条有评价内容的补货记录（只读摘要，不允许在此编辑）
-  const latestReviewEvent = (item.history || [])
-    .slice()
-    .reverse()
-    .find((e) => e.review?.trim())
 
   return (
     <div className="restock-modal-overlay" onClick={onClose}>
       <div className="restock-modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h3>补货 - {item.name}</h3>
-          <button className="icon-button modal-close-btn" onClick={onClose}>
+          <button className="icon-button modal-close-btn" onClick={onClose} aria-label="关闭">
             <Icon name="close" size={18} />
           </button>
         </div>
@@ -1814,29 +2058,21 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
           {/* 采购选项列表 */}
           {purchaseOptions.length > 0 ? (
             <div className="purchase-option-list">
-              {purchaseOptions.map((option) => {
-                // 从补货记录中匹配该平台最近一条有评价内容（取最新，而非最早）
-                const latestReview = (item.history || [])
-                  .slice()
-                  .reverse()
-                  .find((e) => e.platform === option.platform && e.review?.trim())
-
-                return (
+              {purchaseOptions.map((option) => (
                   <button
                     key={option.id}
                     className={`purchase-option-item ${selectedOption?.id === option.id ? 'is-selected' : ''}`}
                     onClick={() => setSelectedOption(option)}
                   >
                     <div className="option-info">
-                      <span className="option-name-platform">{option.productName} · {option.platform}</span>
-                      {latestReview && <span className="option-review-text">{latestReview.review}</span>}
+                      <span className="option-name-platform">{option.productName}</span>
+                      {option.review && <span className="option-review-pill">{option.review}</span>}
                     </div>
                     <div className="option-price">
-                      ¥{option.price ? formatPrice(option.price) : '0.00'}/{option.unit || '件'}
+                      ¥{option.price ? formatPrice(option.price) : '0.00'}/{item.unit || option.unit || '件'}
                     </div>
                   </button>
-                )
-              })}
+              ))}
             </div>
           ) : (
             <div className="restock-empty-hint">
@@ -1845,24 +2081,8 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
                 className="primary-button green restock-add-purchase-btn"
                 onClick={() => onAddPurchaseOption(item.id)}
               >
-                填写采购信息
+                添加商品
               </button>
-            </div>
-          )}
-
-          {/* 最近评价摘要（只读）+ 查看补货记录入口 */}
-          {latestReviewEvent && (
-            <div className="restock-review-summary">
-              <span className="restock-review-text">上次评价：{latestReviewEvent.review}</span>
-              {onViewHistory && (
-                <button
-                  type="button"
-                  className="quiet-button restock-view-history-btn"
-                  onClick={() => onViewHistory(item.id)}
-                >
-                  查看补货记录
-                </button>
-              )}
             </div>
           )}
 
@@ -1933,20 +2153,29 @@ function ItemEditorDialog({
 }) {
   const [name, setName] = useState(item?.name ?? "")
   const [category, setCategory] = useState(item?.category ?? "")
+  const [nameError, setNameError] = useState("")
+  const nameInputRef = useRef<HTMLInputElement>(null)
 
   // 组件始终挂载，需在早退判断之前调用 hooks；切换物品或重新打开时同步表单状态
   useEffect(() => {
     if (isOpen && item) {
       setName(item.name)
       setCategory(item.category)
+      setNameError("")
     }
   }, [isOpen, item?.id])
 
   if (!isOpen || !item) return null
 
   const handleSave = () => {
-    if (name !== item.name) {
-      onRename(item.id, name)
+    const normalizedName = name.trim()
+    if (!normalizedName) {
+      setNameError("请输入物品名称")
+      nameInputRef.current?.focus()
+      return
+    }
+    if (normalizedName !== item.name) {
+      onRename(item.id, normalizedName)
     }
     if (category !== item.category) {
       onMove(item.id, category)
@@ -1973,15 +2202,22 @@ function ItemEditorDialog({
         
         <div className="dialog-form">
           <div className="form-group">
-            <label>名称</label>
+            <label>消耗品名称</label>
             <input 
+              ref={nameInputRef}
               type="text" 
               value={name} 
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value)
+                if (nameError && e.target.value.trim()) setNameError("")
+              }}
               autoFocus
+              aria-invalid={Boolean(nameError)}
+              aria-describedby={nameError ? "item-editor-dialog-name-error" : undefined}
             />
+            {nameError && <small id="item-editor-dialog-name-error" className="field-error" role="alert">{nameError}</small>}
           </div>
-          
+
           <div className="form-group">
             <label>分类</label>
             <select value={category} onChange={(e) => setCategory(e.target.value)}>
@@ -2003,6 +2239,14 @@ function ItemEditorDialog({
   )
 }
 
+const itemCreatorFieldHelp = {
+  inventory: { label: '库存周期', description: '当前库存预计还能使用多少天。' },
+  usage: { label: '消耗周期', description: '一次补货通常可以使用多少天。' },
+  buffer: { label: '提醒天数', description: '预计用完前多少天提醒补货。' }
+} as const
+
+type ItemCreatorFieldHelpKey = keyof typeof itemCreatorFieldHelp
+
 function ItemCreatorDialog({
   category,
   isOpen, 
@@ -2012,26 +2256,40 @@ function ItemCreatorDialog({
   category: string
   isOpen: boolean
   onClose: () => void
-  onCreate: (item: { name: string; initialStock?: number; unit?: string; price?: number; platform?: string; usageIntervalDays?: number; bufferDays?: number }) => void
+  onCreate: (item: { name: string; unit?: string; inventoryDays?: number; usageIntervalDays?: number; bufferDays?: number }) => void
 }) {
   const [name, setName] = useState('')
-  const [initialStock, setInitialStock] = useState(1)
   const [unit, setUnit] = useState('个')
-  const [price, setPrice] = useState<number | ''>('')
-  const [platform, setPlatform] = useState('')
+  const [customUnit, setCustomUnit] = useState('')
+  const [inventoryDays, setInventoryDays] = useState<number | ''>(30)
   const [usageIntervalDays, setUsageIntervalDays] = useState<number | ''>(30)
   const [bufferDays, setBufferDays] = useState<number | ''>('')
+  const [activeFieldHelp, setActiveFieldHelp] = useState<ItemCreatorFieldHelpKey | null>(null)
+  const [nameError, setNameError] = useState('')
+  const [unitError, setUnitError] = useState('')
+  const nameInputRef = useRef<HTMLInputElement>(null)
+  const customUnitInputRef = useRef<HTMLInputElement>(null)
   
   if (!isOpen) return null
   
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
+    const normalizedName = name.trim()
+    if (!normalizedName) {
+      setNameError('请输入消耗品名称')
+      nameInputRef.current?.focus()
+      return
+    }
+    const normalizedUnit = unit === '其他' ? customUnit.trim() : unit
+    if (!normalizedUnit) {
+      setUnitError('请输入自定义单位')
+      customUnitInputRef.current?.focus()
+      return
+    }
     onCreate({ 
-      name, 
-      initialStock, 
-      unit, 
-      price: price === '' ? undefined : price,
-      platform: platform || undefined,
+      name: normalizedName,
+      unit: normalizedUnit,
+      inventoryDays: inventoryDays === '' ? undefined : inventoryDays,
       usageIntervalDays: usageIntervalDays === '' ? undefined : usageIntervalDays,
       bufferDays: bufferDays === '' ? undefined : bufferDays
     })
@@ -2052,67 +2310,109 @@ function ItemCreatorDialog({
           <div className="form-group">
             <label>名称</label>
             <input 
+              ref={nameInputRef}
               type="text" 
               value={name} 
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value)
+                if (nameError && e.target.value.trim()) setNameError('')
+              }}
               placeholder="例如：猫砂、洗衣液"
               autoFocus
+              aria-invalid={Boolean(nameError)}
+              aria-describedby={nameError ? "item-creator-name-error" : undefined}
             />
+            {nameError && <small id="item-creator-name-error" className="field-error" role="alert">{nameError}</small>}
           </div>
-          
-          <div className="form-row">
+
+          <div className="form-row item-creator-settings-grid">
             <div className="form-group">
-              <label>初始数量</label>
-              <input 
-                type="number" 
-                min="1"
-                value={initialStock} 
-                onChange={(e) => setInitialStock(Number(e.target.value))}
-              />
-            </div>
-            
-            <div className="form-group">
-              <label>单位</label>
-              <select value={unit} onChange={(e) => setUnit(e.target.value)}>
+              <label htmlFor="item-creator-unit">计量单位</label>
+              <select id="item-creator-unit" value={unit} onChange={(e) => { setUnit(e.target.value); setUnitError('') }}>
                 <option value="个">个</option>
                 <option value="瓶">瓶</option>
                 <option value="袋">袋</option>
                 <option value="盒">盒</option>
                 <option value="包">包</option>
                 <option value="桶">桶</option>
+                <option value="其他">其他（自定义）</option>
               </select>
+              {unit === '其他' && (
+                <div className="custom-unit-field">
+                  <label htmlFor="item-creator-custom-unit">自定义单位</label>
+                  <input
+                    ref={customUnitInputRef}
+                    id="item-creator-custom-unit"
+                    value={customUnit}
+                    onChange={(e) => { setCustomUnit(e.target.value); if (unitError && e.target.value.trim()) setUnitError('') }}
+                    placeholder="例如：卷、提、组"
+                    autoFocus
+                    aria-invalid={Boolean(unitError)}
+                    aria-describedby={unitError ? "item-creator-unit-error" : undefined}
+                  />
+                  {unitError && <small id="item-creator-unit-error" className="field-error" role="alert">{unitError}</small>}
+                </div>
+              )}
             </div>
-          </div>
-          
-          <div className="form-row">
+
             <div className="form-group">
-              <label>价格（可选）</label>
-              <input 
-                type="number" 
-                min="0"
-                step="0.01"
-                value={price} 
-                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
-                placeholder="例如：29.9"
-              />
+              <div className="field-label-with-help">
+                <label htmlFor="item-creator-inventory-days">库存周期</label>
+                <button
+                  type="button"
+                  className="field-help-button"
+                  aria-label={activeFieldHelp === 'inventory' ? "收起库存周期说明" : "查看库存周期说明"}
+                  aria-expanded={activeFieldHelp === 'inventory'}
+                  aria-controls="item-creator-inventory-help"
+                  aria-describedby={activeFieldHelp === 'inventory' ? "item-creator-inventory-help" : undefined}
+                  onClick={() => setActiveFieldHelp((current) => current === 'inventory' ? null : 'inventory')}
+                  onBlur={() => setActiveFieldHelp((current) => current === 'inventory' ? null : current)}
+                >
+                  ?
+                </button>
+                {activeFieldHelp === 'inventory' && (
+                  <div id="item-creator-inventory-help" className="field-help-popover" role="tooltip">
+                    {itemCreatorFieldHelp.inventory.description}
+                  </div>
+                )}
+              </div>
+              <div className="input-with-unit">
+                <input
+                  id="item-creator-inventory-days"
+                  type="number"
+                  min="0"
+                  value={inventoryDays}
+                  onChange={(e) => setInventoryDays(e.target.value === '' ? '' : Number(e.target.value))}
+                  placeholder="例如：20"
+                />
+                <span className="unit-label">天</span>
+              </div>
             </div>
-            
+
             <div className="form-group">
-              <label>购买平台（可选）</label>
-              <input 
-                type="text" 
-                value={platform} 
-                onChange={(e) => setPlatform(e.target.value)}
-                placeholder="例如：淘宝、京东"
-              />
-            </div>
-          </div>
-          
-          <div className="form-row">
-            <div className="form-group">
-              <label>消耗周期（天）</label>
+              <div className="field-label-with-help">
+                <label htmlFor="item-creator-usage-days">消耗周期</label>
+                <button
+                  type="button"
+                  className="field-help-button"
+                  aria-label={activeFieldHelp === 'usage' ? "收起消耗周期说明" : "查看消耗周期说明"}
+                  aria-expanded={activeFieldHelp === 'usage'}
+                  aria-controls="item-creator-usage-help"
+                  aria-describedby={activeFieldHelp === 'usage' ? "item-creator-usage-help" : undefined}
+                  onClick={() => setActiveFieldHelp((current) => current === 'usage' ? null : 'usage')}
+                  onBlur={() => setActiveFieldHelp((current) => current === 'usage' ? null : current)}
+                >
+                  ?
+                </button>
+                {activeFieldHelp === 'usage' && (
+                  <div id="item-creator-usage-help" className="field-help-popover" role="tooltip">
+                    {itemCreatorFieldHelp.usage.description}
+                  </div>
+                )}
+              </div>
               <div className="input-with-unit">
                 <input 
+                  id="item-creator-usage-days"
                   type="number" 
                   min="1"
                   value={usageIntervalDays} 
@@ -2124,11 +2424,32 @@ function ItemCreatorDialog({
             </div>
             
             <div className="form-group">
-              <label>提前提醒（天）</label>
+              <div className="field-label-with-help">
+                <label htmlFor="item-creator-buffer-days">提醒天数</label>
+                <button
+                  type="button"
+                  className="field-help-button"
+                  aria-label={activeFieldHelp === 'buffer' ? "收起提醒天数说明" : "查看提醒天数说明"}
+                  aria-expanded={activeFieldHelp === 'buffer'}
+                  aria-controls="item-creator-buffer-help"
+                  aria-describedby={activeFieldHelp === 'buffer' ? "item-creator-buffer-help" : undefined}
+                  onClick={() => setActiveFieldHelp((current) => current === 'buffer' ? null : 'buffer')}
+                  onBlur={() => setActiveFieldHelp((current) => current === 'buffer' ? null : current)}
+                >
+                  ?
+                </button>
+                {activeFieldHelp === 'buffer' && (
+                  <div id="item-creator-buffer-help" className="field-help-popover" role="tooltip">
+                    {itemCreatorFieldHelp.buffer.description}
+                  </div>
+                )}
+              </div>
               <div className="input-with-unit">
                 <input 
+                  id="item-creator-buffer-days"
                   type="number" 
                   min="0"
+                  max={usageIntervalDays === '' ? undefined : Math.max(0, usageIntervalDays - 1)}
                   value={bufferDays} 
                   onChange={(e) => setBufferDays(e.target.value === '' ? '' : Number(e.target.value))}
                   placeholder="例如：3"
@@ -2137,7 +2458,7 @@ function ItemCreatorDialog({
               </div>
             </div>
           </div>
-          
+
           <div className="dialog-actions">
             <button type="button" className="quiet-button" onClick={onClose}>取消</button>
             <button type="submit" className="primary-button green">添加</button>
@@ -2148,49 +2469,51 @@ function ItemCreatorDialog({
   )
 }
 
-interface EditPurchaseOptionModalProps {
+interface PurchaseOptionModalProps {
   isOpen: boolean
   onClose: () => void
-  option: PurchaseOption | null
-  onSave: (editedOption: PurchaseOption) => void
+  option?: PurchaseOption | null
+  onSave: (option: Omit<PurchaseOption, 'id' | 'unit'>) => void
 }
 
-interface AddPurchaseOptionModalProps {
-  isOpen: boolean
-  onClose: () => void
-  onSave: (option: Omit<PurchaseOption, 'id'>) => void
-}
-
-function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionModalProps) {
+function PurchaseOptionModal({ isOpen, onClose, option = null, onSave }: PurchaseOptionModalProps) {
   const [productName, setProductName] = useState('')
   const [platform, setPlatform] = useState('')
-  const [unit, setUnit] = useState('')
-  const [unitCustom, setUnitCustom] = useState('')
+  const [platformCustom, setPlatformCustom] = useState('')
   const [price, setPrice] = useState<number | ''>('')
-  const [link, setLink] = useState('')
+  const [review, setReview] = useState('')
   
-  const showUnitCustom = unit === '其他'
+  const showPlatformCustom = platform === '其他'
+  const isEditing = option !== null
+
+  useEffect(() => {
+    if (!isOpen) return
+    setProductName(option?.productName || '')
+    setPrice(option?.price || '')
+    setReview(option?.review || '')
+    if (!option) {
+      setPlatform('')
+      setPlatformCustom('')
+      return
+    }
+    const isKnownPlatform = platforms.includes(option.platform as typeof platforms[number])
+    setPlatform(isKnownPlatform ? option.platform : '其他')
+    setPlatformCustom(isKnownPlatform ? '' : option.platform)
+  }, [isOpen, option])
 
   const handleSubmit = () => {
-    const finalUnit = showUnitCustom ? unitCustom : unit
-    if (!productName || !platform || !finalUnit) return
+    const finalPlatform = showPlatformCustom ? platformCustom.trim() : platform
+    const normalizedProductName = productName.trim()
+    if (!normalizedProductName || !finalPlatform) return
     
     onSave({
-      productName,
-      platform,
-      unit: finalUnit,
+      productName: normalizedProductName,
+      platform: finalPlatform,
       price: price !== '' ? Number(price) : undefined,
-      link: link.trim() || undefined,
-      isDefault: false
+      review: review.trim() || undefined,
+      isDefault: option?.isDefault ?? false,
+      link: option?.link
     })
-    
-    // 重置表单
-    setProductName('')
-    setPlatform('')
-    setUnit('')
-    setUnitCustom('')
-    setPrice('')
-    setLink('')
     onClose()
   }
   
@@ -2209,7 +2532,7 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
     <div className="modal-overlay" onClick={onClose}>
       <div className="modal-container" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
-          <h3>添加采购选项</h3>
+          <h3>{isEditing ? '编辑商品' : '添加商品'}</h3>
           <button className="icon-button modal-close-btn" onClick={onClose}>
             <Icon name="close" size={18} />
           </button>
@@ -2218,13 +2541,13 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
         <div className="modal-body">
           <div className="form-row">
             <div className="form-group">
-              <label>商品名称：</label>
+              <label>具体商品名称：</label>
               <input
                 type="text"
                 value={productName}
                 onChange={(e) => setProductName(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="例如：维达超韧卫生纸"
+                placeholder="例如：皇家猫粮 L40"
                 autoFocus
               />
             </div>
@@ -2233,7 +2556,10 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
               <label>购买平台：</label>
               <select
                 value={platform}
-                onChange={(e) => setPlatform(e.target.value)}
+                onChange={(e) => {
+                  setPlatform(e.target.value)
+                  if (e.target.value !== '其他') setPlatformCustom('')
+                }}
                 onKeyDown={handleKeyDown}
               >
                 <option value="">选择平台</option>
@@ -2241,37 +2567,21 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
                   <option key={p} value={p}>{p}</option>
                 ))}
               </select>
-            </div>
-          </div>
-          
-          <div className="form-row">
-            <div className="form-group">
-              <label>计量单位：</label>
-              <select
-                value={showUnitCustom ? '其他' : unit}
-                onChange={(e) => {
-                  setUnit(e.target.value)
-                  if (e.target.value !== '其他') setUnitCustom('')
-                }}
-                onKeyDown={handleKeyDown}
-              >
-                <option value="">选择单位</option>
-                {units.map((u) => (
-                  <option key={u} value={u}>{u}</option>
-                ))}
-              </select>
-              {showUnitCustom && (
+              {showPlatformCustom && (
                 <input
                   type="text"
-                  value={unitCustom}
-                  onChange={(e) => setUnitCustom(e.target.value)}
+                  value={platformCustom}
+                  onChange={(e) => setPlatformCustom(e.target.value)}
                   onKeyDown={handleKeyDown}
-                  placeholder="输入自定义单位"
-                  style={{ marginTop: '8px' }}
+                  placeholder="输入自定义购买平台"
+                  className="custom-option-input"
+                  autoFocus
+                  aria-label="自定义购买平台"
                 />
               )}
             </div>
-            
+          </div>
+          <div className="form-row">
             <div className="form-group">
               <label>采购价格：</label>
               <input
@@ -2284,17 +2594,16 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
                 placeholder="例如：59.9"
               />
             </div>
-          </div>
-
-          <div className="form-group">
-            <label>购买链接（选填）：</label>
-            <input
-              type="url"
-              value={link}
-              onChange={(e) => setLink(e.target.value)}
-              onKeyDown={handleKeyDown}
-              placeholder="https://..."
-            />
+            <div className="form-group">
+              <label>商品评价（选填）：</label>
+              <input
+                type="text"
+                value={review}
+                onChange={(e) => setReview(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="例如：适口性好，会继续购买"
+              />
+            </div>
           </div>
         </div>
         
@@ -2303,146 +2612,9 @@ function AddPurchaseOptionModal({ isOpen, onClose, onSave }: AddPurchaseOptionMo
           <button 
             className="btn btn-primary" 
             onClick={handleSubmit}
-            disabled={!productName || !platform || !(showUnitCustom ? unitCustom : unit)}
+            disabled={!productName.trim() || !(showPlatformCustom ? platformCustom.trim() : platform)}
           >
-            添加
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function EditPurchaseOptionModal({ isOpen, onClose, option, onSave }: EditPurchaseOptionModalProps) {
-  const [productName, setProductName] = useState('')
-  const [platform, setPlatform] = useState('')
-  const [unit, setUnit] = useState('')
-  const [unitCustom, setUnitCustom] = useState('')
-  const [price, setPrice] = useState<number | ''>('')
-  const [link, setLink] = useState('')
-  
-  const showUnitCustom = unit === '其他' || (!!option?.unit && !units.includes(option.unit as typeof units[number]))
-
-  useEffect(() => {
-    if (option) {
-      setProductName(option.productName)
-      setPlatform(option.platform)
-      const isKnownUnit = units.includes(option.unit as typeof units[number])
-      if (isKnownUnit) {
-        setUnit(option.unit)
-        setUnitCustom('')
-      } else {
-        setUnit('其他')
-        setUnitCustom(option.unit)
-      }
-      setPrice(option.price || '')
-      setLink(option.link || '')
-    }
-  }, [option])
-  
-  if (!isOpen || !option) return null
-  
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-container" onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header">
-          <h3>编辑采购选项</h3>
-          <button className="icon-button modal-close-btn" onClick={onClose}>
-            <Icon name="close" size={18} />
-          </button>
-        </div>
-        
-        <div className="modal-body">
-          <div className="form-group">
-            <label>商品名称：</label>
-            <input
-              type="text"
-              value={productName}
-              onChange={(e) => setProductName(e.target.value)}
-              placeholder="例如：维达超韧卫生纸"
-            />
-          </div>
-          
-          <div className="form-group">
-            <label>购买平台：</label>
-            <select
-              value={platform}
-              onChange={(e) => setPlatform(e.target.value)}
-            >
-              <option value="">选择平台</option>
-              {platforms.map((p) => (
-                <option key={p} value={p}>{p}</option>
-              ))}
-            </select>
-          </div>
-          
-          <div className="form-row">
-            <div className="form-group">
-              <label>计量单位：</label>
-              <select
-                value={showUnitCustom ? '其他' : unit}
-                onChange={(e) => {
-                  setUnit(e.target.value)
-                  if (e.target.value !== '其他') setUnitCustom('')
-                }}
-              >
-                <option value="">选择单位</option>
-                {units.map((u) => (
-                  <option key={u} value={u}>{u}</option>
-                ))}
-              </select>
-              {showUnitCustom && (
-                <input
-                  type="text"
-                  value={unitCustom}
-                  onChange={(e) => setUnitCustom(e.target.value)}
-                  placeholder="输入自定义单位"
-                  style={{ marginTop: '8px' }}
-                />
-              )}
-            </div>
-            
-            <div className="form-group">
-              <label>采购价格：</label>
-              <input
-                type="number"
-                min="0"
-                step="0.01"
-                value={price}
-                onChange={(e) => setPrice(e.target.value === '' ? '' : Number(e.target.value))}
-                placeholder="例如：59.9"
-              />
-            </div>
-          </div>
-          
-          <div className="form-group">
-            <label>商品链接（可选）：</label>
-            <input
-              type="url"
-              value={link}
-              onChange={(e) => setLink(e.target.value)}
-              placeholder="https://..."
-            />
-          </div>
-        </div>
-        
-        <div className="modal-footer">
-          <button className="btn btn-secondary" onClick={onClose}>取消</button>
-          <button 
-            className="btn btn-primary" 
-            onClick={() => {
-              const finalUnit = showUnitCustom ? unitCustom : unit
-              onSave({
-                ...option,
-                productName,
-                platform,
-                unit: finalUnit,
-                price: Number(price) || undefined,
-                link: link || undefined
-              })
-            }}
-          >
-            保存
+            {isEditing ? '保存' : '添加'}
           </button>
         </div>
       </div>
@@ -2519,7 +2691,7 @@ function ReviewEditModal({ isOpen, onClose, record, itemName, initialReview, onS
   )
 }
 
-function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEdit, onSnooze, onRestock, onQuickEdit, onApplySuggestion, onDismissSuggestion, onRateEvent, onOpenItemEditor, onRestockFromOption, showAddPurchaseModal, setShowAddPurchaseModal, addPurchaseOptionItemId, setAddPurchaseOptionItemId, editingPurchaseOption, setEditingPurchaseOption, editModalOpen, setEditModalOpen, onEditPurchaseOption, onDeletePurchaseOption, onSaveEditedOption }: {
+function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEdit, onSnooze, onRestock, onCalibrate, onQuickEdit, onApplySuggestion, onDismissSuggestion, onOpenItemEditor, onRestockFromOption, showAddPurchaseModal, setShowAddPurchaseModal, addPurchaseOptionItemId, setAddPurchaseOptionItemId, editingPurchaseOption, setEditingPurchaseOption, editModalOpen, setEditModalOpen, onEditPurchaseOption, onDeletePurchaseOption, onSaveEditedOption }: {
   category: string
   views: ItemView[]
   onAddItem: () => void
@@ -2528,10 +2700,10 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
   onEdit: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
   onRestock: (item: ReplenishmentItem) => void
+  onCalibrate: (item: ReplenishmentItem, remainingDays: number) => void
   onQuickEdit: (item: ReplenishmentItem, patch: Partial<Pick<ReplenishmentItem, "cycleDays" | "bufferDays" | "link" | "unit" | "defaultQty" | "platform" | "purchaseOptions">>) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
-  onRateEvent: (itemId: string, eventId: string, rating?: Rating, review?: string) => void
   onOpenItemEditor: (itemId: string) => void
   onRestockFromOption: (itemId: string, option: PurchaseOption) => void
   showAddPurchaseModal: boolean
@@ -2550,26 +2722,16 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
   const [editingField, setEditingField] = useState<{ id: string; field: "cycleDays" | "bufferDays" | "link" | "defaultQty" | "unit" | "platform" } | null>(null)
   const [editValue, setEditValue] = useState("")
   const [unitCustomId, setUnitCustomId] = useState<string | null>(null)
-  const [ratingEventId, setRatingEventId] = useState<string | null>(null)
-  const [ratingItemId, setRatingItemId] = useState<string | null>(null)
-  const [ratingDraft, setRatingDraft] = useState<{ review: string }>({ review: "" })
   const [savedFieldKey, setSavedFieldKey] = useState<string | null>(null)
-  const [hoveredItemId, setHoveredItemId] = useState<string | null>(null)
+  const [editingInventoryDays, setEditingInventoryDays] = useState(false)
   const [editingUsageInterval, setEditingUsageInterval] = useState(false)
   const [editingReminderDays, setEditingReminderDays] = useState(false)
+  const [tempInventoryDays, setTempInventoryDays] = useState<string | number>('')
   const [tempUsageInterval, setTempUsageInterval] = useState<string | number>('')
   const [tempReminderDays, setTempReminderDays] = useState<string | number>('')
-  const [editingReviewId, setEditingReviewId] = useState<string | null>(null)
-  const [tempReview, setTempReview] = useState('')
   const [showActionMenu, setShowActionMenu] = useState<string | null>(null) // 操作菜单显示状态
   const [historyExpanded, setHistoryExpanded] = useState<Set<string>>(new Set())
-  
-  // 评价弹窗状态
-  const [reviewModalOpen, setReviewModalOpen] = useState(false)
-  const [selectedRecord, setSelectedRecord] = useState<RestockEvent | null>(null)
-  const [editingReviewText, setEditingReviewText] = useState('')
-  const [currentItemName, setCurrentItemName] = useState('')
-  const [currentItemId, setCurrentItemId] = useState<string | null>(null)
+  const [purchaseOptionsExpanded, setPurchaseOptionsExpanded] = useState<Set<string>>(new Set())
 
   // Escape key to collapse expanded item
   useEffect(() => {
@@ -2650,12 +2812,18 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
     setEditingField(null)
   }
 
-  function submitRating(itemId: string, eventId: string) {
-    if (!ratingDraft.review.trim()) return
-    onRateEvent(itemId, eventId, undefined, ratingDraft.review)
-    setRatingEventId(null)
-    setRatingItemId(null)
-    setRatingDraft({ review: "" })
+  // 当前库存还能消耗多少天（从今天起算）
+  function handleStartEditInventoryDays(computed: ItemComputed) {
+    setTempInventoryDays(Math.max(0, computed.daysUntilDepletion))
+    setEditingInventoryDays(true)
+  }
+
+  function handleSaveInventoryDays(item: ReplenishmentItem) {
+    const parsed = Number(tempInventoryDays)
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      onCalibrate(item, Math.round(parsed))
+    }
+    setEditingInventoryDays(false)
   }
 
   // 开始编辑补货间隔
@@ -2670,7 +2838,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
     const newValue = Number.isFinite(parsed) && parsed > 0
       ? Math.max(1, Math.round(parsed))
       : item.cycleDays
-    onQuickEdit(item, { cycleDays: newValue })
+    onQuickEdit(item, { cycleDays: newValue, bufferDays: Math.min(item.bufferDays, Math.max(0, newValue - 1)) })
     setEditingUsageInterval(false)
   }
 
@@ -2692,59 +2860,12 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
 
   // 取消编辑
   function handleCancelEdit() {
+    setEditingInventoryDays(false)
     setEditingUsageInterval(false)
     setEditingReminderDays(false)
+    setTempInventoryDays('')
     setTempUsageInterval('')
     setTempReminderDays('')
-  }
-
-  // 开始编辑评价
-  function handleStartEditReview(recordId: string, currentReview: string | undefined) {
-    setTempReview(currentReview || '')
-    setEditingReviewId(recordId)
-  }
-
-  // 保存评价
-  function handleSaveReview(itemId: string, recordId: string) {
-    const newReview = tempReview.trim() === '' ? undefined : tempReview
-    // 更新补货记录的评价
-    onRateEvent(itemId, recordId, undefined, newReview)
-    setEditingReviewId(null)
-    setTempReview('')
-  }
-
-  // 取消编辑评价
-  function handleCancelEditReview() {
-    setEditingReviewId(null)
-    setTempReview('')
-  }
-
-  // 打开评价弹窗
-  function handleOpenReviewModal(record: RestockEvent, itemName: string, itemId: string) {
-    setSelectedRecord(record)
-    setCurrentItemName(itemName)
-    setCurrentItemId(itemId)
-    setEditingReviewText(record.review || '')
-    setReviewModalOpen(true)
-  }
-
-  // 关闭评价弹窗
-  function handleCloseReviewModal() {
-    setReviewModalOpen(false)
-    setSelectedRecord(null)
-    setCurrentItemName('')
-    setCurrentItemId(null)
-    setEditingReviewText('')
-  }
-
-  // 从弹窗保存评价
-  function handleSaveReviewFromModal(review: string) {
-    if (!selectedRecord || !currentItemId) return
-    
-    const newReview = review.trim() || undefined
-    onRateEvent(currentItemId, selectedRecord.id, undefined, newReview)
-    
-    handleCloseReviewModal()
   }
 
   return (
@@ -2761,65 +2882,99 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
       {/* item list */}
       <div className="work-item-list">
         {views.map(({ item, computed }) => (
-          <div 
-            key={item.id} 
-            className={`category-item-group ${expandedId === item.id ? "is-expanded" : ""}`}
-            onMouseEnter={() => setHoveredItemId(item.id)}
-            onMouseLeave={() => setHoveredItemId(null)}
-          >
-            <button className={`category-item ${expandedId === item.id ? "is-expanded" : ""}`} onClick={() => toggleExpand(item, computed)}>
-              {/* 左侧状态圆点 */}
-              <span className={`status-dot ${computed.displayStatus}`} />
-              <div className="category-item-copy">
-                {/* 标题行：名称和编辑按钮并排 */}
-                <div className="item-title-row">
-                  <strong>{item.name}</strong>
-                  {hoveredItemId === item.id && (
-                    <button 
-                      className="icon-button item-edit-btn-inline"
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        onOpenItemEditor(item.id)
-                      }}
-                      aria-label="编辑物品"
-                    >
-                      <Icon name="edit" size={14} />
-                    </button>
-                  )}
+          <div key={item.id} className={`category-item-group ${expandedId === item.id ? "is-expanded" : ""}`}>
+            <div className={`category-item ${expandedId === item.id ? "is-expanded" : ""}`}>
+              <button type="button" className="category-item-main" onClick={() => toggleExpand(item, computed)} aria-expanded={expandedId === item.id}>
+                {/* 左侧状态圆点 */}
+                <span className={`status-dot ${computed.displayStatus}`} />
+                <div className="category-item-copy">
+                  <div className="item-title-row"><strong>{item.name}</strong></div>
+                  <small>{formatItemStatusText(item, computed)}</small>
                 </div>
-                <small>
-                  {formatItemStatusText(item, computed)}
-                </small>
-              </div>
+              </button>
+              <button type="button" className="icon-button item-edit-btn-inline" onClick={() => onOpenItemEditor(item.id)} aria-label={`编辑${item.name}`}>
+                <Icon name="edit" size={14} />
+              </button>
               <span className={`status-label ${computed.displayStatus}`}>{computed.statusLabel}</span>
-              <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
-            </button>
+              <button type="button" className="category-item-expand" onClick={() => toggleExpand(item, computed)} aria-label={expandedId === item.id ? `收起${item.name}` : `展开${item.name}`} aria-expanded={expandedId === item.id}>
+                <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
+              </button>
+            </div>
             {expandedId === item.id && (
               <div className="category-item-detail">
+                {item.source === "onboarding" && (
+                  <div className="detail-section category-model-section">
+                    <h4 className="section-title">初始化模型</h4>
+                    <div className="category-model-grid">
+                      <div><span>预测周期</span><strong>约 {item.cycleDays} 天</strong></div>
+                      <div><span>置信度</span><strong>{item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}</strong></div>
+                      <div className="category-model-note"><span>最近校准</span><strong>{item.modelNote || "基于家庭画像和库存状态估算"}</strong><small>{item.history.length < 2 ? `再记录 ${2 - item.history.length} 次补货后会更准。` : "已开始学习你家的真实周期。"}</small></div>
+                    </div>
+                  </div>
+                )}
                 {/* 区块1：消耗设置 */}
                 <div className="detail-section">
                   <h4 className="section-title">消耗设置</h4>
                   <div className="settings-inline-row">
-                    {/* 补货间隔 */}
+                    {/* 当前库存周期 */}
                     <div className="setting-row inline-setting">
-                      <span className="setting-label">间隔：</span>
+                      <span className="setting-label">库存周期：</span>
+                      {editingInventoryDays ? (
+                        <div className="input-with-unit inline-setting-input">
+                          <input
+                            type="number"
+                            min="0"
+                            value={tempInventoryDays}
+                            onChange={(e) => setTempInventoryDays(e.target.value === '' ? '' : Number(e.target.value))}
+                            onBlur={() => handleSaveInventoryDays(item)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                handleSaveInventoryDays(item)
+                              } else if (e.key === 'Escape') {
+                                handleCancelEdit()
+                              }
+                            }}
+                            autoFocus
+                            aria-label={`${item.name}当前库存可消耗天数`}
+                            className="inline-input"
+                          />
+                          <span className="unit-label">天</span>
+                        </div>
+                      ) : (
+                        <button className="editable-value" onClick={() => handleStartEditInventoryDays(computed)}>
+                          {Math.max(0, computed.daysUntilDepletion)} 天
+                          <svg className="edit-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                            <path d="m15 5 4 4" />
+                          </svg>
+                        </button>
+                      )}
+                    </div>
+
+                    {/* 单次补货消耗周期 */}
+                    <div className="setting-row inline-setting">
+                      <span className="setting-label">消耗周期：</span>
                       {editingUsageInterval ? (
-                        <input
-                          type="number"
-                          min="1"
-                          value={tempUsageInterval}
-                          onChange={(e) => setTempUsageInterval(e.target.value === '' ? '' : Number(e.target.value))}
-                          onBlur={() => handleSaveUsageInterval(item)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              handleSaveUsageInterval(item)
-                            } else if (e.key === 'Escape') {
-                              handleCancelEdit()
-                            }
-                          }}
-                          autoFocus
-                          className="inline-input"
-                        />
+                        <div className="input-with-unit inline-setting-input">
+                          <input
+                            type="number"
+                            min="1"
+                            value={tempUsageInterval}
+                            onChange={(e) => setTempUsageInterval(e.target.value === '' ? '' : Number(e.target.value))}
+                            onBlur={() => handleSaveUsageInterval(item)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                handleSaveUsageInterval(item)
+                              } else if (e.key === 'Escape') {
+                                handleCancelEdit()
+                              }
+                            }}
+                            autoFocus
+                            aria-label={`${item.name}单次补货可消耗天数`}
+                            className="inline-input"
+                          />
+                          <span className="unit-label">天</span>
+                        </div>
                       ) : (
                         <button 
                           className="editable-value"
@@ -2846,24 +3001,28 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
 
                     {/* 提前提醒 */}
                     <div className="setting-row inline-setting">
-                      <span className="setting-label">提醒：</span>
+                      <span className="setting-label">提醒天数：</span>
                       {editingReminderDays ? (
-                        <input
-                          type="number"
-                          min="0"
-                          value={tempReminderDays}
-                          onChange={(e) => setTempReminderDays(e.target.value === '' ? '' : Number(e.target.value))}
-                          onBlur={() => handleSaveReminderDays(item)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              handleSaveReminderDays(item)
-                            } else if (e.key === 'Escape') {
-                              handleCancelEdit()
-                            }
-                          }}
-                          autoFocus
-                          className="inline-input"
-                        />
+                        <div className="input-with-unit inline-setting-input">
+                          <input
+                            type="number"
+                            min="0"
+                            value={tempReminderDays}
+                            onChange={(e) => setTempReminderDays(e.target.value === '' ? '' : Number(e.target.value))}
+                            onBlur={() => handleSaveReminderDays(item)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                handleSaveReminderDays(item)
+                              } else if (e.key === 'Escape') {
+                                handleCancelEdit()
+                              }
+                            }}
+                            autoFocus
+                            aria-label={`${item.name}提前提醒天数`}
+                            className="inline-input"
+                          />
+                          <span className="unit-label">天</span>
+                        </div>
                       ) : (
                         <button 
                           className="editable-value"
@@ -2890,94 +3049,124 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                   </div>
                 </div>
                 
-                {/* 区块2：补货设置（采购选项） */}
+                {/* 区块2：常购商品 */}
                 <div className="detail-section">
-                  <h4 className="section-title">补货设置</h4>
+                  <h4 className="section-title">常购商品</h4>
                   <div className="section-content">
                     {item.purchaseOptions && item.purchaseOptions.length > 0 ? (
                       <div className="purchase-options-list">
-                        {item.purchaseOptions.map(option => (
-                          <div 
-                            key={option.id} 
-                            className="purchase-option-card"
-                            onDoubleClick={() => onRestockFromOption(item.id, option)}
-                            title="双击记录补货"
-                          >
-                            <div className="option-info">
-                              <strong>{option.productName}</strong>
-                              <span className="option-meta">
-                                {option.platform} · {option.unit}
-                                {option.price && ` · ¥${option.price}`}
-                              </span>
-                            </div>
-                            <div className="option-actions-wrapper">
-                              {/* 编辑按钮 */}
-                              <button 
-                                className="icon-button edit-option-btn"
-                                onClick={(e) => {
-                                  e.stopPropagation()
-                                  setShowActionMenu(showActionMenu === option.id ? null : option.id)
-                                }}
-                                title="操作"
-                              >
-                                <svg 
-                                  className="action-icon" 
-                                  width="16" 
-                                  height="16" 
-                                  viewBox="0 0 24 24" 
-                                  fill="none" 
-                                  stroke="currentColor" 
-                                  strokeWidth="2" 
-                                  strokeLinecap="round" 
-                                  strokeLinejoin="round"
-                                >
-                                  <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                                  <path d="m15 5 4 4" />
-                                </svg>
-                              </button>
-                              
-                              {/* 操作菜单 */}
-                              {showActionMenu === option.id && (
-                                <div className="action-menu">
-                                  <button 
-                                    className="action-menu-item"
-                                    onClick={() => {
-                                      onEditPurchaseOption(option)
-                                      setShowActionMenu(null)
-                                    }}
-                                  >
-                                    编辑
-                                  </button>
-                                  <button 
-                                    className="action-menu-item danger"
-                                    onClick={() => {
-                                      if (window.confirm('确定要删除这个采购选项吗？')) {
-                                        onDeletePurchaseOption(item.id, option.id)
-                                      }
-                                      setShowActionMenu(null)
-                                    }}
-                                  >
-                                    删除
-                                  </button>
+                        {(() => {
+                          const options = item.purchaseOptions
+                          const isOptionsExpanded = purchaseOptionsExpanded.has(item.id)
+                          const visibleOptions = isOptionsExpanded ? options : options.slice(0, 5)
+                          const hasMoreOptions = options.length > 5
+                          return (
+                            <>
+                              {visibleOptions.map(option => (
+                                <div key={option.id} className="purchase-option-card">
+                                  <div className="option-info">
+                                    <div className="option-name-row">
+                                      <strong>{option.productName}</strong>
+                                      {option.review && <span className="option-review-pill">{option.review}</span>}
+                                    </div>
+                                    <span className="option-meta">
+                                      {option.platform} · {item.unit || option.unit || '件'}
+                                      {option.price && ` · ¥${option.price}`}
+                                    </span>
+                                  </div>
+                                  <div className="option-actions-wrapper">
+                                    <div className="option-edit-wrapper">
+                                      {/* 编辑按钮 */}
+                                      <button
+                                        className="icon-button edit-option-btn"
+                                        onClick={(e) => {
+                                          e.stopPropagation()
+                                          setShowActionMenu(showActionMenu === option.id ? null : option.id)
+                                        }}
+                                        title="操作"
+                                        aria-label={`管理${option.productName}`}
+                                      >
+                                        <svg
+                                          className="action-icon"
+                                          width="16"
+                                          height="16"
+                                          viewBox="0 0 24 24"
+                                          fill="none"
+                                          stroke="currentColor"
+                                          strokeWidth="2"
+                                          strokeLinecap="round"
+                                          strokeLinejoin="round"
+                                        >
+                                          <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                                          <path d="m15 5 4 4" />
+                                        </svg>
+                                      </button>
+
+                                      {/* 操作菜单 */}
+                                      {showActionMenu === option.id && (
+                                        <div className="action-menu">
+                                          <button
+                                            className="action-menu-item"
+                                            onClick={() => {
+                                              onEditPurchaseOption(option)
+                                              setShowActionMenu(null)
+                                            }}
+                                          >
+                                            编辑
+                                          </button>
+                                          <button
+                                            className="action-menu-item danger"
+                                            onClick={() => {
+                                              if (window.confirm('确定要删除这个商品吗？')) {
+                                                onDeletePurchaseOption(item.id, option.id)
+                                              }
+                                              setShowActionMenu(null)
+                                            }}
+                                          >
+                                            删除
+                                          </button>
+                                        </div>
+                                      )}
+                                    </div>
+                                    <button type="button" className="quiet-button purchase-option-restock-btn" onClick={() => onRestockFromOption(item.id, option)}>按此选项补货</button>
+                                  </div>
                                 </div>
+                              ))}
+                              {hasMoreOptions && (
+                                <button
+                                  className="history-toggle-btn"
+                                  onClick={() => {
+                                    setPurchaseOptionsExpanded(prev => {
+                                      const next = new Set(prev)
+                                      if (next.has(item.id)) {
+                                        next.delete(item.id)
+                                      } else {
+                                        next.add(item.id)
+                                      }
+                                      return next
+                                    })
+                                  }}
+                                >
+                                  {isOptionsExpanded ? '收起' : `查看更多 (${options.length - 5})`}
+                                </button>
                               )}
-                            </div>
-                          </div>
-                        ))}
-                        {/* 添加新选项的按钮 */}
-                        <button 
-                          className="secondary-button add-option-inline-btn"
-                          onClick={() => {
-                            setAddPurchaseOptionItemId(item.id)
-                            setShowAddPurchaseModal(true)
-                          }}
-                        >
-                          + 添加采购选项
-                        </button>
+                              {/* 添加新选项的按钮 */}
+                              <button 
+                                className="secondary-button add-option-inline-btn"
+                                onClick={() => {
+                                  setAddPurchaseOptionItemId(item.id)
+                                  setShowAddPurchaseModal(true)
+                                }}
+                              >
+                                + 添加商品
+                              </button>
+                            </>
+                          )
+                        })()}
                       </div>
                     ) : (
                       <div className="empty-purchase-options">
-                        <p className="empty-hint">暂无采购选项</p>
+                        <p className="empty-hint">暂无常购商品</p>
                         <button 
                           className="primary-button green add-option-btn"
                           onClick={() => {
@@ -2985,7 +3174,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                             setShowAddPurchaseModal(true)
                           }}
                         >
-                          添加采购选项
+                          添加商品
                         </button>
                       </div>
                     )}
@@ -3025,18 +3214,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                                       )}
                                       <span className="record-separator">·</span>
                                       <span className="record-price">¥{record.price?.toFixed(2) || '0.00'}</span>
-                                      <span className="record-separator">·</span>
-                                      <span className="record-review-text">{record.review || '暂无评价'}</span>
                                     </div>
-                                    
-                                    {/* 右侧：评价按钮 */}
-                                    <button 
-                                      className="review-btn"
-                                      onClick={() => handleOpenReviewModal(record, recordProductName, item.id)}
-                                      title={record.review ? "编辑评价" : "添加评价"}
-                                    >
-                                      评价
-                                    </button>
                                   </div>
                                 )
                               })}
@@ -3074,31 +3252,28 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
         {!views.length && <div className="empty-category">这个分类还没有记录</div>}
       </div>
 
-      {/* 编辑采购选项弹窗 */}
-      <EditPurchaseOptionModal
+      {/* 编辑商品弹窗 */}
+      <PurchaseOptionModal
         isOpen={editModalOpen}
         onClose={() => {
           setEditModalOpen(false)
           setEditingPurchaseOption(null)
         }}
         option={editingPurchaseOption}
-        onSave={onSaveEditedOption}
-      />
-      
-      {/* 评价编辑弹窗 */}
-      <ReviewEditModal
-        isOpen={reviewModalOpen}
-        onClose={handleCloseReviewModal}
-        record={selectedRecord}
-        itemName={currentItemName}
-        initialReview={editingReviewText}
-        onSave={handleSaveReviewFromModal}
+        onSave={(optionData) => {
+          if (!editingPurchaseOption) return
+          onSaveEditedOption({
+            ...editingPurchaseOption,
+            ...optionData,
+            unit: editingPurchaseOption.unit
+          })
+        }}
       />
     </div>
   )
 }
 
-function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onDeleteCategory }: {
+function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onConfirmDeleteCategory }: {
   dueCount: number
   categorySummaries: Array<{ category: string; views: ItemView[]; urgent: number; warning: number }>
   activeCategory: string | null
@@ -3106,11 +3281,11 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
   onCreateCategory: () => void
   onOpenSettings: () => void
   onRenameCategory: (oldName: string, newName: string) => void
-  onDeleteCategory: (name: string) => void
+  onConfirmDeleteCategory: (name: string) => void
 }) {
   const [editingCategory, setEditingCategory] = useState<string | null>(null)
   const [editName, setEditName] = useState("")
-  const [hoveredCategory, setHoveredCategory] = useState<string | null>(null)
+  const [pendingDelete, setPendingDelete] = useState<string | null>(null)
   return (
     <nav className="sidebar">
       <button
@@ -3134,17 +3309,11 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
       {categorySummaries.map(({ category, views, urgent, warning }) => {
         const dotStatus = urgent ? "urgent" : warning ? "warning" : "normal"
         const isEditing = editingCategory === category
-        const isHovered = hoveredCategory === category
-        
+        const isPendingDelete = pendingDelete === category
         return (
-          <div 
-            key={category}
-            className={`sidebar-item-wrapper ${activeCategory === category ? "is-active" : ""}`}
-            onMouseEnter={() => setHoveredCategory(category)}
-            onMouseLeave={() => setHoveredCategory(null)}
-          >
+          <div key={category} className={`sidebar-item-wrapper ${activeCategory === category ? "is-active" : ""}`}>
             {/* 分类项主体 - 点击切换分类 */}
-            {!isEditing && (
+            {!isEditing && !isPendingDelete && (
               <button
                 className="sidebar-item-main"
                 onClick={() => onSelectCategory(category)}
@@ -3155,8 +3324,8 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
               </button>
             )}
             
-            {/* Hover 时显示的编辑按钮 */}
-            {isHovered && !isEditing && (
+            {/* 始终保留在 DOM 中，鼠标或键盘聚焦时增强显示 */}
+            {!isEditing && !isPendingDelete && (
               <button 
                 className="sidebar-item-edit-btn"
                 onClick={(e) => {
@@ -3170,7 +3339,7 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
               </button>
             )}
             
-            {/* 编辑模式 */}
+            {/* 编辑模式 - 重命名 */}
             {isEditing && (
               <div className="sidebar-item-edit-mode">
                 <input
@@ -3198,17 +3367,43 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
                 />
                 <button 
                   className="sidebar-item-delete-btn"
-                  onClick={(e) => {
+                  onMouseDown={(e) => {
+                    e.preventDefault()
                     e.stopPropagation()
-                    if (window.confirm(`确定要删除分类"${category}"吗？该分类下的所有物品将被移至"其他"分类。`)) {
-                      onDeleteCategory(category)
-                      setEditingCategory(null)
-                    }
+                    setPendingDelete(category)
+                    setEditingCategory(null)
                   }}
                   aria-label="删除分类"
                 >
                   <Icon name="trash" size={12} />
                 </button>
+              </div>
+            )}
+
+            {/* 删除确认模式 - 右侧小弹窗 */}
+            {isPendingDelete && (
+              <div className="sidebar-item-edit-mode sidebar-delete-confirm">
+                <span className="sidebar-item-name">{category}</span>
+                <div className="sidebar-delete-confirm-popover" onClick={(e) => e.stopPropagation()}>
+                  <span className="sidebar-delete-confirm-text">确认删除？</span>
+                  <button 
+                    className="sidebar-delete-confirm-cancel"
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      setPendingDelete(null)
+                    }}
+                  >取消</button>
+                  <button 
+                    className="sidebar-delete-confirm-btn"
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      e.stopPropagation()
+                      onConfirmDeleteCategory(category)
+                      setPendingDelete(null)
+                    }}
+                  >删除</button>
+                </div>
               </div>
             )}
           </div>

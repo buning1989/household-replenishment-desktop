@@ -223,13 +223,19 @@ function calendarDayNumber(timestamp) {
 }
 
 function dueAt(item) {
-  const date = new Date(item.lastRestockedAt)
-  date.setDate(date.getDate() + Number(item.cycleDays || 0) - Number(item.bufferDays || 0))
+  const date = new Date(depletionAt(item))
+  date.setDate(date.getDate() - Number(item.bufferDays || 0))
   date.setHours(0, 0, 0, 0)
   return date.getTime()
 }
 
 function depletionAt(item) {
+  const inventoryDepletionAt = Number(item.inventoryDepletionAt)
+  if (Number.isFinite(inventoryDepletionAt)) {
+    const inventoryDate = new Date(inventoryDepletionAt)
+    inventoryDate.setHours(0, 0, 0, 0)
+    return inventoryDate.getTime()
+  }
   const date = new Date(item.lastRestockedAt)
   date.setDate(date.getDate() + Number(item.cycleDays || 0))
   date.setHours(0, 0, 0, 0)
@@ -258,8 +264,11 @@ function sendNotification(items, isTest = false) {
   if (!Notification.isSupported()) return
   const item = items[0]
   const urgent = item && calendarDayNumber(Date.now()) >= calendarDayNumber(depletionAt(item))
+  const lowConfidence = item?.source === "onboarding" && item?.confidence === "low"
   const title = isTest
     ? "提醒功能工作正常"
+    : lowConfidence
+      ? `${item?.name || "物品"}可能快到补货周期了`
     : urgent
       ? `${item?.name || "物品"}预计已用完了`
       : `${item?.name || "物品"}快用完了`
@@ -340,17 +349,20 @@ app.on("before-quit", () => {
 })
 app.on("window-all-closed", (event) => event.preventDefault())
 
-ipcMain.on("state:sync", (_event, state) => {
+ipcMain.handle("state:sync", (_event, state) => {
   const result = validateState(state)
   if (!result.valid) {
     console.warn("[main] state:sync: rejected invalid state:", result.reason)
-    return
+    return { ok: false, error: "数据校验失败，未写入桌面备份。请检查商品名称和补货设置后重试。" }
   }
   // 校验合法：先更新内存，再尝试写文件。
   // 写入失败不影响当前运行时提醒，但不会破坏旧文件（原子写入保证）。
   latestState = state
-  saveState(state)
+  const saved = saveState(state)
   checkReminders(false)
+  return saved
+    ? { ok: true }
+    : { ok: false, error: "数据已保存在当前窗口，但桌面备份文件写入失败。请重试并建议复制当前数据备份。" }
 })
 ipcMain.on("window:show", showWindow)
 ipcMain.on("notification:test", () => sendNotification([], true))
