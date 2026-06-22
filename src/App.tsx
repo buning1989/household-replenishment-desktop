@@ -925,17 +925,17 @@ function CategoryCreator({ existingCategories, onClose, onCreate, isClosing }: {
 
 type ItemView = { item: ReplenishmentItem; computed: ItemComputed }
 
-function TaskActions({ item, onRestock, onUndo, isExpanded }: {
+function TaskActions({ item, onRestock, onDismiss, isExpanded }: {
   item: ReplenishmentItem
   onRestock: (item: ReplenishmentItem) => void
-  onUndo?: () => void
+  onDismiss?: () => void
   isExpanded?: boolean
 }) {
   const latestRating = getLatestRating(item)
-  if (isExpanded && onUndo) {
+  if (isExpanded && onDismiss) {
     return (
       <div className="task-actions">
-        <button className="task-action collapse" onClick={onUndo}>收起</button>
+        <button className="task-action collapse" onClick={onDismiss}>收起</button>
       </div>
     )
   }
@@ -1019,7 +1019,7 @@ function CurrentTasks({ items, recentRestock, allItems, snoozeUntilHour, onResto
                   ) : (
                     <>
                       <button className={`task-snooze-link ${snoozeHour ? "is-snoozed" : ""}`} onClick={() => handleSnoozeWithFeedback(item)}>{snoozeHour ? `已推迟到 ${snoozeHour} 点` : "稍后提醒"}</button>
-                      <TaskActions item={item} onRestock={onRestock} isExpanded={recentRestock?.itemId === item.id} onUndo={recentRestock?.itemId === item.id ? onUndoRestock : undefined} />
+                      <TaskActions item={item} onRestock={onRestock} isExpanded={recentRestock?.itemId === item.id} onDismiss={recentRestock?.itemId === item.id ? onDismissRestock : undefined} />
                     </>
                   )}
                 </article>
