@@ -2964,14 +2964,6 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
               <button type="button" className="icon-button item-edit-btn-inline" onClick={() => onOpenItemEditor(item.id)} aria-label={`编辑${item.name}`}>
                 <Icon name="edit" size={14} />
               </button>
-              <button
-                type="button"
-                className="text-button item-restock-btn-inline"
-                onClick={() => onRestock(item)}
-                aria-label={`记录${item.name}补货`}
-              >
-                记录补货
-              </button>
               <span className={`status-label ${computed.displayStatus}`}>{computed.statusLabel}</span>
               <button type="button" className="category-item-expand" onClick={() => toggleExpand(item, computed)} aria-label={expandedId === item.id ? `收起${item.name}` : `展开${item.name}`} aria-expanded={expandedId === item.id}>
                 <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
