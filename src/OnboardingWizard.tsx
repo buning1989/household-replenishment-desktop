@@ -22,6 +22,7 @@ type OnboardingWizardProps = {
   initialProfile: HouseholdProfile | null
   onboarding: OnboardingState
   isRerun?: boolean
+  existingTemplateIds?: string[]
   onProgress: (profile: HouseholdProfile, patch: Partial<OnboardingState>) => void
   onSkip: () => void
   onComplete: (result: OnboardingCompletion) => void
@@ -37,7 +38,7 @@ function decisionsFromState(onboarding: OnboardingState, profile: HouseholdProfi
   return defaults
 }
 
-export function OnboardingWizard({ initialProfile, onboarding, isRerun = false, onProgress, onSkip, onComplete }: OnboardingWizardProps) {
+export function OnboardingWizard({ initialProfile, onboarding, isRerun = false, existingTemplateIds = [], onProgress, onSkip, onComplete }: OnboardingWizardProps) {
   const [step, setStep] = useState<OnboardingStep>(onboarding.currentStep)
   const [profile, setProfile] = useState<HouseholdProfile>(() => initialProfile ?? createDefaultHouseholdProfile())
   const [skippedProfile, setSkippedProfile] = useState(onboarding.skippedProfile)
@@ -45,6 +46,7 @@ export function OnboardingWizard({ initialProfile, onboarding, isRerun = false, 
   const [decisions, setDecisions] = useState<Record<string, TemplateDecision>>(() => decisionsFromState(onboarding, profile))
   const [inventoryStatuses, setInventoryStatuses] = useState<Record<string, InventoryStatus>>(() => onboarding.inventoryStatuses ?? {})
   const [previewNow] = useState(() => Date.now())
+  const existingTemplateSet = useMemo(() => new Set(existingTemplateIds), [existingTemplateIds])
 
   useEffect(() => {
     setDecisions((current) => {
@@ -172,21 +174,33 @@ export function OnboardingWizard({ initialProfile, onboarding, isRerun = false, 
         {step === 3 && (
           <section className="onboarding-panel recommendation-step">
             <div className="onboarding-section-heading"><div><span className="onboarding-kicker">推荐清单</span><h1>哪些东西，想让管家帮你看着？</h1></div><p>已按家庭情况筛选。你随时可以在主界面增删。</p></div>
+            {isRerun && (
+              <div className="onboarding-rerun-notice">
+                重新设置只会补充新增物品，不会删除你已经管理的物品和历史记录。如需停止管理某项，请到主界面执行带确认的删除操作。
+              </div>
+            )}
             <div className="recommendation-groups">
               {[...new Set(recommendations.map(({ template }) => template.category))].map((category) => (
                 <section key={category} className="recommendation-group">
                   <div className="recommendation-group-title"><h2>{category}</h2><span>{recommendations.filter(({ template }) => template.category === category).length} 项</span></div>
                   <div className="recommendation-list">
-                    {recommendations.filter(({ template }) => template.category === category).map(({ template, reason }) => (
-                      <div key={template.id} className={`recommendation-row decision-${decisions[template.id]}`}>
-                        <div><strong>{template.name}</strong><small>{reason} · 约 {template.minCycleDays}-{template.maxCycleDays} 天</small></div>
-                        <div className="decision-control" aria-label={`${template.name}管理方式`}>
-                          {([["manage", "管理"], ["defer", "暂不管理"], ["notUsed", "我家不用"]] as Array<[TemplateDecision, string]>).map(([value, label]) => (
-                            <button key={value} className={decisions[template.id] === value ? "is-selected" : ""} onClick={() => setDecisions((current) => ({ ...current, [template.id]: value }))}>{label}</button>
-                          ))}
+                    {recommendations.filter(({ template }) => template.category === category).map(({ template, reason }) => {
+                      const alreadyManaged = isRerun && existingTemplateSet.has(template.id)
+                      return (
+                        <div key={template.id} className={`recommendation-row decision-${decisions[template.id]} ${alreadyManaged ? "is-existing" : ""}`}>
+                          <div><strong>{template.name}</strong><small>{reason} · 约 {template.minCycleDays}-{template.maxCycleDays} 天</small></div>
+                          <div className="decision-control" aria-label={`${template.name}管理方式`}>
+                            {alreadyManaged ? (
+                              <span className="recommendation-existing-badge">已在管理</span>
+                            ) : (
+                              ([["manage", "管理"], ["defer", "暂不管理"], ["notUsed", "我家不用"]] as Array<[TemplateDecision, string]>).map(([value, label]) => (
+                                <button key={value} className={decisions[template.id] === value ? "is-selected" : ""} onClick={() => setDecisions((current) => ({ ...current, [template.id]: value }))}>{label}</button>
+                              ))
+                            )}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 </section>
               ))}

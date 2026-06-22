@@ -260,17 +260,27 @@ function getDueItems(state, now = Date.now()) {
   }).sort((a, b) => depletionAt(a) - depletionAt(b))
 }
 
+// 预算提醒状态机：按月份重置，四档阈值（50/75/90/100）各自独立，
+// 达到 90% 后继续达到 100% 仍需触发“预算已用完”提醒。
+// 同一月份、同一阈值不重复通知；预算清空或降到阈值以下后状态复位。
 let lastBudgetNotificationLevel = ""
+let lastBudgetNotificationMonth = ""
+
+function getBudgetMonthKey(now = new Date()) {
+  return `${now.getFullYear()}-${now.getMonth()}`
+}
 
 function getMonthlySpending(state) {
   if (!state || !Array.isArray(state.items)) return 0
   const now = new Date()
   const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
+  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, 1).getTime()
   let total = 0
   for (const item of state.items) {
     if (!Array.isArray(item.history)) continue
     for (const event of item.history) {
-      if (event.at >= currentMonthStart && Number.isFinite(Number(event.price))) {
+      // 与 domain.ts calculateMonthlySpend 保持一致：包含月份上界过滤
+      if (event.at >= currentMonthStart && event.at < nextMonth && Number.isFinite(Number(event.price))) {
         total += Number(event.price)
       }
     }
@@ -278,11 +288,12 @@ function getMonthlySpending(state) {
   return total
 }
 
+// 四档阈值各自独立标识，90% 和 100% 使用不同 level，避免 90→100 不触发
 function getBudgetLevel(percent) {
-  if (percent >= 100) return "urgent"
-  if (percent >= 90) return "urgent"
-  if (percent >= 75) return "warning"
-  if (percent >= 50) return "info"
+  if (percent >= 100) return "budget-100"
+  if (percent >= 90) return "budget-90"
+  if (percent >= 75) return "budget-75"
+  if (percent >= 50) return "budget-50"
   return null
 }
 
@@ -294,13 +305,26 @@ function getBudgetReminderText(percent) {
   return ""
 }
 
-function sendBudgetNotification(percent, spent, budget) {
+function sendBudgetNotification(percent, spent, budget, settings) {
   if (!Notification.isSupported()) return
   const level = getBudgetLevel(percent)
-  if (!level) return
+  const monthKey = getBudgetMonthKey()
+  // 月份变化后重置当月提醒状态
+  if (lastBudgetNotificationMonth !== monthKey) {
+    lastBudgetNotificationMonth = monthKey
+    lastBudgetNotificationLevel = ""
+  }
+  // 预算被清空或降到阈值以下后，状态应正确复位
+  if (!level) {
+    lastBudgetNotificationLevel = ""
+    return
+  }
+  // 同一月份、同一阈值不得每分钟重复通知
   if (level === lastBudgetNotificationLevel) return
   lastBudgetNotificationLevel = level
-  const title = level === "urgent" ? "预算提醒" : "预算进度"
+  // 预算通知必须遵守现有勿扰时段
+  if (inQuietHours(new Date(), settings?.quietStart, settings?.quietEnd)) return
+  const title = level === "budget-100" || level === "budget-90" ? "预算提醒" : "预算进度"
   const body = `${getBudgetReminderText(percent)}（已用 ¥${spent.toFixed(0)} / ¥${budget.toFixed(0)}）`
   const notification = new Notification({ title, body, closeButtonText: "关闭" })
   notification.on("click", () => showWindow())
@@ -311,12 +335,13 @@ function checkBudgetNotification(state) {
   if (!state) return
   const budget = Number(state.settings?.monthlyBudget || 0)
   if (budget <= 0) {
+    // 预算被清空后状态复位
     lastBudgetNotificationLevel = ""
     return
   }
   const spent = getMonthlySpending(state)
   const percent = Math.round((spent / budget) * 100)
-  sendBudgetNotification(percent, spent, budget)
+  sendBudgetNotification(percent, spent, budget, state.settings)
 }
 
 function sendNotification(items, isTest = false) {
@@ -413,6 +438,12 @@ app.on("before-quit", () => {
   isQuitting = true
 })
 app.on("window-all-closed", (event) => event.preventDefault())
+
+ipcMain.handle("state:load", () => {
+  // 返回主进程内存中的最新状态（已在 loadState 时经过 validateState 校验）。
+  // renderer 侧负责与 localStorage 协调，避免空初始状态覆盖桌面备份。
+  return latestState
+})
 
 ipcMain.handle("state:sync", (_event, state) => {
   const result = validateState(state)

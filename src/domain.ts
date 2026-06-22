@@ -189,9 +189,17 @@ export function restockItem(
     ? weightedCycle(singleItemIntervals, currentSingleItemCycle)
     : undefined
 
-  const newCycleDays = singleItemCandidate
+  const candidateCycleDays = singleItemCandidate
     ? Math.max(1, Math.round(singleItemCandidate * safeQty))
-    : item.cycleDays
+    : undefined
+
+  // 周期学习必须先建议，用户确认后才生效：
+  // - 候选周期与当前 cycleDays 不同时，写入 suggestedCycleDays，不覆盖 cycleDays；
+  // - 固定周期或关闭学习的物品不生成建议；
+  // - 差异过小（<1 天）时不生成建议，避免频繁打扰。
+  const hasSuggestion = candidateCycleDays !== undefined && Math.abs(candidateCycleDays - item.cycleDays) >= 1
+  const newCycleDays = hasSuggestion ? item.cycleDays : (candidateCycleDays ?? item.cycleDays)
+  const suggestedCycleDays = hasSuggestion ? candidateCycleDays : undefined
 
   const confidence = item.source === "onboarding"
     ? history.length >= 2 ? "high" : "medium"
@@ -207,7 +215,7 @@ export function restockItem(
     price: price ?? item.price,
     platform: platform || item.platform,
     snoozeUntil: undefined,
-    suggestedCycleDays: undefined,
+    suggestedCycleDays,
     confidence,
     inventoryStatus: "justRestocked",
     modelNote: item.source === "onboarding"

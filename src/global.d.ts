@@ -9,6 +9,7 @@ declare global {
   interface Window {
     desktop?: {
       syncState: (state: AppState) => Promise<{ ok: boolean; error?: string }>
+      loadState: () => Promise<AppState | null>
       openExternal: (url: string) => Promise<void>
       showWindow: () => void
       testNotification: () => void

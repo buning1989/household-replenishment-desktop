@@ -392,6 +392,54 @@ export function loadState(): AppState {
 }
 
 /**
+ * 判断状态是否为“有效且非空”的初始状态：用于决定是否可以安全写回主进程。
+ * 空状态（无 items 且 onboarding 未完成）不应覆盖主进程已有备份。
+ */
+function isEmptyInitialCandidate(state: AppState): boolean {
+  return state.items.length === 0 && !state.onboarding.completed
+}
+
+/**
+ * 在应用启动时协调 localStorage 与主进程 JSON 两份数据：
+ * - 两份数据都有效：选择 updatedAt 较新的版本；
+ * - localStorage 异常/为空、主进程有效：恢复主进程数据；
+ * - 主进程无数据或浏览器预览模式：继续使用 localStorage；
+ * - 协调完成前禁止将空初始状态写回主进程（由调用方在 ready 前阻止 persist）。
+ * 远端读取的数据仍须经过 migrateState 迁移与运行时校验。
+ */
+export async function reconcileState(localState: AppState): Promise<AppState> {
+  if (!window.desktop?.loadState) {
+    // 浏览器预览模式或 preload 未就绪：继续使用 localStorage
+    return localState
+  }
+  let remoteRaw: unknown = null
+  try {
+    remoteRaw = await window.desktop.loadState()
+  } catch (error) {
+    console.warn("Unable to load state from main process", error)
+    return localState
+  }
+  if (!remoteRaw) {
+    // 主进程没有数据：继续使用 localStorage
+    return localState
+  }
+  const remoteState = migrateState(remoteRaw)
+  const localEmpty = isEmptyInitialCandidate(localState)
+  const remoteEmpty = isEmptyInitialCandidate(remoteState)
+
+  // localStorage 异常/为空、主进程有效：优先恢复主进程数据
+  if (localEmpty && !remoteEmpty) {
+    return remoteState
+  }
+  // 主进程为空但 localStorage 有效：继续使用 localStorage
+  if (remoteEmpty && !localEmpty) {
+    return localState
+  }
+  // 两份数据都有效：选择 updatedAt 较新的版本
+  return remoteState.updatedAt > localState.updatedAt ? remoteState : localState
+}
+
+/**
  * 持久化容错：
  * - localStorage.setItem 失败（配额超限 / 被禁用）不再导致应用崩溃；
  * - Electron 主进程返回桌面备份文件是否写入成功；

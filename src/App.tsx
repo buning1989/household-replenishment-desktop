@@ -19,7 +19,7 @@ import {
   updateItemFromDraft
 } from "./domain"
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
-import { loadState, persistState, takePendingLoadIssue, type PersistenceIssue } from "./store"
+import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import type { AppState, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PriceAnchor, Rating, RecentRestock, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 
@@ -116,6 +116,8 @@ function App() {
   const [persistenceIssue, setPersistenceIssue] = useState<PersistenceIssue | null>(() => takePendingLoadIssue())
   const [backupCopyState, setBackupCopyState] = useState<"idle" | "copied" | "failed">("idle")
   const persistenceSequence = useRef(0)
+  // 启动协调完成前禁止将空初始状态写回主进程，避免覆盖桌面备份
+  const [persistenceReady, setPersistenceReady] = useState(false)
   const [editingItem, setEditingItem] = useState<ReplenishmentItem | null | undefined>(undefined)
   const [newItemCategory, setNewItemCategory] = useState<string | undefined>(undefined)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -186,13 +188,27 @@ function App() {
   }), [itemViews, state.categories])
 
   useEffect(() => {
+    // 启动协调完成前禁止将空初始状态写回主进程，避免覆盖桌面备份
+    if (!persistenceReady) return
     const sequence = ++persistenceSequence.current
     void persistState(state).then((issue) => {
       if (sequence !== persistenceSequence.current) return
       setPersistenceIssue((current) => issue ?? (current?.kind === "read" ? current : null))
       if (issue) setBackupCopyState("idle")
     })
-  }, [state])
+  }, [state, persistenceReady])
+
+  // 启动时协调 localStorage 与主进程 JSON 两份数据，选择较新或有效的版本
+  useEffect(() => {
+    let cancelled = false
+    const initial = loadState()
+    void reconcileState(initial).then((reconciled) => {
+      if (cancelled) return
+      setState(reconciled)
+      setPersistenceReady(true)
+    })
+    return () => { cancelled = true }
+  }, [])
 
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 60 * 1000)
@@ -248,8 +264,24 @@ function App() {
 
   // 统一补货入口：所有补货流程都经由 domain.restockItem 完成状态迁移
   // （append history、计算 intervalDays、清除 snoozeUntil、周期学习等均由 domain 负责）
+  // 补货前保存完整物品快照，撤销时完整恢复 history、cycleDays、inventoryDepletionAt、
+  // lastRestockedAt、confidence、snoozeUntil 等状态。
   function performRestock(itemId: string, qty?: number, price?: number, platform?: string, purchaseProductName?: string, purchaseUnit?: string) {
+    const currentItem = state.items.find((item) => item.id === itemId)
+    if (!currentItem) return
+    const snapshot = cloneItem(currentItem)
     updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseProductName, purchaseUnit))
+    // 恢复补货后的可见回执，使用户能立即看到周期建议和撤销入口
+    setRecentRestock({
+      itemId,
+      itemName: currentItem.name,
+      amount: price !== undefined ? String(price) : "",
+      qty: qty !== undefined ? String(qty) : "",
+      platform: platform || "",
+      customPlatform: "",
+      linkDraft: currentItem.link || "",
+      snapshot
+    })
   }
 
   function undoRestock() {
@@ -655,6 +687,7 @@ function App() {
           initialProfile={state.householdProfile}
           onboarding={state.onboarding}
           isRerun={state.onboarding.rerun}
+          existingTemplateIds={state.items.flatMap((item) => item.templateId ? [item.templateId] : [])}
           onProgress={handleOnboardingProgress}
           onSkip={handleOnboardingSkip}
           onComplete={handleOnboardingComplete}
@@ -679,7 +712,11 @@ function App() {
           onCreateCategory={() => setCategoryCreatorOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onRenameCategory={renameCategory}
-          onConfirmDeleteCategory={(name) => deleteCategory(name)}
+          onConfirmDeleteCategory={(name) => {
+            // 走安全删除弹窗，禁止仅凭"确认删除？"直接删除全部内容
+            setActiveCategory(name)
+            setCategoryDialog("delete")
+          }}
         />
         <main className="work-area">
           {activeCategory ? (
@@ -691,7 +728,7 @@ function App() {
                 setIsItemCreatorOpen(true)
               }}
               onRename={() => setCategoryDialog("rename")}
-              onDelete={() => deleteCategory(activeCategory)}
+              onDelete={() => setCategoryDialog("delete")}
               onEdit={editFromDetail}
               onSnooze={handleSnooze}
               onRestock={handleRestock}
@@ -1033,10 +1070,11 @@ function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave,
   const latestRestockEvent = item.history[item.history.length - 1]
   const unit = latestRestockEvent?.purchaseUnit || getDisplayPurchaseUnit(item)
 
-  // 计算当前单价和比价提示
-  const currentPrice = recentRestock.amount ? Number(recentRestock.amount) : 0
-  const currentQty = recentRestock.qty ? Number(recentRestock.qty) : 0
+  // 数量和价格已经在 RestockModal 中填写，回执只读摘要，不再次修改数量，避免周期模型不一致
+  const currentPrice = recentRestock.amount ? Number(recentRestock.amount) : (latestRestockEvent?.price ?? 0)
+  const currentQty = recentRestock.qty ? Number(recentRestock.qty) : (latestRestockEvent?.qty ?? 0)
   const currentUnitPrice = currentPrice > 0 && currentQty > 0 ? currentPrice / currentQty : null
+  const displayPlatform = recentRestock.platform || (recentRestock.platform === "其他" ? recentRestock.customPlatform.trim() : "") || latestRestockEvent?.platform || ""
 
   let priceHint: { text: string; tone: "good" | "bad" | "neutral" } | null = null
   if (currentUnitPrice && priceAnchor.avgUnitPrice) {
@@ -1053,32 +1091,20 @@ function RestockReceiptInline({ recentRestock, item, computed, onUpdate, onSave,
 
   return (
     <div className="restock-inline" role="status">
-      <div className="restock-inline-fields">
-        <div className="restock-inline-field">
+      <div className="restock-inline-summary">
+        <div className="restock-inline-summary-item">
           <span>本次花费</span>
-          <div className="input-prefix receipt-amount">
-            <b>¥</b>
-            <input aria-label="本次补货总金额" type="number" min="0" step="0.01" value={recentRestock.amount} onChange={(event) => onUpdate({ amount: event.target.value })} placeholder="选填" />
-          </div>
-          {currentUnitPrice && <small className="unit-price-hint">单价 ¥{formatPrice(currentUnitPrice)}/{unit}</small>}
+          <strong>{currentPrice > 0 ? `¥${formatPrice(currentPrice)}` : "未填写"}</strong>
         </div>
-        <div className="restock-inline-field">
+        <div className="restock-inline-summary-item">
           <span>购买数量</span>
-          <div className="input-suffix">
-            <input aria-label="购买数量" type="number" min="1" value={recentRestock.qty} onChange={(event) => onUpdate({ qty: event.target.value })} placeholder={item.defaultQty ? String(item.defaultQty) : "选填"} />
-            <b>{unit}</b>
-          </div>
+          <strong>{currentQty > 0 ? `${currentQty} ${unit}` : "未填写"}</strong>
         </div>
-        <div className="restock-inline-field">
+        <div className="restock-inline-summary-item">
           <span>购买平台</span>
-          <select value={recentRestock.platform} onChange={(event) => onUpdate({ platform: event.target.value, customPlatform: "" })}>
-            <option value="">选填</option>
-            {platforms.map((p) => <option key={p} value={p}>{p}</option>)}
-          </select>
-          {recentRestock.platform === "其他" && (
-            <input type="text" value={recentRestock.customPlatform} onChange={(event) => onUpdate({ customPlatform: event.target.value })} placeholder="输入平台名称" />
-          )}
+          <strong>{displayPlatform || "未填写"}</strong>
         </div>
+        {currentUnitPrice && <small className="unit-price-hint">单价 ¥{formatPrice(currentUnitPrice)}/{unit}</small>}
       </div>
       {priceHint && <div className={`price-comparison ${priceHint.tone}`}>{priceHint.text}</div>}
       {item.suggestedCycleDays && (
@@ -2938,6 +2964,14 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
               <button type="button" className="icon-button item-edit-btn-inline" onClick={() => onOpenItemEditor(item.id)} aria-label={`编辑${item.name}`}>
                 <Icon name="edit" size={14} />
               </button>
+              <button
+                type="button"
+                className="text-button item-restock-btn-inline"
+                onClick={() => onRestock(item)}
+                aria-label={`记录${item.name}补货`}
+              >
+                记录补货
+              </button>
               <span className={`status-label ${computed.displayStatus}`}>{computed.statusLabel}</span>
               <button type="button" className="category-item-expand" onClick={() => toggleExpand(item, computed)} aria-label={expandedId === item.id ? `收起${item.name}` : `展开${item.name}`} aria-expanded={expandedId === item.id}>
                 <span className={`category-item-arrow ${expandedId === item.id ? "is-open" : ""}`}><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M6 9l6 6 6-6" /></svg></span>
@@ -3478,12 +3512,12 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, onSelectCategory
               </div>
             )}
 
-            {/* 删除确认模式 - 右侧小弹窗 */}
+            {/* 删除确认模式 - 右侧小弹窗，仅作为进入安全删除弹窗的入口 */}
             {isPendingDelete && (
               <div className="sidebar-item-edit-mode sidebar-delete-confirm">
                 <span className="sidebar-item-name">{category}</span>
                 <div className="sidebar-delete-confirm-popover" onClick={(e) => e.stopPropagation()}>
-                  <span className="sidebar-delete-confirm-text">确认删除？</span>
+                  <span className="sidebar-delete-confirm-text">删除该分类？</span>
                   <button 
                     className="sidebar-delete-confirm-cancel"
                     onMouseDown={(e) => {

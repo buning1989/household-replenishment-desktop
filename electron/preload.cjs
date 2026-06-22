@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer } = require("electron")
 
 contextBridge.exposeInMainWorld("desktop", {
   syncState: (state) => ipcRenderer.invoke("state:sync", state),
+  loadState: () => ipcRenderer.invoke("state:load"),
   openExternal: (url) => ipcRenderer.invoke("external:open", url),
   showWindow: () => ipcRenderer.send("window:show"),
   testNotification: () => ipcRenderer.send("notification:test"),
