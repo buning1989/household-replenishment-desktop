@@ -3053,131 +3053,148 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                 <div className="detail-section">
                   <h4 className="section-title">常购商品</h4>
                   <div className="section-content">
-                    {item.purchaseOptions && item.purchaseOptions.length > 0 ? (
-                      <div className="purchase-options-list">
-                        {(() => {
-                          const options = item.purchaseOptions
-                          const isOptionsExpanded = purchaseOptionsExpanded.has(item.id)
-                          const visibleOptions = isOptionsExpanded ? options : options.slice(0, 5)
-                          const hasMoreOptions = options.length > 5
-                          return (
-                            <>
-                              {visibleOptions.map(option => (
-                                <div key={option.id} className="purchase-option-card">
-                                  <div className="option-info">
-                                    <div className="option-name-row">
-                                      <strong>{option.productName}</strong>
-                                      {option.review && <span className="option-review-pill">{option.review}</span>}
-                                    </div>
-                                    <span className="option-meta">
-                                      {option.platform} · {item.unit || option.unit || '件'}
-                                      {option.price && ` · ¥${option.price}`}
-                                    </span>
-                                  </div>
-                                  <div className="option-actions-wrapper">
-                                    <div className="option-edit-wrapper">
-                                      {/* 编辑按钮 */}
-                                      <button
-                                        className="icon-button edit-option-btn"
-                                        onClick={(e) => {
-                                          e.stopPropagation()
-                                          setShowActionMenu(showActionMenu === option.id ? null : option.id)
-                                        }}
-                                        title="操作"
-                                        aria-label={`管理${option.productName}`}
-                                      >
-                                        <svg
-                                          className="action-icon"
-                                          width="16"
-                                          height="16"
-                                          viewBox="0 0 24 24"
-                                          fill="none"
-                                          stroke="currentColor"
-                                          strokeWidth="2"
-                                          strokeLinecap="round"
-                                          strokeLinejoin="round"
-                                        >
-                                          <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
-                                          <path d="m15 5 4 4" />
-                                        </svg>
-                                      </button>
-
-                                      {/* 操作菜单 */}
-                                      {showActionMenu === option.id && (
-                                        <div className="action-menu">
-                                          <button
-                                            className="action-menu-item"
-                                            onClick={() => {
-                                              onEditPurchaseOption(option)
-                                              setShowActionMenu(null)
-                                            }}
-                                          >
-                                            编辑
-                                          </button>
-                                          <button
-                                            className="action-menu-item danger"
-                                            onClick={() => {
-                                              if (window.confirm('确定要删除这个商品吗？')) {
-                                                onDeletePurchaseOption(item.id, option.id)
-                                              }
-                                              setShowActionMenu(null)
-                                            }}
-                                          >
-                                            删除
-                                          </button>
-                                        </div>
-                                      )}
-                                    </div>
-                                    <button type="button" className="quiet-button purchase-option-restock-btn" onClick={() => onRestockFromOption(item.id, option)}>按此选项补货</button>
-                                  </div>
-                                </div>
-                              ))}
-                              {hasMoreOptions && (
-                                <button
-                                  className="history-toggle-btn"
-                                  onClick={() => {
-                                    setPurchaseOptionsExpanded(prev => {
-                                      const next = new Set(prev)
-                                      if (next.has(item.id)) {
-                                        next.delete(item.id)
-                                      } else {
-                                        next.add(item.id)
-                                      }
-                                      return next
-                                    })
-                                  }}
-                                >
-                                  {isOptionsExpanded ? '收起' : `查看更多 (${options.length - 5})`}
-                                </button>
+                    {(() => {
+                      const options = item.purchaseOptions || []
+                      const isOptionsExpanded = purchaseOptionsExpanded.has(item.id)
+                      const SHELF_LIMIT = 6
+                      const visibleOptions = isOptionsExpanded ? options : options.slice(0, SHELF_LIMIT)
+                      const hasMoreOptions = options.length > SHELF_LIMIT
+                      const handleAddOption = () => {
+                        setAddPurchaseOptionItemId(item.id)
+                        setShowAddPurchaseModal(true)
+                      }
+                      return (
+                        <div className="purchase-shelf-grid">
+                          {visibleOptions.map(option => (
+                            <div
+                              key={option.id}
+                              className={`purchase-shelf-card${option.isDefault ? ' is-default' : ''}`}
+                            >
+                              {/* [默认] badge */}
+                              {option.isDefault && (
+                                <span className="purchase-shelf-badge">默认</span>
                               )}
-                              {/* 添加新选项的按钮 */}
-                              <button 
-                                className="secondary-button add-option-inline-btn"
-                                onClick={() => {
-                                  setAddPurchaseOptionItemId(item.id)
-                                  setShowAddPurchaseModal(true)
-                                }}
+
+                              {/* 编辑图标（左上角，hover 出现） */}
+                              <div className="purchase-shelf-edit-group">
+                                <button
+                                  className="purchase-shelf-edit-btn"
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    setShowActionMenu(showActionMenu === option.id ? null : option.id)
+                                  }}
+                                  title="操作"
+                                  aria-label={`管理${option.productName}`}
+                                >
+                                  <svg
+                                    className="action-icon"
+                                    width="14"
+                                    height="14"
+                                    viewBox="0 0 24 24"
+                                    fill="none"
+                                    stroke="currentColor"
+                                    strokeWidth="2"
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  >
+                                    <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z" />
+                                    <path d="m15 5 4 4" />
+                                  </svg>
+                                </button>
+                                {/* 操作菜单 */}
+                                {showActionMenu === option.id && (
+                                  <div className="action-menu">
+                                    <button
+                                      className="action-menu-item"
+                                      onClick={() => {
+                                        onEditPurchaseOption(option)
+                                        setShowActionMenu(null)
+                                      }}
+                                    >
+                                      编辑
+                                    </button>
+                                    <button
+                                      className="action-menu-item danger"
+                                      onClick={() => {
+                                        if (window.confirm('确定要删除这个商品吗？')) {
+                                          onDeletePurchaseOption(item.id, option.id)
+                                        }
+                                        setShowActionMenu(null)
+                                      }}
+                                    >
+                                      删除
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* 商品名（最多2行截断） */}
+                              <p className="purchase-shelf-name">{option.productName}</p>
+
+                              {/* 平台 tag · 单位 */}
+                              <p className="purchase-shelf-meta">
+                                <span className="purchase-shelf-platform">{option.platform}</span>
+                                · {item.unit || option.unit || '件'}
+                              </p>
+
+                              {/* 价格 */}
+                              {option.price && (
+                                <p className="purchase-shelf-price">
+                                  ¥{option.price} / {item.unit || option.unit || '件'}
+                                </p>
+                              )}
+
+                              {/* 评价 */}
+                              {option.review && (
+                                <p className="purchase-shelf-review">{option.review}</p>
+                              )}
+
+                              {/* spacer */}
+                              <span className="purchase-shelf-spacer" />
+
+                              {/* 悬浮补货按钮 */}
+                              <button
+                                type="button"
+                                className="purchase-shelf-restock-btn"
+                                onClick={() => onRestockFromOption(item.id, option)}
                               >
-                                + 添加商品
+                                按此选项补货
                               </button>
-                            </>
-                          )
-                        })()}
-                      </div>
-                    ) : (
-                      <div className="empty-purchase-options">
-                        <p className="empty-hint">暂无常购商品</p>
-                        <button 
-                          className="primary-button green add-option-btn"
-                          onClick={() => {
-                            setAddPurchaseOptionItemId(item.id)
-                            setShowAddPurchaseModal(true)
-                          }}
-                        >
-                          添加商品
-                        </button>
-                      </div>
-                    )}
+                            </div>
+                          ))}
+
+                          {/* 查看更多 / 收起（跨满3列） */}
+                          {hasMoreOptions && (
+                            <button
+                              className="purchase-shelf-show-more"
+                              onClick={() => {
+                                setPurchaseOptionsExpanded(prev => {
+                                  const next = new Set(prev)
+                                  if (next.has(item.id)) {
+                                    next.delete(item.id)
+                                  } else {
+                                    next.add(item.id)
+                                  }
+                                  return next
+                                })
+                              }}
+                            >
+                              {isOptionsExpanded ? '收起' : `查看更多 (${options.length - SHELF_LIMIT}) ›`}
+                            </button>
+                          )}
+
+                          {/* 添加选项虚线空卡 */}
+                          <button
+                            type="button"
+                            className="purchase-shelf-add-card"
+                            onClick={handleAddOption}
+                          >
+                            <span className="purchase-shelf-add-icon">+</span>
+                            <span>添加商品</span>
+                          </button>
+                        </div>
+                      )
+                    })()}
                   </div>
                 </div>
                 
