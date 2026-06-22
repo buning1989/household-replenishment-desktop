@@ -11,6 +11,11 @@ import {
 import fs from "node:fs"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
+import {
+  evaluateBudgetNotification,
+  getBudgetNotificationState,
+  resetBudgetNotificationState
+} from "./budget-notifier.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
@@ -260,15 +265,8 @@ function getDueItems(state, now = Date.now()) {
   }).sort((a, b) => depletionAt(a) - depletionAt(b))
 }
 
-// 预算提醒状态机：按月份重置，四档阈值（50/75/90/100）各自独立，
-// 达到 90% 后继续达到 100% 仍需触发“预算已用完”提醒。
-// 同一月份、同一阈值不重复通知；预算清空或降到阈值以下后状态复位。
-let lastBudgetNotificationLevel = ""
-let lastBudgetNotificationMonth = ""
-
-function getBudgetMonthKey(now = new Date()) {
-  return `${now.getFullYear()}-${now.getMonth()}`
-}
+// 预算提醒状态机已提取到 ./budget-notifier.mjs
+// 保留 getMonthlySpending 用于计算当月支出
 
 function getMonthlySpending(state) {
   if (!state || !Array.isArray(state.items)) return 0
@@ -289,46 +287,16 @@ function getMonthlySpending(state) {
 }
 
 // 四档阈值各自独立标识，90% 和 100% 使用不同 level，避免 90→100 不触发
-function getBudgetLevel(percent) {
-  if (percent >= 100) return "budget-100"
-  if (percent >= 90) return "budget-90"
-  if (percent >= 75) return "budget-75"
-  if (percent >= 50) return "budget-50"
-  return null
-}
-
-function getBudgetReminderText(percent) {
-  if (percent >= 100) return "本月预算已用完，下个月再买吧"
-  if (percent >= 90) return "本月预算即将用完，谨慎消费"
-  if (percent >= 75) return "本月预算已用四分之三，注意控制开销"
-  if (percent >= 50) return "本月预算已使用一半，继续保持"
-  return ""
-}
+// 已迁移到 ./budget-notifier.mjs
 
 function sendBudgetNotification(percent, spent, budget, settings) {
   if (!Notification.isSupported()) return
-  const level = getBudgetLevel(percent)
-  const monthKey = getBudgetMonthKey()
-  // 月份变化后重置当月提醒状态
-  if (lastBudgetNotificationMonth !== monthKey) {
-    lastBudgetNotificationMonth = monthKey
-    lastBudgetNotificationLevel = ""
-  }
-  // 预算被清空或降到阈值以下后，状态应正确复位
-  if (!level) {
-    lastBudgetNotificationLevel = ""
-    return
-  }
-  // 同一月份、同一阈值不得每分钟重复通知
-  if (level === lastBudgetNotificationLevel) return
-  lastBudgetNotificationLevel = level
-  // 预算通知必须遵守现有勿扰时段
-  if (inQuietHours(new Date(), settings?.quietStart, settings?.quietEnd)) return
-  const title = level === "budget-100" || level === "budget-90" ? "预算提醒" : "预算进度"
-  const body = `${getBudgetReminderText(percent)}（已用 ¥${spent.toFixed(0)} / ¥${budget.toFixed(0)}）`
-  const notification = new Notification({ title, body, closeButtonText: "关闭" })
-  notification.on("click", () => showWindow())
-  notification.show()
+  const now = new Date()
+  evaluateBudgetNotification(percent, spent, budget, settings, now, ({ title, body }) => {
+    const notification = new Notification({ title, body, closeButtonText: "关闭" })
+    notification.on("click", () => showWindow())
+    notification.show()
+  })
 }
 
 function checkBudgetNotification(state) {
@@ -336,7 +304,7 @@ function checkBudgetNotification(state) {
   const budget = Number(state.settings?.monthlyBudget || 0)
   if (budget <= 0) {
     // 预算被清空后状态复位
-    lastBudgetNotificationLevel = ""
+    resetBudgetNotificationState()
     return
   }
   const spent = getMonthlySpending(state)
