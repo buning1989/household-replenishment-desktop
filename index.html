@@ -4,6 +4,16 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f3f1ec" />
+    <!--
+      Content-Security-Policy：纵深防御。
+      - script-src / style-src 允许 'unsafe-inline'：vite-plugin-singlefile 把所有脚本/样式内联进 index.html，
+        构建产物中没有外部脚本可签名，因此必须放开 inline 才能避免白屏。
+        Electron 已开启 contextIsolation: true、nodeIntegration: false，渲染层不暴露 Node API。
+      - img-src 允许 data：常购商品图片仍可能是 base64 data URL。
+      - connect-src 允许 127.0.0.1:5173 / ws：dev 模式下 Vite HMR 需要。
+      - object-src 'none' / base-uri 'self' / form-action 'self'：收紧默认行为。
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:5173 ws://127.0.0.1:5173 data:; object-src 'none'; base-uri 'self'; form-action 'self';" />
 
     <title>403家庭管家</title>
   </head>

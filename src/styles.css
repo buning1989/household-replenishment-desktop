@@ -317,12 +317,24 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
 .sidebar-delete-confirm-popover {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 4px 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius-small);
   background: var(--paper);
   flex-shrink: 0;
+}
+
+.sidebar-delete-confirm-select {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12px;
+  max-width: 140px;
 }
 
 .sidebar-delete-confirm-text {

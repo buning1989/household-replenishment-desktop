@@ -208,3 +208,10 @@ export type RecentRestock = {
 
 export const PLATFORM_OPTIONS = ["拼多多", "淘宝", "京东", "抖音", "1688", "线下", "美团外卖", "其他"]
 export const UNIT_OPTIONS = ["件", "包", "卷", "瓶", "袋", "盒", "支", "kg", "L", "其他"]
+
+// 删除分类时的安全选项：必须显式选择“迁移到其他分类”或“确认删除物品”，
+// 非空分类不允许在两者都没有的情况下直接删除。
+export interface DeleteCategoryOptions {
+  moveToCategory?: string
+  deleteItemsConfirmed?: boolean
+}

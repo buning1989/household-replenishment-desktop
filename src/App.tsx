@@ -22,7 +22,8 @@ import {
 } from "./domain"
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
-import type { AppState, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
+import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
+import type { AppState, DeleteCategoryOptions, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 
 const EMPTY_DRAFT: ItemDraft = {
@@ -368,15 +369,17 @@ function App() {
     setCategoryDialog(null)
   }
 
-  function deleteCategory(category: string, moveTo?: string) {
-    setState((current) => ({
-      ...current,
-      categories: current.categories.filter((name) => name !== category),
-      items: moveTo
-        ? current.items.map((item) => item.category === category ? { ...item, category: moveTo, updatedAt: Date.now() } : item)
-        : current.items.filter((item) => item.category !== category),
-      updatedAt: Date.now()
-    }))
+  function deleteCategory(category: string, options?: DeleteCategoryOptions) {
+    // 安全门：非空分类必须显式选择迁移目标或确认删除物品，避免一个轻量 confirm 误删真实数据。
+    // applyDeleteCategory 在条件不满足时返回 ok:false，state 不会被改动。
+    setState((current) => {
+      const result = applyDeleteCategory(current, category, options)
+      if (!result.ok) {
+        // 拒绝删除：保持原 state，由调用方（Sidebar）的 UI 保证不会走到这里。
+        return current
+      }
+      return result.state
+    })
     setCategoryDialog(null)
     setPendingCategoryDelete(null)
     setActiveCategory(null)
@@ -711,7 +714,7 @@ function App() {
           pendingDelete={pendingCategoryDelete}
           onRequestDeleteCategory={setPendingCategoryDelete}
           onCancelDeleteCategory={() => setPendingCategoryDelete(null)}
-          onConfirmDeleteCategory={(name) => deleteCategory(name)}
+          onConfirmDeleteCategory={(name, options) => deleteCategory(name, options)}
         />
         <main className="work-area">
           {activeCategory ? (
@@ -804,7 +807,6 @@ function App() {
             setCreatingCategory(null)
           }}
           onCreate={(itemData) => {
-            console.log('App onCreate called with:', itemData)
             const newItem = createItem({
               name: itemData.name,
               category: creatingCategory || '其他',
@@ -817,7 +819,6 @@ function App() {
               remainingDays: itemData.inventoryDays === undefined ? '' : String(itemData.inventoryDays),
               learningEnabled: true
             })
-            console.log('Created newItem:', newItem)
             commit({
               ...state,
               items: [...state.items, newItem],
@@ -825,7 +826,6 @@ function App() {
                 ? state.categories
                 : [...state.categories, newItem.category]
             })
-            console.log('State committed, new items count:', state.items.length + 1)
           }}
         />
       )}
@@ -2046,17 +2046,9 @@ function SettingsPanel({ state, onChange, onRestartOnboarding, onClose, isClosin
   }
 
   function getCurrentMonthSpending(): number {
-    const now = new Date()
-    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1).getTime()
-    let total = 0
-    for (const item of state.items) {
-      for (const event of item.history) {
-        if (event.at >= currentMonthStart && event.price) {
-          total += event.price
-        }
-      }
-    }
-    return total
+    // 复用 domain.ts 的 calculateMonthlySpend，避免与主进程预算提醒、domain 计算结果不一致。
+    // 该函数会按 monthStart <= at < nextMonthStart 过滤，不会把未来日期的补货记录算进当前月。
+    return calculateMonthlySpend(state.items)
   }
 
   const currentMonthSpending = getCurrentMonthSpending()
@@ -2274,7 +2266,17 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
   const usesMeasurePricing = Boolean(selectedOption && selectedPricingMode === 'measure')
   const compatibleMeasureUnits = usesMeasurePricing ? getCompatibleMeasureUnits(selectedOption?.measureUnit) : []
   const finalPlatform = platform === '其他' ? platformCustom.trim() : platform
-  const canConfirm = Boolean(selectedOption) && !!qty && Number(qty) >= 1 && price !== '' && Number(price) >= 0 && (!usesMeasurePricing || (!!measureAmount && Number(measureAmount) > 0 && !!measureUnit))
+  const restockTimestamp = parseDateInputValue(restockDate)
+  // canConfirm 不再强制 selectedOption：item 没有 purchaseOptions 时也能直接补货。
+  // 仅 qty / price / restockDate 必填；measure 信息只在选择了按含量计价的常购商品时才要求。
+  const canConfirm = canConfirmRestock({
+    qty,
+    price,
+    restockDateValid: restockTimestamp !== undefined,
+    usesMeasurePricing,
+    measureAmount,
+    measureUnit
+  })
   const currentUnitPrice = selectedOption && price !== '' && qty !== '' && (!usesMeasurePricing || measureAmount !== '')
     ? getRestockUnitPriceInfo(item, selectedOption, {
         id: 'draft',
@@ -2438,11 +2440,10 @@ function RestockModal({ isOpen, onClose, item, onConfirm, onAddPurchaseOption, p
           <button
             className="btn btn-primary"
             onClick={() => {
-              if (canConfirm) {
-                const restockTimestamp = parseDateInputValue(restockDate)
+              if (canConfirm && restockTimestamp !== undefined) {
                 onConfirm(item.id, selectedOption, Number(qty), Number(price) || 0, restockTimestamp, finalPlatform || undefined, selectedPricingMode, selectedMeasureBaseAmount, usesMeasurePricing ? Number(measureAmount) : undefined, usesMeasurePricing ? measureUnit : undefined, review)
               } else {
-                setError(selectedOption ? (usesMeasurePricing ? '请补全数量、含量和价格' : '请补全数量和价格') : '请选择要补货的商品')
+                setError(usesMeasurePricing ? '请补全数量、含量和价格' : '请补全数量和价格')
               }
             }}
             disabled={!canConfirm}
@@ -3905,10 +3906,20 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, pendingDelete, o
   pendingDelete: string | null
   onRequestDeleteCategory: (name: string) => void
   onCancelDeleteCategory: () => void
-  onConfirmDeleteCategory: (name: string) => void
+  onConfirmDeleteCategory: (name: string, options?: DeleteCategoryOptions) => void
 }) {
   const [editingCategory, setEditingCategory] = useState<string | null>(null)
   const [editName, setEditName] = useState("")
+  // 非空分类删除流程的子状态：idle = 选择处理方式；move = 选择迁移目标；delete-items = 二次确认删除物品
+  const [deleteMode, setDeleteMode] = useState<"idle" | "move" | "delete-items">("idle")
+  const [moveTarget, setMoveTarget] = useState<string>("")
+
+  // pendingDelete 变化时重置子状态（取消或切换到其他分类时回到初始）
+  useEffect(() => {
+    setDeleteMode("idle")
+    setMoveTarget("")
+  }, [pendingDelete])
+
   return (
     <nav className="sidebar">
       <button
@@ -4006,26 +4017,86 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, pendingDelete, o
               </div>
             )}
 
-            {/* 删除确认模式 - 两个删除入口共用这一处内联确认 */}
+            {/* 删除确认模式 - 两个删除入口共用这一处内联确认。
+                非空分类必须显式选择迁移目标或勾选删除物品，避免一个轻量 confirm 误删真实数据。 */}
             {isPendingDelete && (
               <div className="sidebar-item-edit-mode sidebar-delete-confirm">
                 <span className="sidebar-item-name">{category}</span>
                 <div className="sidebar-delete-confirm-popover" onClick={(e) => e.stopPropagation()}>
-                  <span className="sidebar-delete-confirm-text">{views.length > 0 ? `删除分类及 ${views.length} 项？` : "删除该分类？"}</span>
-                  <button 
-                    className="sidebar-delete-confirm-cancel"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onCancelDeleteCategory()
-                    }}
-                  >取消</button>
-                  <button 
-                    className="sidebar-delete-confirm-btn"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onConfirmDeleteCategory(category)
-                    }}
-                  >删除</button>
+                  {views.length === 0 ? (
+                    <>
+                      <span className="sidebar-delete-confirm-text">删除该分类？</span>
+                      <button
+                        className="sidebar-delete-confirm-cancel"
+                        onClick={(e) => { e.stopPropagation(); onCancelDeleteCategory() }}
+                      >取消</button>
+                      <button
+                        className="sidebar-delete-confirm-btn"
+                        onClick={(e) => { e.stopPropagation(); onConfirmDeleteCategory(category) }}
+                      >删除</button>
+                    </>
+                  ) : deleteMode === "idle" ? (
+                    <>
+                      <span className="sidebar-delete-confirm-text">该分类下有 {views.length} 个物品</span>
+                      <button
+                        className="sidebar-delete-confirm-cancel"
+                        onClick={(e) => { e.stopPropagation(); onCancelDeleteCategory() }}
+                      >取消</button>
+                      {categorySummaries.some((c) => c.category !== category) && (
+                        <button
+                          className="sidebar-delete-confirm-cancel"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            const others = categorySummaries.filter((c) => c.category !== category).map((c) => c.category)
+                            setMoveTarget(others[0] || "")
+                            setDeleteMode("move")
+                          }}
+                        >迁移到其他分类</button>
+                      )}
+                      <button
+                        className="sidebar-delete-confirm-btn"
+                        onClick={(e) => { e.stopPropagation(); setDeleteMode("delete-items") }}
+                      >同时删除物品</button>
+                    </>
+                  ) : deleteMode === "move" ? (
+                    <>
+                      <span className="sidebar-delete-confirm-text">迁移到</span>
+                      <select
+                        className="sidebar-delete-confirm-select"
+                        value={moveTarget}
+                        onChange={(e) => setMoveTarget(e.target.value)}
+                        aria-label="选择迁移目标分类"
+                      >
+                        {categorySummaries.filter((c) => c.category !== category).map((c) => (
+                          <option key={c.category} value={c.category}>{c.category}</option>
+                        ))}
+                      </select>
+                      <button
+                        className="sidebar-delete-confirm-cancel"
+                        onClick={(e) => { e.stopPropagation(); onCancelDeleteCategory() }}
+                      >取消</button>
+                      <button
+                        className="sidebar-delete-confirm-btn"
+                        disabled={!moveTarget}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          if (moveTarget) onConfirmDeleteCategory(category, { moveToCategory: moveTarget })
+                        }}
+                      >确认迁移并删除</button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="sidebar-delete-confirm-text">将同时删除分类和 {views.length} 个物品，无法恢复</span>
+                      <button
+                        className="sidebar-delete-confirm-cancel"
+                        onClick={(e) => { e.stopPropagation(); onCancelDeleteCategory() }}
+                      >取消</button>
+                      <button
+                        className="sidebar-delete-confirm-btn"
+                        onClick={(e) => { e.stopPropagation(); onConfirmDeleteCategory(category, { deleteItemsConfirmed: true }) }}
+                      >确认删除</button>
+                    </>
+                  )}
                 </div>
               </div>
             )}

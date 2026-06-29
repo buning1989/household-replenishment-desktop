@@ -102,18 +102,20 @@ test("P2: 90% 已通知后达到 100%，仍须单独通知", () => {
 
 test("P2: 月份变化后重置提醒状态", () => {
   resetBudgetNotificationState()
-  
-  const now = new Date()
+
+  // 使用固定的 10:00 避开默认勿扰时段 22:00-08:00，
+  // 否则测试在勿扰时段运行时会因通知不发送而失败。
+  const now = createDateTime(10, 0)
   const { notify, notifications } = createMockNotify()
-  
+
   // 当月发送 50% 通知
   evaluateBudgetNotification(50, 500, 1000, {}, now, notify)
   assert.equal(notifications.length, 1, "当月应发送")
-  
+
   // 模拟下个月
   const nextMonth = new Date(now)
   nextMonth.setMonth(nextMonth.getMonth() + 1)
-  
+
   // 下个月相同档位应重新发送
   evaluateBudgetNotification(50, 500, 1000, {}, nextMonth, notify)
   assert.equal(notifications.length, 2, "月份变化后应重新发送")
