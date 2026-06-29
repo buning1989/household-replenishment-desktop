@@ -59,6 +59,35 @@ function asStringArray(value: unknown): string[] {
   return asArray(value).map(asString).filter((item): item is string => Boolean(item))
 }
 
+function normalizeMeasureUnit(value: unknown): string | undefined {
+  const rawText = asString(value)
+  if (rawText?.startsWith("custom:")) return rawText
+  const text = rawText?.toLowerCase()
+  if (!text) return undefined
+  if (/(kg|公斤|千克)/i.test(text)) return "kg"
+  if (/(^|\d|\s)(g|克)$/i.test(text) || text === "g" || text === "克") return "g"
+  if (/(ml|毫升)/i.test(text)) return "ml"
+  if (/(^|\d|\s)(l|升)$/i.test(text) || text === "l" || text === "升") return "L"
+  if (/(个|只|件|包|袋|瓶|盒|抽)/.test(text)) return text
+  return text
+}
+
+function parseMeasureSnapshot(value: unknown): { amount?: number; unit?: string } {
+  const text = asString(value)
+  if (!text) return {}
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(kg|公斤|千克|g|克|ml|毫升|l|L|升)/i)
+  if (!match) return { unit: normalizeMeasureUnit(text) }
+  const rawUnit = match[2]
+  const unit = /(kg|公斤|千克)/i.test(rawUnit)
+    ? "kg"
+    : /(?:g|克)/i.test(rawUnit)
+      ? "g"
+      : /(?:ml|毫升)/i.test(rawUnit)
+        ? "ml"
+        : "L"
+  return { amount: Number(match[1]), unit }
+}
+
 function migrateInventoryStatuses(value: unknown): Record<string, InventoryStatus> {
   if (!isObject(value)) return {}
   return Object.fromEntries(Object.entries(value).flatMap(([templateId, status]) =>
@@ -69,26 +98,25 @@ function migrateInventoryStatuses(value: unknown): Record<string, InventoryStatu
 }
 
 const DEFAULT_SETTINGS: ReminderSettings = {
-  reminderIntervalMinutes: 60,
+  reminderIntervalHours: 1,
   quietStart: "22:00",
   quietEnd: "08:00",
-  snoozeUntilHour: 8
+  notificationEnabled: true
 }
 
 /** 合并解析后的 settings，缺失字段用默认值兜底；monthlyBudget 仅在正数时保留。 */
 function migrateSettings(raw: unknown): ReminderSettings {
   if (!isObject(raw)) return { ...DEFAULT_SETTINGS }
-  const interval = raw.reminderIntervalMinutes
-  const snoozeRaw = asFiniteNumber(raw.snoozeUntilHour)
-  // snoozeUntilHour 是小时（0-23）：非有限数字回退默认值，否则钳制到 [0, 23]
-  const snoozeUntilHour = snoozeRaw === undefined
-    ? DEFAULT_SETTINGS.snoozeUntilHour
-    : Math.min(23, Math.max(0, Math.round(snoozeRaw)))
+  const intervalHoursRaw = asFiniteNumber(raw.reminderIntervalHours)
+  const legacyIntervalMinutes = asFiniteNumber(raw.reminderIntervalMinutes)
+  const intervalHours = intervalHoursRaw ?? (legacyIntervalMinutes !== undefined ? legacyIntervalMinutes / 60 : undefined)
   return {
-    reminderIntervalMinutes: interval === 30 || interval === 60 ? interval : DEFAULT_SETTINGS.reminderIntervalMinutes,
+    reminderIntervalHours: intervalHours === undefined
+      ? DEFAULT_SETTINGS.reminderIntervalHours
+      : Math.min(24, Math.max(1, Math.round(intervalHours))),
     quietStart: asString(raw.quietStart) ?? DEFAULT_SETTINGS.quietStart,
     quietEnd: asString(raw.quietEnd) ?? DEFAULT_SETTINGS.quietEnd,
-    snoozeUntilHour,
+    notificationEnabled: raw.notificationEnabled !== false,
     monthlyBudget: asFiniteNumber(raw.monthlyBudget) !== undefined && (asFiniteNumber(raw.monthlyBudget) as number) > 0
       ? asFiniteNumber(raw.monthlyBudget)
       : undefined
@@ -99,20 +127,28 @@ function migratePurchaseOption(raw: unknown): PurchaseOption | null {
   if (!isObject(raw)) return null
   const id = asString(raw.id)
   const productName = asString(raw.productName)
-  const platform = asString(raw.platform)
   const unit = asString(raw.unit)
-  // id / productName / platform / unit 为采购选项核心标识，缺失则丢弃该选项避免后续渲染崩溃
-  if (!id || !productName || !platform || !unit) return null
+  // id / productName / unit 为商品卡片核心标识，缺失则丢弃该选项避免后续渲染崩溃
+  if (!id || !productName || !unit) return null
   const price = asFiniteNumber(raw.price)
+  const measureUnit = normalizeMeasureUnit(raw.measureUnit)
+  const pricingMode = raw.pricingMode === "spec" || raw.pricingMode === "measure"
+    ? raw.pricingMode
+    : measureUnit ? "measure" : "spec"
+  const measureBaseAmount = asFiniteNumber(raw.measureBaseAmount)
   return {
     id,
     productName,
-    platform,
     unit,
+    pricingMode,
+    measureUnit: pricingMode === "measure" ? measureUnit : undefined,
+    measureBaseAmount: pricingMode === "measure" && measureBaseAmount !== undefined && measureBaseAmount > 0 ? measureBaseAmount : undefined,
+    platform: asString(raw.platform),
     price: price !== undefined && price > 0 ? price : undefined,
     link: asString(raw.link),
     review: asString(raw.review),
-    isDefault: raw.isDefault === true
+    isDefault: raw.isDefault === true,
+    image: asString(raw.image)
   }
 }
 
@@ -125,6 +161,12 @@ function migrateHistoryEvent(raw: unknown): RestockEvent | null {
   const ratingNum = asFiniteNumber(raw.rating)
   const rating: Rating | undefined = ratingNum === 1 || ratingNum === 2 || ratingNum === 3 ? ratingNum : undefined
   const qty = asFiniteNumber(raw.qty)
+  const measureSnapshot = parseMeasureSnapshot(raw.purchaseMeasureUnit)
+  const measureAmount = asFiniteNumber(raw.purchaseMeasureAmount) ?? measureSnapshot.amount
+  const purchasePricingMode = raw.purchasePricingMode === "spec" || raw.purchasePricingMode === "measure"
+    ? raw.purchasePricingMode
+    : measureAmount !== undefined ? "measure" : "spec"
+  const purchaseMeasureBaseAmount = asFiniteNumber(raw.purchaseMeasureBaseAmount)
   return {
     id: id ?? `event_${at}_${Math.random().toString(36).slice(2, 7)}`,
     at,
@@ -132,8 +174,13 @@ function migrateHistoryEvent(raw: unknown): RestockEvent | null {
     price: asFiniteNumber(raw.price),
     qty: qty !== undefined && qty > 0 ? qty : undefined,
     platform: asString(raw.platform),
+    purchaseOptionId: asString(raw.purchaseOptionId),
     purchaseProductName: asString(raw.purchaseProductName),
     purchaseUnit: asString(raw.purchaseUnit),
+    purchasePricingMode,
+    purchaseMeasureBaseAmount: purchaseMeasureBaseAmount !== undefined && purchaseMeasureBaseAmount > 0 ? purchaseMeasureBaseAmount : undefined,
+    purchaseMeasureAmount: measureAmount !== undefined && measureAmount > 0 ? measureAmount : undefined,
+    purchaseMeasureUnit: measureSnapshot.unit ?? normalizeMeasureUnit(raw.purchaseMeasureUnit),
     rating,
     review: asString(raw.review)
   }
@@ -253,19 +300,12 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
   const purchaseOptions = asArray(raw.purchaseOptions)
     .map(migratePurchaseOption)
     .filter((option): option is PurchaseOption => option !== null)
-  const purchaseOptionsWithReview = purchaseOptions.map((option) => {
-    if (option.review?.trim()) return option
-    const matchingHistoryReview = historyEvents
-      .slice()
-      .reverse()
-      .find((event) => event.review?.trim() && (
-        event.purchaseProductName === option.productName ||
-        (!event.purchaseProductName && purchaseOptions.length === 1)
-      ))
-    return matchingHistoryReview?.review
-      ? { ...option, review: matchingHistoryReview.review }
-      : option
-  })
+  const normalizedPurchaseOptions = purchaseOptions.map((option) => ({
+    ...option,
+    platform: undefined,
+    price: undefined,
+    review: undefined
+  }))
 
   const now = Date.now()
   const createdAt = asFiniteNumber(raw.createdAt) ?? now
@@ -289,7 +329,7 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
     lastRestockedAt,
     inventoryDepletionAt: asFiniteNumber(raw.inventoryDepletionAt),
     anchorEstimated: raw.anchorEstimated !== false,
-    purchaseOptions: purchaseOptionsWithReview,
+    purchaseOptions: normalizedPurchaseOptions,
     history: historyEvents,
     link: asString(raw.link),
     price: asFiniteNumber(raw.price),

@@ -38,6 +38,16 @@ let latestState = null
 let lastNotificationAt = 0
 let lastNotificationKey = ""
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on("second-instance", () => {
+    showWindow()
+  })
+}
+
 function stateFile() {
   return path.join(app.getPath("userData"), "reminder-state.json")
 }
@@ -301,6 +311,7 @@ function sendBudgetNotification(percent, spent, budget, settings) {
 
 function checkBudgetNotification(state) {
   if (!state) return
+  if (state.settings?.notificationEnabled === false) return
   const budget = Number(state.settings?.monthlyBudget || 0)
   if (budget <= 0) {
     // 预算被清空后状态复位
@@ -312,25 +323,21 @@ function checkBudgetNotification(state) {
   sendBudgetNotification(percent, spent, budget, state.settings)
 }
 
-function sendNotification(items, isTest = false) {
+function sendNotification(items) {
   if (!Notification.isSupported()) return
   const item = items[0]
   const urgent = item && calendarDayNumber(Date.now()) >= calendarDayNumber(depletionAt(item))
   const lowConfidence = item?.source === "onboarding" && item?.confidence === "low"
-  const title = isTest
-    ? "提醒功能工作正常"
-    : lowConfidence
-      ? `${item?.name || "物品"}可能快到补货周期了`
+  const title = lowConfidence
+    ? `${item?.name || "物品"}可能快到补货周期了`
     : urgent
       ? `${item?.name || "物品"}预计已用完了`
       : `${item?.name || "物品"}快用完了`
-  const body = isTest
-    ? "通知已开启"
-    : String(item?.category || "家庭用品")
+  const body = String(item?.category || "家庭用品")
   const actions = process.platform === "darwin"
     ? [
         { type: "button", text: "已买好" },
-        { type: "button", text: "明天提醒我" }
+        { type: "button", text: "稍后提醒我" }
       ]
     : []
   const notification = new Notification({
@@ -363,6 +370,7 @@ function checkReminders(force = false) {
   if (!latestState) return
   const now = Date.now()
   const settings = latestState.settings || {}
+  if (settings.notificationEnabled === false) return
   const dueItems = getDueItems(latestState, now)
   if (!dueItems.length) {
     lastNotificationKey = ""
@@ -374,7 +382,8 @@ function checkReminders(force = false) {
   }
 
   const key = dueItems.map((item) => item.id).sort().join(",")
-  const repeatMs = Number(settings.reminderIntervalMinutes || 60) * 60 * 1000
+  const reminderIntervalHours = Math.min(24, Math.max(1, Number(settings.reminderIntervalHours) || 1))
+  const repeatMs = reminderIntervalHours * 60 * 60 * 1000
   const itemSetChanged = key !== lastNotificationKey
   if (!force && !itemSetChanged && now - lastNotificationAt < repeatMs) return
 
@@ -383,23 +392,25 @@ function checkReminders(force = false) {
   lastNotificationAt = now
 }
 
-app.whenReady().then(() => {
-  if (process.platform === "darwin") {
-    const dockIcon = nativeImage.createFromPath(APP_ICON).resize({ width: 128, height: 128 })
-    app.dock.setIcon(dockIcon)
-  }
-  loadState()
-  createWindow()
-  createTray()
-  setInterval(() => {
-    checkReminders(false)
-    checkBudgetNotification(latestState)
-  }, 60 * 1000)
-  setTimeout(() => {
-    checkReminders(false)
-    checkBudgetNotification(latestState)
-  }, 2500)
-})
+if (hasSingleInstanceLock) {
+  app.whenReady().then(() => {
+    if (process.platform === "darwin") {
+      const dockIcon = nativeImage.createFromPath(APP_ICON).resize({ width: 128, height: 128 })
+      app.dock.setIcon(dockIcon)
+    }
+    loadState()
+    createWindow()
+    createTray()
+    setInterval(() => {
+      checkReminders(false)
+      checkBudgetNotification(latestState)
+    }, 60 * 1000)
+    setTimeout(() => {
+      checkReminders(false)
+      checkBudgetNotification(latestState)
+    }, 2500)
+  })
+}
 
 app.on("activate", showWindow)
 app.on("before-quit", () => {
@@ -430,7 +441,6 @@ ipcMain.handle("state:sync", (_event, state) => {
     : { ok: false, error: "数据已保存在当前窗口，但桌面备份文件写入失败。请重试并建议复制当前数据备份。" }
 })
 ipcMain.on("window:show", showWindow)
-ipcMain.on("notification:test", () => sendNotification([], true))
 ipcMain.handle("external:open", async (_event, url) => {
   let target
   try {

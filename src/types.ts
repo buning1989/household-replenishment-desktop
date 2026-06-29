@@ -3,6 +3,7 @@ export type ItemUrgency = "normal" | "warning" | "urgent"
 export type Rating = 1 | 2 | 3
 export type ItemSource = "manual" | "onboarding" | "imported"
 export type ModelConfidence = "low" | "medium" | "high"
+export type PricingMode = "spec" | "measure"
 export type InventoryStatus = "justRestocked" | "plenty" | "half" | "low" | "unknown"
 
 export type ResidentCount = 1 | 2 | 3 | 4
@@ -66,14 +67,20 @@ export type ConsumableTemplate = {
 
 export interface PurchaseOption {
   id: string
-  productName: string  // 具体商品名称（如"维达卫生纸"）
-  platform: string     // 购买平台
-  unit: string         // 计量单位
-  price?: number       // 采购价格
+  productName: string  // 商品名称（如"维达卫生纸"）
+  unit: string         // 规格（如"袋"、"瓶"、"包"）
+  pricingMode?: PricingMode // 计价方式：按规格或按含量
+  measureUnit?: string // 常用计量单位（如"kg"、"L"、"抽"）
+  measureBaseAmount?: number // 计价口径数量（如 100 抽、100 克）
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  platform?: string
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  price?: number
   link?: string        // 商品链接（可选）
-  review?: string      // 对该具体商品的评价
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  review?: string
   isDefault?: boolean  // 是否为默认选项
-  image?: string       // 商品图片（base64）
+  image?: string       // 图片（base64）
 }
 
 export type RestockEvent = {
@@ -83,8 +90,13 @@ export type RestockEvent = {
   price?: number
   qty?: number
   platform?: string
-  purchaseProductName?: string  // 本次补货对应的具体采购商品名称快照
+  purchaseOptionId?: string      // 本次补货对应的商品卡片 id
+  purchaseProductName?: string  // 本次补货对应的商品名称快照
   purchaseUnit?: string         // 本次补货对应的采购单位快照
+  purchasePricingMode?: PricingMode // 本次补货对应的计价方式快照
+  purchaseMeasureBaseAmount?: number // 本次补货对应的计价口径数量快照
+  purchaseMeasureAmount?: number // 单件商品含量数值（如 500）
+  purchaseMeasureUnit?: string  // 单件商品含量单位（如"ml"、"kg"）
   rating?: Rating
   review?: string
 }
@@ -124,10 +136,10 @@ export type ReplenishmentItem = {
 }
 
 export type ReminderSettings = {
-  reminderIntervalMinutes: 30 | 60
+  reminderIntervalHours: number
   quietStart: string
   quietEnd: string
-  snoozeUntilHour: number
+  notificationEnabled: boolean
   monthlyBudget?: number
 }
 
@@ -194,5 +206,5 @@ export type RecentRestock = {
   snapshot: ReplenishmentItem
 }
 
-export const PLATFORM_OPTIONS = ["拼多多", "淘宝", "京东", "抖音", "1688", "线下", "其他"]
+export const PLATFORM_OPTIONS = ["拼多多", "淘宝", "京东", "抖音", "1688", "线下", "美团外卖", "其他"]
 export const UNIT_OPTIONS = ["件", "包", "卷", "瓶", "袋", "盒", "支", "kg", "L", "其他"]

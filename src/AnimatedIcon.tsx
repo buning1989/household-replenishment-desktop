@@ -92,9 +92,9 @@ export function AnimatedIcon({ name, size = 18 }: AnimatedIconProps) {
 
   if (name === "close") {
     return (
-      <motion.svg {...commonProps} {...hoverProps} viewBox="0 0 24 24">
-        <motion.path d="M18 6 6 18" animate={hovered ? { rotate: 15, scale: 1.1 } : { rotate: 0, scale: 1 }} transition={{ duration: 0.2 }} style={{ transformOrigin: "50% 50%" }} />
-        <motion.path d="M6 6l12 12" animate={hovered ? { rotate: -15, scale: 1.1 } : { rotate: 0, scale: 1 }} transition={{ duration: 0.2 }} style={{ transformOrigin: "50% 50%" }} />
+      <motion.svg {...commonProps} viewBox="0 0 24 24">
+        <path d="M18 6 6 18" />
+        <path d="M6 6l12 12" />
       </motion.svg>
     )
   }

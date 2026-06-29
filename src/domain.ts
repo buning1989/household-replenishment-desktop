@@ -1,4 +1,4 @@
-import type { AppState, ConsumptionInfo, ItemComputed, ItemDraft, ItemUrgency, PriceAnchor, ReplenishmentItem } from "./types"
+import type { AppState, ConsumptionInfo, ItemComputed, ItemDraft, ItemUrgency, PriceAnchor, PricingMode, ReplenishmentItem, RestockEvent } from "./types"
 import { createInitialOnboardingState } from "./model/onboarding"
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -100,6 +100,10 @@ export function formatPrice(value: number): string {
   return value.toFixed(2)
 }
 
+export function formatCompactPrice(value: number): string {
+  return value.toFixed(1)
+}
+
 export function calculateMonthlySpend(items: ReplenishmentItem[], now = Date.now()): number {
   const monthStart = new Date(now)
   monthStart.setDate(1)
@@ -116,11 +120,9 @@ export function calculateMonthlySpend(items: ReplenishmentItem[], now = Date.now
   }, 0), 0)
 }
 
-export function nextSnoozeTime(hour: number, now = Date.now()): number {
-  const target = new Date(now)
-  target.setDate(target.getDate() + 1)
-  target.setHours(hour, 0, 0, 0)
-  return target.getTime()
+export function nextSnoozeTime(hours: number, now = Date.now()): number {
+  const safeHours = Math.min(24, Math.max(1, Math.round(Number(hours) || 1)))
+  return now + safeHours * 60 * 60 * 1000
 }
 
 function weightedCycle(intervals: number[], currentCycle: number): number | undefined {
@@ -147,34 +149,59 @@ function safeRestockQty(value: number | undefined): number {
   return Number.isFinite(value) && value! >= 1 ? Math.round(value!) : 1
 }
 
+function normalizeRestockHistory(history: RestockEvent[]): RestockEvent[] {
+  return history
+    .slice()
+    .sort((a, b) => a.at - b.at)
+    .map((event, index, list) => ({
+      ...event,
+      at: startOfDay(event.at),
+      intervalDays: index > 0 ? Math.max(1, differenceInDays(event.at, list[index - 1].at)) : event.intervalDays
+    }))
+}
+
 export function restockItem(
   item: ReplenishmentItem,
   now = Date.now(),
   price?: number,
   qty?: number,
   platform?: string,
+  purchaseOptionId?: string,
   purchaseProductName?: string,
-  purchaseUnit?: string
+  purchaseUnit?: string,
+  purchasePricingMode?: PricingMode,
+  purchaseMeasureBaseAmount?: number,
+  purchaseMeasureAmount?: number,
+  purchaseMeasureUnit?: string,
+  review?: string,
+  restockDate?: number
 ): ReplenishmentItem {
+  const effectiveRestockAt = restockDate !== undefined ? startOfDay(restockDate) : startOfDay(now)
   const actualInterval = item.anchorEstimated
     ? undefined
-    : Math.max(1, differenceInDays(now, item.lastRestockedAt))
+    : Math.max(1, differenceInDays(effectiveRestockAt, item.lastRestockedAt))
 
   const safeQty = safeRestockQty(qty)
 
-  const history = [
+  const history = normalizeRestockHistory([
     ...item.history,
     {
       id: id("restock"),
-      at: now,
+      at: effectiveRestockAt,
       intervalDays: actualInterval,
       price,
       qty: safeQty,
-      platform,
+      platform: platform?.trim() || undefined,
+      purchaseOptionId: purchaseOptionId?.trim() || undefined,
       purchaseProductName: purchaseProductName?.trim() || undefined,
-      purchaseUnit: purchaseUnit?.trim() || undefined
+      purchaseUnit: purchaseUnit?.trim() || undefined,
+      purchasePricingMode,
+      purchaseMeasureBaseAmount: Number.isFinite(purchaseMeasureBaseAmount) && purchaseMeasureBaseAmount! > 0 ? purchaseMeasureBaseAmount : undefined,
+      purchaseMeasureAmount: Number.isFinite(purchaseMeasureAmount) && purchaseMeasureAmount! > 0 ? purchaseMeasureAmount : undefined,
+      purchaseMeasureUnit: purchaseMeasureUnit?.trim() || undefined,
+      review: review?.trim() || undefined
     }
-  ]
+  ])
 
   const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)
   const currentSingleItemCycle = Math.max(1, Math.round(item.cycleDays / previousQty))
@@ -205,10 +232,12 @@ export function restockItem(
     ? history.length >= 2 ? "high" : "medium"
     : item.confidence
 
+  const latestRestock = history[history.length - 1]
+
   return {
     ...item,
     cycleDays: newCycleDays,
-    lastRestockedAt: startOfDay(now),
+    lastRestockedAt: latestRestock?.at ?? effectiveRestockAt,
     inventoryDepletionAt: undefined,
     anchorEstimated: false,
     history,
@@ -221,6 +250,39 @@ export function restockItem(
     modelNote: item.source === "onboarding"
       ? history.length >= 2 ? "已根据多次真实补货记录学习周期" : "已记录首次真实补货，继续观察中"
       : item.modelNote,
+    updatedAt: now
+  }
+}
+
+export function updateRestockRecord(
+  item: ReplenishmentItem,
+  eventId: string,
+  patch: Pick<RestockEvent, "at" | "qty" | "price"> & Partial<Pick<RestockEvent, "platform" | "purchasePricingMode" | "purchaseMeasureBaseAmount" | "purchaseMeasureAmount" | "purchaseMeasureUnit" | "review">>,
+  now = Date.now()
+): ReplenishmentItem {
+  const history = normalizeRestockHistory(item.history.map((event) => event.id === eventId
+    ? {
+        ...event,
+        at: startOfDay(patch.at),
+        qty: safeRestockQty(patch.qty),
+        price: Math.max(0, Number(patch.price) || 0),
+        platform: patch.platform?.trim() || undefined,
+        purchasePricingMode: patch.purchasePricingMode,
+        purchaseMeasureBaseAmount: Number.isFinite(patch.purchaseMeasureBaseAmount) && patch.purchaseMeasureBaseAmount! > 0 ? patch.purchaseMeasureBaseAmount : undefined,
+        purchaseMeasureAmount: Number.isFinite(patch.purchaseMeasureAmount) && patch.purchaseMeasureAmount! > 0 ? patch.purchaseMeasureAmount : undefined,
+        purchaseMeasureUnit: patch.purchaseMeasureUnit?.trim() || undefined,
+        review: patch.review?.trim() || undefined
+      }
+    : event
+  ))
+  const latestRestock = history[history.length - 1]
+
+  return {
+    ...item,
+    history,
+    lastRestockedAt: latestRestock?.at ?? item.lastRestockedAt,
+    price: latestRestock?.price ?? item.price,
+    platform: latestRestock?.platform || item.platform,
     updatedAt: now
   }
 }
@@ -288,7 +350,7 @@ export function updateItemFromDraft(item: ReplenishmentItem, draft: ItemDraft): 
     defaultQty: draft.defaultQty ? Math.max(1, Number(draft.defaultQty)) : undefined,
     purchaseOptions: (draft.purchaseOptions || item.purchaseOptions).map((option) => ({
       ...option,
-      unit: draft.unit.trim() || option.unit || "件"
+      unit: option.unit || draft.unit.trim() || "件"
     })),
     suggestedCycleDays: undefined,
     updatedAt: now
@@ -1440,10 +1502,10 @@ export function createInitialState(): AppState {
     categories: ["卫生间", "厨房", "洗衣清洁", "宠物用品", "日常护理", "饮品零食", "其他用品"],
     items: [],
     settings: {
-      reminderIntervalMinutes: 60,
+      reminderIntervalHours: 1,
       quietStart: "22:00",
       quietEnd: "08:00",
-      snoozeUntilHour: 8
+      notificationEnabled: true
     },
     householdProfile: null,
     onboarding: createInitialOnboardingState(now),
@@ -1469,6 +1531,13 @@ export function calculatePriceAnchor(history: ReplenishmentItem["history"]): Pri
   }
 }
 
+function getConsumptionUnit(item: ReplenishmentItem): string {
+  const latestWithUnit = item.history.slice().reverse().find((event) => event.purchaseUnit?.trim())
+  if (latestWithUnit?.purchaseUnit) return latestWithUnit.purchaseUnit
+  const firstOptionUnit = item.purchaseOptions?.find((option) => option.unit?.trim())?.unit
+  return firstOptionUnit || item.unit || "件"
+}
+
 export function calculateConsumption(item: ReplenishmentItem): ConsumptionInfo {
   const qtyEvents = item.history.filter((e) => Number.isFinite(e.qty) && e.qty! > 0)
   if (!qtyEvents.length || !item.cycleDays) {
@@ -1478,7 +1547,7 @@ export function calculateConsumption(item: ReplenishmentItem): ConsumptionInfo {
   const latest = qtyEvents[qtyEvents.length - 1]
   const dailyUse = latest.qty! / item.cycleDays
 
-  const unit = item.unit || "件"
+  const unit = getConsumptionUnit(item)
   const formatted = dailyUse < 0.1
     ? dailyUse.toFixed(2)
     : dailyUse < 1
@@ -1498,7 +1567,7 @@ export function estimateRemainingQty(item: ReplenishmentItem, now = Date.now()):
   const computed = computeItem(item, now)
   const remainingDays = Math.max(0, computed.daysUntilDepletion)
   const remainingQty = remainingDays * consumption.dailyUse
-  const unit = item.unit || "件"
+  const unit = getConsumptionUnit(item)
 
   return `约 ${Math.round(remainingQty)} ${unit}`
 }
@@ -1510,5 +1579,5 @@ export function getLatestRating(item: ReplenishmentItem): number | null {
 }
 
 export function formatUnitPrice(price: number, unit: string): string {
-  return `¥${formatPrice(price)}/${unit}`
+  return `¥${price.toFixed(1)}/${unit}`
 }

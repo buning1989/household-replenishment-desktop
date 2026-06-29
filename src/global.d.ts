@@ -12,10 +12,24 @@ declare global {
       loadState: () => Promise<AppState | null>
       openExternal: (url: string) => Promise<void>
       showWindow: () => void
-      testNotification: () => void
       onNotificationAction: (callback: (payload: NotificationAction) => void) => () => void
     }
   }
+}
+
+declare module "*.png" {
+  const value: string
+  export default value
+}
+
+declare module "*.jpg" {
+  const value: string
+  export default value
+}
+
+declare module "*.svg" {
+  const value: string
+  export default value
 }
 
 export {}

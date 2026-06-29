@@ -5,7 +5,6 @@ contextBridge.exposeInMainWorld("desktop", {
   loadState: () => ipcRenderer.invoke("state:load"),
   openExternal: (url) => ipcRenderer.invoke("external:open", url),
   showWindow: () => ipcRenderer.send("window:show"),
-  testNotification: () => ipcRenderer.send("notification:test"),
   onNotificationAction: (callback) => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on("notification:action", listener)
