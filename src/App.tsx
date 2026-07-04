@@ -24,7 +24,7 @@ import {
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
 import { answerHouseholdQuickly, askHouseholdAssistant, buildHouseholdChatStarter, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
-import { buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
+import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
 import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, type AgentMessageLink } from "./agent/executor"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
@@ -1159,16 +1159,16 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
   onDraftChange?: (next: AgentDraft) => void
 }) {
   const statusLabel = status === "pending"
-    ? draft.kind === "createItem" ? "待确认创建"
-      : draft.kind === "restock" ? "待确认补货记录"
-        : draft.kind === "createItemWithRestock" ? "待确认创建并记录"
-          : "待确认常购商品"
+    ? draft.kind === "createItem" ? "准备加入管理"
+      : draft.kind === "restock" ? "准备记一笔补货"
+        : draft.kind === "createItemWithRestock" ? "准备加入并记账"
+          : "准备挂为常购商品"
     : status === "confirmed" ? "已写入" : status === "cancelled" ? "已取消" : "已更新为新草稿"
   const confirmLabel = draft.kind === "createItem"
-    ? "确认创建"
-    : draft.kind === "restock" ? "确认记录补货"
-      : draft.kind === "createItemWithRestock" ? "确认创建并记录"
-        : "确认添加常购商品"
+    ? "就这么记"
+    : draft.kind === "restock" ? "就这么记"
+      : draft.kind === "createItemWithRestock" ? "就这么记"
+        : "就这么挂"
 
   function rows(): Array<[string, string]> {
     if (draft.kind === "createItem") {
@@ -1366,7 +1366,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
       {status === "pending" && (
         <>
           <div className="chat-action-card-actions">
-            <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
+            <button type="button" className="quiet-button compact" onClick={onCancel}>先不记</button>
             <button type="button" className="primary-button compact green" onClick={onConfirm}>{confirmLabel}</button>
           </div>
           <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」，也能在上面直接改。</small>
@@ -1506,9 +1506,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   const starter = buildHouseholdChatStarter(itemViews)
 	  const quickQuestions = [
 	    "今天优先补什么？",
-	    "哪些东西可以暂时不用管？",
-	    "最近价格记录有什么异常？",
-	    "帮我添加一个消耗品"
+	    "这周可能要补什么？",
+	    "哪些信息还缺？",
+	    "在京东买了两袋猫粮"
 	  ]
 	  function latestPendingDraftMessageIndex(list: HouseholdChatMessage[]): number {
 	    for (let index = list.length - 1; index >= 0; index -= 1) {
@@ -1518,24 +1518,34 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  }
 
 	  function draftIntro(agentDraft: AgentDraft): string {
-	    if (agentDraft.kind === "createItem") return "我整理成了一个待确认的消耗品草稿。"
-	    if (agentDraft.kind === "restock") return "我整理成了一条待确认的补货记录。"
-	    if (agentDraft.kind === "createItemWithRestock") return "我整理成了一个待确认的创建并补货草稿。"
-	    return "我整理成了一个待确认的常购商品草稿。"
+	    if (agentDraft.kind === "createItem") {
+	      const cycle = agentDraft.cycleDays
+	      return `我准备把「${agentDraft.itemName}」加进来，先按 ${cycle} 天一轮提醒。确认后再写入。`
+	    }
+	    if (agentDraft.kind === "restock") {
+	      return `我准备给「${agentDraft.itemName}」记一笔补货，价格和平台没说也可以先空着。确认后再写入。`
+	    }
+	    if (agentDraft.kind === "createItemWithRestock") {
+	      const qty = agentDraft.restock.qty
+	      const unit = agentDraft.restock.unit || agentDraft.item.unit || "件"
+	      const qtyText = qty ? `${qty}${unit}` : "这一笔"
+	      return `我准备把「${agentDraft.item.itemName}」加进来，也把这次 ${qtyText} 一起记上。确认后再写入。`
+	    }
+	    return `我准备把「${agentDraft.productName}」放到「${agentDraft.itemName}」下面，之后补货可以直接沿用。确认后再写入。`
 	  }
 
 	  function buildPendingDraftReminder(agentDraft: AgentDraft): string {
 	    return [
-	      "还没有真正写入。",
-	      `当前草稿：${describeAgentDraft(agentDraft)}。`,
-	      "下一步：点卡片里的确认按钮，或直接输入「确认记录」。"
+	      "还没真正写入，需要你确认一下。",
+	      `当前准备处理：${describeAgentDraft(agentDraft)}。`,
+	      "你可以点卡片里的「就这么记」，或直接输入「确认吧」。"
 	    ].join("\n")
 	  }
 
 	  function safeQueryFallback(content: string): string {
 	    const text = content.trim()
-	    if (!text) return "我没能整理出可靠回答，请换一句问法。"
-	    if (/已创建|已记录|已更新|已登记|已为您|已帮/.test(text)) return "我没能整理成可确认草稿，请换一句描述。"
+	    if (!text) return "我没能整理出可靠回答，你换一句问法试试。"
+	    if (/已创建|已记录|已更新|已登记|已为您|已帮/.test(text)) return "我没能整理成可确认草稿，你换一句描述试试。"
 	    return text
 	  }
 
@@ -1718,13 +1728,19 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
-	        onMessagesChange([...base, { role: "assistant", content: "好的，我更新了待确认草稿。", agentDraft: revised, draftStatus: "pending" as const }])
+	        onMessagesChange([...base, { role: "assistant", content: "好的，我按你说的改了一下。要是不对再告诉我。", agentDraft: revised, draftStatus: "pending" as const }])
 	      } else {
 	        onMessagesChange([...nextMessages, { role: "assistant", content: buildPendingDraftReminder(pendingDraft) }])
 	      }
 	      return
 	    }
 	    if (intent === "writeDraft") {
+	      // 写入对象不确定时先澄清，避免误创建或误补货到错误物品
+	      const clarification = buildLocalClarification(text, state)
+	      if (clarification) {
+	        onMessagesChange([...nextMessages, { role: "assistant", content: clarification.question, clarification }])
+	        return
+	      }
 	      const localDraft = buildLocalDraftFromText(text, state)
 	      if (localDraft) {
 	        onMessagesChange([...nextMessages, { role: "assistant", content: draftIntro(localDraft), agentDraft: localDraft, draftStatus: "pending" as const }])
@@ -1766,10 +1782,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
-	        onMessagesChange([...base, { role: "assistant", content: draftIntro(parsed.draft), agentDraft: parsed.draft, draftStatus: "pending" as const }])
+	        const intro = parsed.message?.trim() || draftIntro(parsed.draft)
+	        onMessagesChange([...base, { role: "assistant", content: intro, agentDraft: parsed.draft, draftStatus: "pending" as const }])
+	      } else if (parsed.kind === "clarification") {
+	        onMessagesChange([...nextMessages, { role: "assistant", content: parsed.clarification.question, clarification: parsed.clarification }])
 	      } else {
 	        if (intent === "writeDraft" || pendingDraft) {
-	          onMessagesChange([...nextMessages, { role: "assistant", content: pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，请换一句描述。" }])
+	          onMessagesChange([...nextMessages, { role: "assistant", content: pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，你换一句描述试试。" }])
 	        } else {
 	          onMessagesChange([...nextMessages, { role: "assistant", content: parsed.answer }])
 	        }
@@ -1825,6 +1844,24 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	                      onDraftChange={(next) => reviseDraftInPlace(index, next)}
 	                    />
 	                  )}
+                  {message.role === "assistant" && message.clarification && (
+                    <div className="chat-clarification-card">
+                      <div className="chat-clarification-options">
+                        {message.clarification.options.map((option) => (
+                          <button
+                            key={option.label}
+                            type="button"
+                            className="quiet-button compact"
+                            onClick={() => void sendMessage(option.hint || option.label)}
+                            disabled={loading}
+                          >
+                            {option.label}
+                          </button>
+                        ))}
+                      </div>
+                      <small className="chat-action-hint">点上面选项，或者直接打字告诉我。</small>
+                    </div>
+                  )}
                   {message.role === "assistant" && message.agentDraftBatch && message.batchDraftStatuses && (
                     <AgentDraftBatchCard
                       drafts={message.agentDraftBatch}

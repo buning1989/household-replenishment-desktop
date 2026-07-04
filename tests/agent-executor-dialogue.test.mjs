@@ -52,12 +52,14 @@ test("commitAgentDraft: createItem 写入新物品并附带链接", () => {
   assert.ok(result.links.some((link) => link.target.kind === "item"))
 })
 
-test("commitAgentDraft: createItem 重名不重复创建", () => {
+test("commitAgentDraft: 已有同名物品时「帮我加一个洗发水」走 restock 不重复创建", () => {
   const state = makeState({ items: [makeItem("i1", "洗发水", "日常护理")] })
   const draft = buildLocalDraftFromText("帮我加一个洗发水", state)
+  // 库里已存在时本地 parser 应识别为 restock，避免重复创建
+  assert.equal(draft?.kind, "restock")
   const result = commitAgentDraft(state, draft, 1000)
-  assert.equal(result.state.items.length, 1)
-  assert.match(result.summary, /已存在/)
+  assert.equal(result.state.items.length, 1, "不应新增物品")
+  assert.match(result.summary, /已记录|补货/)
 })
 
 test("commitAgentDraft: restock 写入 history 记录", () => {

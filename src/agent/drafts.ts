@@ -60,8 +60,26 @@ export type AgentDraft =
   | CreateItemWithRestockDraft
   | AddPurchaseOptionDraft
 
+export type ClarificationOption = {
+  label: string
+  /** 选中该选项时附带的修订意图；UI 可直接把 label 当作新的用户消息继续走流程。 */
+  hint?: string
+}
+
+/** 模型主动澄清：写入对象不确定（同名、近义、模糊指代）时使用。
+ *  - question：展示给用户的口语化追问
+ *  - options：可点击的选项；UI 应让用户能直接点选，也可自由输入
+ *  - provisional：暂存的草稿对象（不会写入 state），用户选完选项后由本地组装成完整草稿
+ */
+export type AgentClarification = {
+  question: string
+  options: ClarificationOption[]
+  provisional?: AgentDraft
+}
+
 export type AgentResponse =
   | { kind: "draft"; draft: AgentDraft; message?: string }
+  | { kind: "clarification"; clarification: AgentClarification }
   | { kind: "queryAnswer"; answer: string }
 
 const UNIT_PATTERN = "包|瓶|袋|盒|支|卷|件|kg|斤|L|升"
@@ -470,7 +488,30 @@ export function parseItemNameRevision(text: string): { from: string; to: string 
 
 export function buildLocalDraftFromText(text: string, state: AppState): AgentDraft | null {
   const compact = cleanText(text)
-  const hasPurchaseSignal = /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|京东|淘宝|天猫|拼多多/.test(compact)
+
+  // 常购商品优先级最高：把 X 加为某物品的常购商品
+  // 必须在补货信号判断之前，避免「加成卷纸的常购商品」被「加+卷」误吞
+  const addOptionMatch = compact.match(/(?:把|给)?(.+?)的?常购商品/)
+  if (addOptionMatch) {
+    const productName = cleanItemName(addOptionMatch[1])
+    if (productName && productName !== "常购商品") {
+      const match = findItemMatch(state, productName)
+      if (match.item) {
+        return {
+          kind: "addPurchaseOption",
+          itemId: match.item.id,
+          itemName: match.item.name,
+          productName,
+          unit: match.item.unit
+        }
+      }
+    }
+  }
+
+  // 「加一袋猫砂」「加一瓶洗发水」这种「加+量词」也算补货信号，走 restock/createItemWithRestock
+  // 但要排除「加一个」「加个」这种建档信号（无量词）
+  const hasQtyWithAdd = /(?:加|补|买|购入).{0,4}(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)/.test(compact)
+  const hasPurchaseSignal = hasQtyWithAdd || /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|京东|淘宝|天猫|拼多多/.test(compact)
   if (hasPurchaseSignal) {
     const itemName = extractPurchasedName(compact)
     if (!itemName) return null
@@ -518,28 +559,27 @@ export function buildLocalDraftFromText(text: string, state: AppState): AgentDra
     }
   }
 
+  // 「帮我加一个猫砂」等无补货信号时仍可能命中已有物品 → 走 restock（避免重复创建）
   if (/添加|新建|创建|录入|登记|帮我加|加一个|加个|加入清单|以后提醒|帮我管/.test(compact)) {
+    // 如果用户说了具体物品名且库里已存在，且用户没有「以后提醒」「加入清单」等强建档信号，
+    // 则视为补货而非创建
     const name = cleanItemName(compact.replace(/以后提醒|帮我管|加入清单/g, ""))
-    if (!name || name === "一个" || name === "个") return null
-    return createItemDraftFromName(name, state)
-  }
-
-  // 常购商品：把 X 加为某物品的常购商品（X 已存在物品则生成 addPurchaseOption）
-  const addOptionMatch = compact.match(/(?:把|给)?(.+?)的?常购商品/)
-  if (addOptionMatch) {
-    const productName = cleanItemName(addOptionMatch[1])
-    if (productName && productName !== "常购商品") {
-      const match = findItemMatch(state, productName)
-      if (match.item) {
+    if (name && name !== "一个" && name !== "个" && !/以后提醒|加入清单|帮我管/.test(compact)) {
+      const match = findItemMatch(state, name)
+      if (match.item && match.confidence === "exact") {
         return {
-          kind: "addPurchaseOption",
+          kind: "restock",
           itemId: match.item.id,
           itemName: match.item.name,
-          productName,
-          unit: match.item.unit
+          qty: 1,
+          unit: match.item.unit,
+          restockDate: startOfDay(Date.now())
         }
       }
     }
+    const cleanedName = cleanItemName(compact.replace(/以后提醒|帮我管|加入清单/g, ""))
+    if (!cleanedName || cleanedName === "一个" || cleanedName === "个") return null
+    return createItemDraftFromName(cleanedName, state)
   }
 
   return null
@@ -775,6 +815,35 @@ function normalizeDraft(raw: unknown, state?: AppState): AgentDraft | null {
   return null
 }
 
+function normalizeClarification(raw: unknown): AgentClarification | null {
+  if (typeof raw !== "object" || raw === null) return null
+  const record = raw as Record<string, unknown>
+  const question = typeof record.question === "string" ? record.question.trim() : ""
+  if (!question) return null
+  const optionsRaw = Array.isArray(record.options) ? record.options : []
+  const options: ClarificationOption[] = []
+  for (const entry of optionsRaw) {
+    if (typeof entry === "string") {
+      const trimmed = entry.trim()
+      if (trimmed) options.push({ label: trimmed })
+    } else if (typeof entry === "object" && entry !== null) {
+      const label = typeof (entry as Record<string, unknown>).label === "string"
+        ? String((entry as Record<string, unknown>).label).trim()
+        : ""
+      if (label) {
+        const hint = typeof (entry as Record<string, unknown>).hint === "string"
+          ? String((entry as Record<string, unknown>).hint).trim()
+          : undefined
+        options.push({ label, hint })
+      }
+    }
+    if (options.length >= 6) break
+  }
+  if (!options.length) return null
+  const provisional = normalizeDraft(record.provisional, undefined)
+  return { question, options, provisional: provisional || undefined }
+}
+
 export function parseAgentResponse(content: string, state?: AppState): AgentResponse | null {
   const source = content.trim()
   const start = source.indexOf("{")
@@ -784,6 +853,10 @@ export function parseAgentResponse(content: string, state?: AppState): AgentResp
     const parsed = JSON.parse(source.slice(start, end + 1)) as Record<string, unknown>
     if (parsed.kind === "queryAnswer" && typeof parsed.answer === "string") {
       return { kind: "queryAnswer", answer: parsed.answer.trim() }
+    }
+    if (parsed.kind === "clarification") {
+      const clarification = normalizeClarification(parsed.clarification)
+      return clarification ? { kind: "clarification", clarification } : null
     }
     if (parsed.kind === "draft") {
       const draft = normalizeDraft(parsed.draft, state)
@@ -801,4 +874,61 @@ export function describeAgentDraft(draft: AgentDraft): string {
   if (draft.kind === "restock") return `补货记录「${draft.itemName}」`
   if (draft.kind === "createItemWithRestock") return `消耗品「${draft.item.itemName}」和本次补货`
   return `常购商品「${draft.productName}」`
+}
+
+/**
+ * 本地澄清生成器：当 buildLocalDraftFromText 检测到写入对象不确定时，
+ * 返回一个 AgentClarification 让用户选具体物品，而不是直接写入。
+ *
+ * 触发场景：
+ *  1. 已有「猫砂」时用户说「帮我加一个猫砂」→ 不是创建，是补货或改节奏
+ *  2. 已有多个相近物品（猫砂/猫粮/猫罐头）时用户说「猫的那个加一袋」→ 让用户选
+ *
+ * 返回 null 表示本地没识别到需要澄清的场景，应交给模型。
+ */
+export function buildLocalClarification(text: string, state: AppState): AgentClarification | null {
+  const compact = cleanText(text)
+  const hasAddSignal = /加一个|添加一个|新建一个|帮我加|加个|创建一个/.test(compact)
+  if (!hasAddSignal) return null
+
+  // 提取用户提到的物品名（去掉「加一个/帮我加」等动作词）
+  const name = cleanItemName(compact.replace(/帮我加一个|帮我加|加一个|加个|添加一个|新建一个|创建一个|以后提醒|加入清单/g, ""))
+  if (!name || name === "一个" || name === "个") return null
+
+  const match = findItemMatch(state, name)
+  // 场景 1：精确命中已有物品 → 不是创建，问是补货还是改节奏
+  if (match.item && match.confidence === "exact") {
+    return {
+      question: `${match.item.name}已经在管了。你这次是要记一笔补货，还是想改一下提醒节奏？`,
+      options: [
+        { label: `记一笔${match.item.name}补货`, hint: `记一笔${match.item.name}补货` },
+        { label: "改提醒节奏", hint: `把${match.item.name}的周期改一下` },
+        { label: `打开${match.item.name}`, hint: `打开${match.item.name}` }
+      ],
+      provisional: {
+        kind: "restock",
+        itemId: match.item.id,
+        itemName: match.item.name,
+        unit: match.item.unit,
+        restockDate: startOfDay(Date.now())
+      }
+    }
+  }
+  // 场景 2：多个相近物品，且 query 较模糊 → 让用户选具体哪一个
+  if (match.candidates.length > 1 && (match.confidence === "ambiguous" || AMBIGUOUS_SHORT_NAMES.includes(norm(name)) || name.length <= 2)) {
+    const candidateItems = match.candidates
+      .map((candidateName) => state.items.find((item) => item.name === candidateName))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+      .slice(0, 4)
+    if (candidateItems.length > 1) {
+      return {
+        question: `你说的是${candidateItems.map((item) => item.name).join("、")}哪一个？我怕记错，先跟你确认一下。`,
+        options: candidateItems.map((item) => ({
+          label: item.name,
+          hint: `给${item.name}记一笔补货`
+        }))
+      }
+    }
+  }
+  return null
 }
