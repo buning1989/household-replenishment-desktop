@@ -23,7 +23,7 @@ import {
 } from "./domain"
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
-import { answerHouseholdQuickly, askHouseholdAssistant, buildHouseholdChatStarter, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
+import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
 import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
 import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, type AgentMessageLink } from "./agent/executor"
@@ -1520,18 +1520,18 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  function draftIntro(agentDraft: AgentDraft): string {
 	    if (agentDraft.kind === "createItem") {
 	      const cycle = agentDraft.cycleDays
-	      return `我准备把「${agentDraft.itemName}」加进来，先按 ${cycle} 天一轮提醒。确认后再写入。`
+	      return `我先把「${agentDraft.itemName}」加进来，按 ${cycle} 天一轮帮你盯着。你要是没问题，我就先这么记下。`
 	    }
 	    if (agentDraft.kind === "restock") {
-	      return `我准备给「${agentDraft.itemName}」记一笔补货，价格和平台没说也可以先空着。确认后再写入。`
+	      return `「${agentDraft.itemName}」我先按这次补货记上，价格和平台没说也不影响。你要是没问题，我就这么保存。`
 	    }
 	    if (agentDraft.kind === "createItemWithRestock") {
 	      const qty = agentDraft.restock.qty
 	      const unit = agentDraft.restock.unit || agentDraft.item.unit || "件"
 	      const qtyText = qty ? `${qty}${unit}` : "这一笔"
-	      return `我准备把「${agentDraft.item.itemName}」加进来，也把这次 ${qtyText} 一起记上。确认后再写入。`
+	      return `我先把「${agentDraft.item.itemName}」加进来，这次 ${qtyText} 也一起算作起始记录。你要是没问题，我就先这么记下。`
 	    }
-	    return `我准备把「${agentDraft.productName}」放到「${agentDraft.itemName}」下面，之后补货可以直接沿用。确认后再写入。`
+	    return `我先把「${agentDraft.productName}」放到「${agentDraft.itemName}」下面，之后你补货就能直接沿用。没问题我就保存。`
 	  }
 
 	  function buildPendingDraftReminder(agentDraft: AgentDraft): string {
@@ -1747,7 +1747,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        return
 	      }
 	    }
-	    const quickAnswer = pendingDraft || shouldSkipQuickAnswerForAgent(text) ? null : answerHouseholdQuickly(text, state, itemViews)
+	    const dateContext = buildChatDateContext()
+	    const quickAnswer = pendingDraft || shouldSkipQuickAnswerForAgent(text) ? null : answerHouseholdQuickly(text, state, itemViews, dateContext)
 	    if (quickAnswer) {
 	      onMessagesChange([...nextMessages, { role: "assistant", content: quickAnswer }])
 	      return
@@ -1764,7 +1765,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	      state,
 	      itemViews,
 	      messages: nextMessages,
-	      pendingDraft
+	      pendingDraft,
+	      dateContext
 	    })
 	    if (result.ok) {
 	      setLoading(false)

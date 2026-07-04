@@ -134,7 +134,9 @@ test("agent: 下周补货查询按未来 7 天回答，不落到今天优先", (
     }
   }])
 
-  assert.match(answer, /未来 7 天/)
+  assert.match(answer, /接下来 7 天|未来 7 天/)
   assert.match(answer, /洗衣液/)
   assert.doesNotMatch(answer, /今天优先/)
+  // 新增：管家口吻，不应再像报表
+  assert.doesNotMatch(answer, /未来 7 天有 \d+ 项/)
 })

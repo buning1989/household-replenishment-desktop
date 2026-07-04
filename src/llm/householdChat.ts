@@ -1,9 +1,43 @@
-import { calculateConsumption, DEFAULT_CYCLES, estimateRemainingQty, formatDate, formatPrice } from "../domain"
+import { calculateConsumption, DEFAULT_CYCLES, estimateRemainingQty, formatDate, formatPrice, startOfDay } from "../domain"
 import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
 import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus } from "../agent/drafts"
 
 const DEFAULT_CHAT_MODEL = "qwen-plus"
+
+/**
+ * 对话统一日期上下文。所有「今天/昨天/这周/未来 7 天」的判断都以此为准，
+ * 不在 householdChat 内部随意 Date.now()，避免测试和运行不一致。
+ */
+export type ChatDateContext = {
+  now: number
+  todayStart: number
+  /** 形如 2026-07-04 */
+  todayLabel: string
+  /** 形如 2026-07-04 09:30 */
+  timestampLabel: string
+  /** 形如 Asia/Shanghai 或 UTC+8 */
+  timezone: string
+}
+
+/** 用当前时间构造一个 ChatDateContext，用于线上运行。 */
+export function buildChatDateContext(now: number = Date.now()): ChatDateContext {
+  const todayStart = startOfDay(now)
+  const date = new Date(now)
+  const pad = (n: number) => String(n).padStart(2, "0")
+  const todayLabel = `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`
+  const timestampLabel = `${todayLabel} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  const timezone = (() => {
+    try {
+      const offset = -date.getTimezoneOffset() / 60
+      const sign = offset >= 0 ? "+" : "-"
+      return `UTC${sign}${Math.abs(offset)}`
+    } catch {
+      return "local"
+    }
+  })()
+  return { now, todayStart, todayLabel, timestampLabel, timezone }
+}
 
 /** 管家在对话中提议的创建动作；由用户在确认清单里确认后才真正写入。 */
 export type ChatProposedAction =
@@ -43,8 +77,9 @@ function buildHouseholdManagerSystemPrompt(opts: {
   pendingDraft?: AgentDraft
   pendingActions?: ChatProposedAction[]
   repairMissingActionBlock?: boolean
+  dateContext: ChatDateContext
 }): string {
-  const { pendingDraft, pendingActions, repairMissingActionBlock } = opts
+  const { pendingDraft, pendingActions, repairMissingActionBlock, dateContext } = opts
   return [
     "你是「403 家庭管家」里长期负责这个家庭日常消耗品的管家，不是通用 AI 助手，也不是表格录入机器人。",
     "",
@@ -405,10 +440,21 @@ export function shouldRepairMissingActionBlock(content: string): boolean {
   return /创建|新建|添加|登记|录入|确认|清单|方案|更新|已将|已为|已帮|补货记录/.test(text)
 }
 
-export function answerHouseholdQuickly(question: string, state: AppState, itemViews: HouseholdChatItemView[]): string | null {
+export function answerHouseholdQuickly(
+  question: string,
+  state: AppState,
+  itemViews: HouseholdChatItemView[],
+  dateContext: ChatDateContext = buildChatDateContext()
+): string | null {
   const text = question.trim().toLocaleLowerCase("zh-CN")
   // 添加/新建/记一笔意图需要走 agent 草稿流程，不能被本地快捷回答拦截
   if (/添加|新建|创建|录入|登记|帮我加|记一笔|记录一下|买了|下单|购入|入手/.test(text)) return null
+
+  // 身份问题：你是谁 / 你能做什么 —— 用管家口吻短句回答，不展开能力清单
+  if (/你是谁|你是干嘛|你能做什么|你是啥|你是什么|介绍下自己|介绍一下你自己/.test(text)) {
+    return "我是 403 家庭管家，平时就帮你盯着家里的消耗品。你随口说买了什么、快没什么，我先按家里的习惯替你记好，拿不准的时候才问你。"
+  }
+
   const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
   const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
 
@@ -417,60 +463,69 @@ export function answerHouseholdQuickly(question: string, state: AppState, itemVi
     const spend = calculateMonthlySpend(state.items)
     const budget = state.settings.monthlyBudget
     if (!budget || budget <= 0) {
-      return [
-        `本月已记录补货支出 ¥${formatPrice(spend)}，但还没有设置每月预算。`,
-        "下一步：可以在设置里填写每月预算，我再帮你对比剩余额度。"
-      ].join("\n")
+      return `本月已经记了 ¥${formatPrice(spend)} 的补货支出，还没设月预算。要不你在设置里填一个？我下次好帮你盯着别超。`
     }
     const remaining = budget - spend
     const percent = Math.round((spend / budget) * 100)
-    return [
-      remaining >= 0
-        ? `本月预算还剩 ¥${formatPrice(remaining)}。`
-        : `本月预算已超出 ¥${formatPrice(Math.abs(remaining))}。`,
-      `预算：¥${formatPrice(budget)}。`,
-      `已记录支出：¥${formatPrice(spend)}。`,
-      `使用率：${percent}%。`,
-      percent >= 90 ? "下一步：本月尽量先别再补非急需品。" : "下一步：保持当前节奏即可。"
-    ].join("\n")
+    if (remaining >= 0) {
+      const tail = percent >= 90 ? "这月尽量先别再补非急需品了。" : "保持当前节奏就行。"
+      return `本月预算还剩 ¥${formatPrice(remaining)}（已用 ${percent}%）。${tail}`
+    }
+    return `本月预算已经超了 ¥${formatPrice(Math.abs(remaining))}（使用率 ${percent}%）。接下来非急需的可以先放放。`
   }
 
-  // 这周 / 下周 要补什么：按日期分组
+  // 这周 / 下周 要补什么：严格区分 overdue 和 upcoming
   if (/下周|未来一周|未来7天|未来七天|这周|本周|一周内/.test(text)) {
-    const upcoming = itemViews
-      .filter(({ computed }) => computed.daysUntilDue <= 7)
+    const overdue = itemViews
+      .filter(({ computed }) => computed.daysUntilDue <= 0)
       .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
-    if (!upcoming.length) return "未来 7 天没有新的补货提醒，可以先不用处理。"
-    const groups = new Map<string, string[]>()
-    for (const { item, computed } of upcoming) {
-      const key = formatDate(computed.dueAt)
-      const list = groups.get(key) || []
-      const timing = computed.daysUntilDue <= 0 ? "已到提醒点" : `${computed.daysUntilDue} 天后到提醒点`
-      list.push(`${item.name}（${timing}，${computed.remainingText}）`)
-      groups.set(key, list)
+    const upcoming = itemViews
+      .filter(({ computed }) => computed.daysUntilDue > 0 && computed.daysUntilDue <= 7)
+      .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
+
+    if (!overdue.length && !upcoming.length) {
+      return "这周没有新的补货提醒，可以先不用处理。"
     }
-    return [
-      `未来 7 天有 ${upcoming.length} 项需要关注，按提醒日分组：`,
-      ...[...groups.entries()].map(([date, names]) => `${date}：${names.join("、")}`)
-    ].join("\n")
+
+    const lines: string[] = []
+    if (overdue.length) {
+      lines.push(overdue.length === 1
+        ? `先处理已经到点的：${overdue[0].item.name}，${overdue[0].computed.remainingText}。`
+        : `先处理已经到点的 ${overdue.length} 项：${overdue.map(({ item, computed }) => `${item.name}（${computed.remainingText}）`).join("、")}。`
+      )
+    }
+    if (upcoming.length) {
+      const grouped = new Map<string, string[]>()
+      for (const { item, computed } of upcoming) {
+        const key = formatDate(computed.dueAt)
+        const list = grouped.get(key) || []
+        list.push(`${item.name}（${computed.daysUntilDue} 天后到提醒点）`)
+        grouped.set(key, list)
+      }
+      const groupLines = [...grouped.entries()].map(([date, names]) => `${date}：${names.join("、")}`)
+      lines.push(overdue.length
+        ? `接下来 7 天还要留意：${groupLines.join("；")}。`
+        : `接下来 7 天要留意：${groupLines.join("；")}。`
+      )
+    }
+    return lines.join("\n")
   }
 
   // 今天优先买什么：urgent > warning > dueAt，最多 5 项，附原因
   if (/今天|优先|现在|急|补什么|买什么|今天买|优先买/.test(text)) {
-    if (!urgent.length && !warning.length) return "当前没有急需补货或快用完的记录，可以先不用处理。"
+    if (!urgent.length && !warning.length) return "今天没有需要优先处理的，可以先放放。"
     const priority = [...urgent, ...warning].slice(0, 5)
     const lines = priority.map(({ item, computed }, index) => {
       const reason = computed.daysUntilDepletion <= 0
-        ? "预计已用完"
+        ? "预计已经用完"
         : computed.daysUntilDue <= 0
           ? `已到提醒点，${computed.remainingText}`
           : `${computed.daysUntilDue} 天后到提醒点，${computed.remainingText}`
       return `${index + 1}. ${item.name}：${reason}。`
     })
     return [
-      urgent.length ? `今天优先看 ${urgent.length} 项急需补货。` : `今天没有急需补货，另有 ${warning.length} 项快用完。`,
-      ...lines,
-      "下一步：点对应物品补货，或在对话里直接说「在京东买了两袋猫粮」。"
+      urgent.length ? `今天先看 ${urgent.length} 项急需补货。` : `今天没有急需的，另有 ${warning.length} 项快用完。`,
+      ...lines
     ].join("\n")
   }
 
@@ -487,15 +542,14 @@ export function answerHouseholdQuickly(question: string, state: AppState, itemVi
       return !(latest?.review || item.purchaseOptions.some((option) => option.review))
     })
     if (!missingPrice.length && !missingPlatform.length && !missingOption.length && !missingReview.length) {
-      return "当前价格、平台、常购商品、评价记录看起来比较完整。"
+      return "价格、平台、常购商品、评价记录都还齐全，暂时不用补。"
     }
-    return [
-      "当前主要缺这些信息，补全后提醒和价格异常判断会更准。",
-      `缺少价格：${missingPrice.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
-      `缺少平台：${missingPlatform.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
-      `缺少常购商品：${missingOption.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
-      `缺少评价：${missingReview.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`
-    ].join("\n")
+    const groups: string[] = []
+    if (missingPrice.length) groups.push(`价格：${missingPrice.map(({ item }) => item.name).slice(0, 10).join("、")}`)
+    if (missingPlatform.length) groups.push(`平台：${missingPlatform.map(({ item }) => item.name).slice(0, 10).join("、")}`)
+    if (missingOption.length) groups.push(`常购商品：${missingOption.map(({ item }) => item.name).slice(0, 10).join("、")}`)
+    if (missingReview.length) groups.push(`评价：${missingReview.map(({ item }) => item.name).slice(0, 10).join("、")}`)
+    return `有几处信息还缺，补上之后提醒会更准：${groups.join("；")}。不急的话下次补货时顺手补就行。`
   }
 
   // 哪些价格异常：本次单价 vs 历史均价，超过 10% 标记
@@ -511,14 +565,14 @@ export function answerHouseholdQuickly(question: string, state: AppState, itemVi
       const ratio = latestUnit / avgUnit
       if (ratio > 1.1) {
         const pct = Math.round((ratio - 1) * 100)
-        anomalies.push(`${item.name}：本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，贵 ${pct}%。`)
+        anomalies.push(`${item.name}这次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，贵了 ${pct}%`)
       } else if (ratio < 0.9) {
         const pct = Math.round((1 - ratio) * 100)
-        anomalies.push(`${item.name}：本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，便宜 ${pct}%。`)
+        anomalies.push(`${item.name}这次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，便宜了 ${pct}%`)
       }
     }
-    if (!anomalies.length) return "最近几次补货的单价和均价相比没有明显异常。"
-    return ["以下物品本次单价相对历史均价偏离超过 10%。", ...anomalies].join("\n")
+    if (!anomalies.length) return "最近几次补货的单价都还算正常，没明显异常。"
+    return `这几样本次单价和均价偏离超过 10%：${anomalies.join("；")}。`
   }
 
   return null
@@ -541,7 +595,8 @@ export async function askHouseholdAssistant({
   messages,
   pendingActions,
   pendingDraft,
-  repairMissingActionBlock
+  repairMissingActionBlock,
+  dateContext = buildChatDateContext()
 }: {
   apiKey: string
   model?: string
@@ -554,10 +609,19 @@ export async function askHouseholdAssistant({
   pendingDraft?: AgentDraft
   /** 上一轮疑似忘记动作块时，仅重试一次并把协议纠正放进系统提示 */
   repairMissingActionBlock?: boolean
+  /** 对话日期上下文，所有「今天/这周/未来 7 天」判断以此为准 */
+  dateContext?: ChatDateContext
 }): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
   const latestQuestion = [...messages].reverse().find((message) => message.role === "user")?.content || ""
   const systemPrompt = [
-    buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock }),
+    buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock, dateContext }),
+    "",
+    "【当前时间】",
+    `今天是：${dateContext.todayLabel}`,
+    `当前时间：${dateContext.timestampLabel}`,
+    `本地时区：${dateContext.timezone}`,
+    "所有「今天、明天、昨天、这周、下周、未来 7 天」的判断都必须以这个日期为准。",
+    "如果家庭数据里出现早于今天的提醒日期，它表示已经过了提醒点，不要说成未来要发生。",
     "",
     "【当前家庭数据】",
     buildHouseholdContext(state, itemViews, latestQuestion)

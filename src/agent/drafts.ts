@@ -520,7 +520,7 @@ export function buildLocalDraftFromText(text: string, state: AppState): AgentDra
     const platform = parsePlatform(compact)
     const spec = parseSpec(compact)
     const review = parseReview(compact)
-    const restockDate = parseNaturalDate(compact)
+    const restockDate = parseNaturalDate(compact) || startOfDay(Date.now())
     const match = findItemMatch(state, itemName)
     if (match.item) {
       return {
