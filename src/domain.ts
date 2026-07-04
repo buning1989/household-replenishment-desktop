@@ -108,7 +108,16 @@ export function formatCompactPrice(value: number): string {
   return value.toFixed(1)
 }
 
-export function nextSnoozeTime(hours: number, now = Date.now()): number {
+/**
+ * 推迟 N 小时后重新提醒的时间点。
+ *
+ * 语义说明：这里的 hours 是「延后多少小时」的间隔（reminderIntervalHours），
+ * 不是「推迟到几点」的小时点位。reminderIntervalHours 在设置里同时承担两个用途：
+ *   1. main.js 中作为通知重复间隔（同一组待提醒物品在 N 小时内不重复通知）；
+ *   2. 这里作为单次推迟时长（把某个物品的提醒推迟 N 小时）。
+ * 两者共用同一个 N，语义一致。函数返回 now + N 小时的时间戳。
+ */
+export function nextSnoozeTimeAfterHours(hours: number, now = Date.now()): number {
   const safeHours = Math.min(24, Math.max(1, Math.round(Number(hours) || 1)))
   return now + safeHours * 60 * 60 * 1000
 }

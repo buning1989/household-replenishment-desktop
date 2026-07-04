@@ -29,6 +29,11 @@ export type HouseholdChatMessage = {
   /** 新版可确认 agent 草稿；只有本地确认后才写入。 */
   agentDraft?: AgentDraft
   draftStatus?: AgentDraftStatus
+  /** 订单截图导入后的批量待确认草稿；每条独立标记 pending/confirmed/cancelled。批量确认前不写入 state。 */
+  agentDraftBatch?: AgentDraft[]
+  batchDraftStatuses?: AgentDraftStatus[]
+  /** 批量草稿确认后的写入结果摘要与跳转入口 */
+  batchResult?: { summary: string; links: ChatMessageLink[] }
 }
 
 /** 把待确认清单序列化进下一轮上下文，让模型知道自己在修订什么 */
@@ -323,12 +328,13 @@ export function shouldRepairMissingActionBlock(content: string): boolean {
 
 export function answerHouseholdQuickly(question: string, state: AppState, itemViews: HouseholdChatItemView[]): string | null {
   const text = question.trim().toLocaleLowerCase("zh-CN")
-  // 添加/新建意图需要模型输出动作块，不能被本地快捷回答拦截
-  if (/添加|新建|创建|录入|登记|帮我加/.test(text)) return null
+  // 添加/新建/记一笔意图需要走 agent 草稿流程，不能被本地快捷回答拦截
+  if (/添加|新建|创建|录入|登记|帮我加|记一笔|记录一下|买了|下单|购入|入手/.test(text)) return null
   const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
   const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
 
-  if (/预算|还剩|花了|支出|超支/.test(text)) {
+  // 本月预算
+  if (/预算|还剩|花了|支出|超支|本月预算|月预算/.test(text)) {
     const spend = calculateMonthlySpend(state.items)
     const budget = state.settings.monthlyBudget
     if (!budget || budget <= 0) {
@@ -345,50 +351,95 @@ export function answerHouseholdQuickly(question: string, state: AppState, itemVi
         : `本月预算已超出 ¥${formatPrice(Math.abs(remaining))}。`,
       `预算：¥${formatPrice(budget)}。`,
       `已记录支出：¥${formatPrice(spend)}。`,
-      `使用率：${percent}%。`
+      `使用率：${percent}%。`,
+      percent >= 90 ? "下一步：本月尽量先别再补非急需品。" : "下一步：保持当前节奏即可。"
     ].join("\n")
   }
 
+  // 这周 / 下周 要补什么：按日期分组
   if (/下周|未来一周|未来7天|未来七天|这周|本周|一周内/.test(text)) {
     const upcoming = itemViews
       .filter(({ computed }) => computed.daysUntilDue <= 7)
       .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
-      .slice(0, 8)
     if (!upcoming.length) return "未来 7 天没有新的补货提醒，可以先不用处理。"
+    const groups = new Map<string, string[]>()
+    for (const { item, computed } of upcoming) {
+      const key = formatDate(computed.dueAt)
+      const list = groups.get(key) || []
+      const timing = computed.daysUntilDue <= 0 ? "已到提醒点" : `${computed.daysUntilDue} 天后到提醒点`
+      list.push(`${item.name}（${timing}，${computed.remainingText}）`)
+      groups.set(key, list)
+    }
     return [
-      `未来 7 天有 ${upcoming.length} 项需要关注。`,
-      ...upcoming.map(({ item, computed }) => {
-        const timing = computed.daysUntilDue <= 0
-          ? "已到提醒点"
-          : `${computed.daysUntilDue} 天后到提醒点`
-        return `${item.name}：${timing}，${computed.remainingText}。`
-      })
+      `未来 7 天有 ${upcoming.length} 项需要关注，按提醒日分组：`,
+      ...[...groups.entries()].map(([date, names]) => `${date}：${names.join("、")}`)
     ].join("\n")
   }
 
-  if (/今天|优先|现在|急|补什么|买什么|补货/.test(text)) {
+  // 今天优先买什么：urgent > warning > dueAt，最多 5 项，附原因
+  if (/今天|优先|现在|急|补什么|买什么|今天买|优先买/.test(text)) {
     if (!urgent.length && !warning.length) return "当前没有急需补货或快用完的记录，可以先不用处理。"
-    const lines = urgent.slice(0, 6).map(({ item, computed }) => `${item.name}：${computed.remainingText}，建议优先补。`)
-    const warningLines = warning.slice(0, Math.max(0, 6 - lines.length)).map(({ item, computed }) => `${item.name}：${computed.remainingText}，可以顺手关注。`)
+    const priority = [...urgent, ...warning].slice(0, 5)
+    const lines = priority.map(({ item, computed }, index) => {
+      const reason = computed.daysUntilDepletion <= 0
+        ? "预计已用完"
+        : computed.daysUntilDue <= 0
+          ? `已到提醒点，${computed.remainingText}`
+          : `${computed.daysUntilDue} 天后到提醒点，${computed.remainingText}`
+      return `${index + 1}. ${item.name}：${reason}。`
+    })
     return [
       urgent.length ? `今天优先看 ${urgent.length} 项急需补货。` : `今天没有急需补货，另有 ${warning.length} 项快用完。`,
       ...lines,
-      ...warningLines
+      "下一步：点对应物品补货，或在对话里直接说「在京东买了两袋猫粮」。"
     ].join("\n")
   }
 
-  if (/缺|没有|补全|信息/.test(text)) {
+  // 哪些信息缺失：按 价格 / 平台 / 常购商品 / 评价 分组
+  if (/缺|没有|补全|信息|哪些信息|信息缺失/.test(text)) {
     const missingPrice = itemViews.filter(({ item }) => !item.history.some((event) => Number.isFinite(event.price) && event.price! > 0))
     const missingPlatform = itemViews.filter(({ item }) => {
       const latest = latestHistory(item)
       return !(latest?.platform || item.platform || item.purchaseOptions.some((option) => option.platform))
     })
-    if (!missingPrice.length && !missingPlatform.length) return "当前价格和平台记录看起来比较完整。"
+    const missingOption = itemViews.filter(({ item }) => !item.purchaseOptions || item.purchaseOptions.length === 0)
+    const missingReview = itemViews.filter(({ item }) => {
+      const latest = latestHistory(item)
+      return !(latest?.review || item.purchaseOptions.some((option) => option.review))
+    })
+    if (!missingPrice.length && !missingPlatform.length && !missingOption.length && !missingReview.length) {
+      return "当前价格、平台、常购商品、评价记录看起来比较完整。"
+    }
     return [
-      "当前主要缺这些信息。",
+      "当前主要缺这些信息，补全后提醒和价格异常判断会更准。",
       `缺少价格：${missingPrice.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
-      `缺少平台：${missingPlatform.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`
+      `缺少平台：${missingPlatform.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
+      `缺少常购商品：${missingOption.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`,
+      `缺少评价：${missingReview.map(({ item }) => item.name).slice(0, 10).join("、") || "无"}。`
     ].join("\n")
+  }
+
+  // 哪些价格异常：本次单价 vs 历史均价，超过 10% 标记
+  if (/价格异常|异常|均价|偏贵|贵了|涨价/.test(text)) {
+    const anomalies: string[] = []
+    for (const { item } of itemViews) {
+      const priced = item.history.filter((event) => Number.isFinite(event.price) && event.price! > 0 && Number.isFinite(event.qty) && event.qty! > 0)
+      if (priced.length < 2) continue
+      const latest = priced[priced.length - 1]
+      const latestUnit = latest.price! / latest.qty!
+      const avgUnit = priced.reduce((total, event) => total + event.price! / event.qty!, 0) / priced.length
+      if (avgUnit <= 0) continue
+      const ratio = latestUnit / avgUnit
+      if (ratio > 1.1) {
+        const pct = Math.round((ratio - 1) * 100)
+        anomalies.push(`${item.name}：本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，贵 ${pct}%。`)
+      } else if (ratio < 0.9) {
+        const pct = Math.round((1 - ratio) * 100)
+        anomalies.push(`${item.name}：本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，便宜 ${pct}%。`)
+      }
+    }
+    if (!anomalies.length) return "最近几次补货的单价和均价相比没有明显异常。"
+    return ["以下物品本次单价相对历史均价偏离超过 10%。", ...anomalies].join("\n")
   }
 
   return null

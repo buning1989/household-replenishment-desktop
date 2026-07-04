@@ -5106,6 +5106,144 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   text-align: right;
 }
 
+/* 待确认卡片：疑似匹配 / 缺失字段提示 */
+.chat-action-hint-warn {
+  color: var(--faint);
+}
+.chat-action-hint-warn b {
+  color: var(--signal-warning, #b88500);
+}
+
+/* 待确认卡片：内联快速编辑 */
+.chat-action-quickedit {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 6px 8px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--line);
+}
+.chat-edit-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--faint);
+}
+.chat-edit-field input {
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 13px;
+}
+.chat-edit-field input:focus {
+  outline: none;
+  border-color: var(--ink);
+}
+
+/* 批量待确认草稿卡片（订单截图导入后） */
+.chat-batch-card {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.chat-batch-card-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.chat-batch-card-header small {
+  font-size: 12px;
+  color: var(--faint);
+}
+.chat-batch-card-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.chat-batch-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--surface, #fff);
+}
+.chat-batch-row.is-cancelled {
+  opacity: 0.55;
+}
+.chat-batch-row.is-confirmed {
+  border-color: var(--line);
+}
+.chat-batch-row-main {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  min-width: 0;
+  flex: 1;
+}
+.chat-batch-row-index {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  font-size: 11px;
+  color: var(--faint);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.chat-batch-row-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.chat-batch-row-name {
+  font-size: 13px;
+  color: var(--ink);
+  word-break: break-word;
+}
+.chat-batch-row-detail {
+  font-size: 12px;
+  color: var(--faint);
+  word-break: break-word;
+}
+.chat-batch-row-hint {
+  font-size: 11px;
+  color: var(--signal-warning, #b88500);
+}
+.chat-batch-row-aside {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.chat-batch-row-status {
+  font-size: 11px;
+  color: var(--faint);
+}
+.chat-batch-card-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* 创建结果消息里的跳转入口 */
 .chat-message-links {
   display: flex;

@@ -15,7 +15,7 @@ import {
   formatPrice,
   formatUnitPrice,
   getLatestRating,
-  nextSnoozeTime,
+  nextSnoozeTimeAfterHours,
   restockItem,
   startOfDay,
   updateRestockRecord,
@@ -23,10 +23,10 @@ import {
 } from "./domain"
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
-import { answerHouseholdQuickly, askHouseholdAssistant, buildHouseholdChatStarter, type ChatMessageLink, type ChatProposedAction, type HouseholdChatMessage } from "./llm/householdChat"
+import { answerHouseholdQuickly, askHouseholdAssistant, buildHouseholdChatStarter, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
 import { buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
-import { classifyAgentIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
-import { commitAgentDraft, type AgentMessageLink } from "./agent/executor"
+import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
+import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, type AgentMessageLink } from "./agent/executor"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
@@ -350,7 +350,7 @@ function App() {
       if (item) handleRestock(item)
     }
     if (payload.action === "snooze") {
-      const snoozeUntil = nextSnoozeTime(state.settings.reminderIntervalHours)
+      const snoozeUntil = nextSnoozeTimeAfterHours(state.settings.reminderIntervalHours)
       updateItems(payload.itemIds, (item) => ({ ...item, snoozeUntil, updatedAt: Date.now() }))
     }
   }), [state.items, state.settings.reminderIntervalHours])
@@ -393,94 +393,24 @@ function App() {
     updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseOptionId, purchaseProductName, purchaseUnit, purchasePricingMode, purchaseMeasureBaseAmount, purchaseMeasureAmount, purchaseMeasureUnit, review, restockDate))
   }
 
-  // 订单截图批量导入确认：一次 setState 写入全部补货记录，
-  // 必要时新建物品/常购商品，写入路径与补货面板一致（带 purchaseOptionId 快照）
+  // 订单截图批量导入确认：把每一行转成 AgentDraft，推到对话作为待确认批量草稿。
+  // 批量确认前不写入 state；用户在对话中逐条修正或「确认全部」后，由 commitAgentDraftBatch 统一写入。
   function handleOrderImportConfirm(payload: { rows: OrderImportConfirmedRow[] }) {
     const now = Date.now()
-    const actionableRows = payload.rows.filter((row) => row.targetItem !== "__skip__")
+    const actionableRows = payload.rows.filter((row) => row.targetItem !== "__skip__" && row.qty > 0)
     setOrderImportOpen(false)
     if (!actionableRows.length) return
-    type ImportRow = typeof actionableRows[number]
-    setState((current) => {
-      let items = [...current.items]
-      let categories = current.categories
-
-      // 与 RestockModal 相同的写入口径：带 option id/名称/单位/计价方式/含量快照
-      const restockWith = (item: ReplenishmentItem, row: ImportRow, option?: PurchaseOption): ReplenishmentItem =>
-        restockItem(
-          item,
-          now,
-          row.price,
-          row.qty,
-          row.platform,
-          option?.id,
-          option?.productName || row.coreName || row.brandName || row.productName,
-          option?.unit || item.unit,
-          option ? (option.pricingMode || (option.measureUnit ? "measure" : "spec")) : undefined,
-          option?.measureBaseAmount,
-          row.measureAmount,
-          row.measureUnit,
-          row.review,
-          row.restockDate
-        )
-
-      const newOptionFrom = (row: ImportRow, unit: string): PurchaseOption => ({
-        id: crypto.randomUUID(),
-        productName: (row.coreName || row.brandName || row.productName).trim(),
-        unit,
-        pricingMode: "spec"
-      })
-
-      const applyToItem = (itemId: string, row: ImportRow) => {
-        items = items.map((item) => {
-          if (item.id !== itemId) return item
-          const targetCategory = (row.category || item.category || "其他").trim() || "其他"
-          const itemWithCategory = item.category === targetCategory
-            ? item
-            : { ...item, category: targetCategory, updatedAt: now }
-          if (row.targetOption === "__newopt__") {
-            // 顺带建档：把识别出的品牌商品登记为常购商品
-            const option = newOptionFrom(row, itemWithCategory.unit || "件")
-            return restockWith({ ...itemWithCategory, purchaseOptions: [...(itemWithCategory.purchaseOptions || []), option] }, row, option)
-          }
-          const option = (itemWithCategory.purchaseOptions || []).find((candidate) => candidate.id === row.targetOption)
-          return restockWith(itemWithCategory, row, option)
-        })
-      }
-
-      for (const row of actionableRows) {
-        if (row.targetItem === "__create__") {
-          const name = (row.genericName || row.coreName || row.brandName || row.productName).trim()
-          if (!name) continue
-          // 同名物品已存在时直接补货到该物品，避免重复建档
-          const existing = items.find((item) => item.name.trim().toLocaleLowerCase("zh-CN") === name.toLocaleLowerCase("zh-CN"))
-          if (existing) {
-            applyToItem(existing.id, { ...row, targetOption: "__newopt__" })
-            continue
-          }
-          const categoryName = (row.category || "其他").trim() || "其他"
-          const newItem = createItem({
-            name,
-            category: categoryName,
-            cycleDays: 30,
-            bufferDays: 2,
-            link: "",
-            remainingDays: "",
-            learningEnabled: true,
-            unit: "件",
-            defaultQty: "",
-            platform: ""
-          }, now)
-          if (!categories.includes(categoryName)) categories = [...categories, categoryName]
-          const option = newOptionFrom(row, "件")
-          items = [...items, restockWith({ ...newItem, purchaseOptions: [option] }, row, option)]
-        } else {
-          applyToItem(row.targetItem, row)
-        }
-      }
-      return { ...current, categories, items, updatedAt: now }
-    })
-    setRestockToast({ itemName: `${actionableRows.length} 项商品` })
+    const drafts = buildAgentDraftsFromOrderRows(actionableRows, state, now)
+    if (!drafts.length) return
+    const intro = `已从订单截图生成 ${drafts.length} 条待确认草稿。可以在下面逐条修正，或输入「全部确认」一次性写入。`
+    setHouseholdChatMessages((current) => [...current, {
+      role: "assistant",
+      content: intro,
+      agentDraftBatch: drafts,
+      batchDraftStatuses: drafts.map(() => "pending" as const)
+    }])
+    setHouseholdChatOpen(true)
+    setRestockToast({ itemName: `${drafts.length} 条待确认草稿` })
   }
 
   function saveEditedRestockRecord(itemId: string, recordId: string, patch: Pick<RestockEvent, "at" | "qty" | "price"> & Partial<Pick<RestockEvent, "platform" | "purchasePricingMode" | "purchaseMeasureBaseAmount" | "purchaseMeasureAmount" | "purchaseMeasureUnit" | "review">>) {
@@ -489,12 +419,12 @@ function App() {
   }
 
   function handleSnooze(item: ReplenishmentItem) {
-    const snoozeUntil = nextSnoozeTime(state.settings.reminderIntervalHours)
+    const snoozeUntil = nextSnoozeTimeAfterHours(state.settings.reminderIntervalHours)
     updateItems([item.id], (current) => ({ ...current, snoozeUntil, updatedAt: Date.now() }))
   }
 
   function handleColdStartFeedback(item: ReplenishmentItem, feedback: ColdStartFeedback) {
-    const snoozeUntil = feedback === "later" ? nextSnoozeTime(state.settings.reminderIntervalHours) : undefined
+    const snoozeUntil = feedback === "later" ? nextSnoozeTimeAfterHours(state.settings.reminderIntervalHours) : undefined
     updateItems([item.id], (current) => applyColdStartFeedback(current, feedback, Date.now(), snoozeUntil))
   }
 
@@ -534,91 +464,18 @@ function App() {
     setNewItemCategory(undefined)
   }
 
-  // 对话确认清单的写入执行器：一次 setState 批量创建，重名跳过，
-  // addPurchaseOption 可以引用同一批 createItem 刚建出来的物品；返回跳转入口
-  function handleChatActionsConfirm(actions: ChatProposedAction[]): { created: string[]; skipped: string[]; links: ChatMessageLink[] } {
-    const now = Date.now()
-    const created: string[] = []
-    const skipped: string[] = []
-    const links: ChatMessageLink[] = []
-    const linkedItemIds = new Set<string>()
-    const norm = (value: string) => value.trim().toLocaleLowerCase("zh-CN")
-    let categories = [...state.categories]
-    let items = [...state.items]
-
-    const addItemLink = (itemId: string, name: string) => {
-      if (linkedItemIds.has(itemId)) return
-      linkedItemIds.add(itemId)
-      links.push({ label: `查看「${name}」`, target: { kind: "item", itemId } })
-    }
-
-    for (const action of actions) {
-      if (action.type === "createCategory") {
-        const name = action.name.trim()
-        if (categories.some((category) => norm(category) === norm(name))) {
-          skipped.push(`分类「${name}」已存在`)
-        } else {
-          categories = [...categories, name]
-          created.push(`分类「${name}」`)
-          links.push({ label: `打开分类「${name}」`, target: { kind: "category", category: name } })
-        }
-      } else if (action.type === "createItem") {
-        const name = action.name.trim()
-        if (items.some((item) => norm(item.name) === norm(name))) {
-          skipped.push(`消耗品「${name}」已存在`)
-          continue
-        }
-        const category = action.category.trim() || "其他"
-        if (!categories.includes(category)) {
-          categories = [...categories, category]
-          created.push(`分类「${category}」`)
-        }
-        const newItem = createItem({
-          name,
-          category,
-          cycleDays: action.cycleDays,
-          bufferDays: action.bufferDays,
-          link: "",
-          remainingDays: "",
-          learningEnabled: true,
-          unit: action.unit.trim() || "件",
-          defaultQty: "",
-          platform: ""
-        }, now)
-        items = [...items, newItem]
-        created.push(`消耗品「${name}」`)
-        addItemLink(newItem.id, name)
-      } else {
-        const target = items.find((item) => norm(item.name) === norm(action.itemName))
-          || items.find((item) => action.itemName.includes(item.name) || item.name.includes(action.itemName))
-        if (!target) {
-          skipped.push(`找不到消耗品「${action.itemName}」，未添加「${action.productName}」`)
-          continue
-        }
-        if ((target.purchaseOptions || []).some((option) => norm(option.productName) === norm(action.productName))) {
-          skipped.push(`「${target.name}」下已有商品「${action.productName}」`)
-          continue
-        }
-        const option: PurchaseOption = {
-          id: crypto.randomUUID(),
-          productName: action.productName.trim(),
-          unit: action.unit.trim() || target.unit || "件",
-          pricingMode: "spec"
-        }
-        items = items.map((item) => item.id === target.id
-          ? { ...item, purchaseOptions: [...(item.purchaseOptions || []), option], updatedAt: now }
-          : item)
-        created.push(`常购商品「${action.productName}」（${target.name}）`)
-        addItemLink(target.id, target.name)
-      }
-    }
-
-    commit({ ...state, categories, items })
-    return { created, skipped, links: links.slice(0, 3) }
-  }
-
+  // 旧 ChatProposedAction 写入路径已下线：所有写入类意图统一走 AgentDraft → commitAgentDraft。
+  // 旧 <action> / pendingActions 仅在 householdChat.ts 中保留兼容解析，不再作为主流程。
   function handleAgentDraftConfirm(agentDraft: AgentDraft): { summary: string; links: AgentMessageLink[] } {
     const result = commitAgentDraft(state, agentDraft)
+    if (result.state !== state) commit(result.state)
+    return { summary: result.summary, links: result.links }
+  }
+
+  // 批量草稿确认：只写入 status !== "cancelled" 的草稿，复用共享 executor，不允许另写一套。
+  function handleAgentDraftBatchConfirm(drafts: AgentDraft[]): { summary: string; links: AgentMessageLink[] } {
+    if (!drafts.length) return { summary: "没有需要写入的草稿。", links: [] }
+    const result = commitAgentDraftBatch(state, drafts, Date.now())
     if (result.state !== state) commit(result.state)
     return { summary: result.summary, links: result.links }
   }
@@ -1087,6 +944,7 @@ function App() {
 	          onMessagesChange={setHouseholdChatMessages}
 	          onQuestionSent={setHouseholdChatLastQuestion}
 	          onConfirmDraft={handleAgentDraftConfirm}
+          onConfirmBatch={handleAgentDraftBatchConfirm}
           onOpenItem={(itemId) => {
             deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
             setDetailItemId(itemId)
@@ -1292,65 +1150,20 @@ function renderChatAnswer(content: string) {
   )
 }
 
-// 对话创建提案的确认清单：只读展示，修改通过继续对话完成
-function ChatActionCard({ actions, status, onConfirm, onCancel }: {
-  actions: ChatProposedAction[]
-  status: "pending" | "confirmed" | "cancelled" | "superseded"
-  onConfirm: () => void
-  onCancel: () => void
-}) {
-  const statusLabel = status === "pending"
-    ? `将创建 ${actions.length} 项`
-    : status === "confirmed" ? "已创建" : status === "cancelled" ? "已取消" : "已更新为新方案"
-
-  function actionTypeLabel(action: ChatProposedAction): string {
-    if (action.type === "createCategory") return "分类"
-    if (action.type === "createItem") return "消耗品"
-    return "常购商品"
-  }
-
-  function actionSummary(action: ChatProposedAction): string {
-    if (action.type === "createCategory") return action.name
-    if (action.type === "createItem") return `${action.name} · 归入${action.category} · 约 ${action.cycleDays} 天一轮 · 单位 ${action.unit}`
-    return `${action.productName} → ${action.itemName}`
-  }
-
-  return (
-    <div className={`chat-action-card is-${status}`}>
-      <div className="chat-action-card-head">
-        <span>{statusLabel}</span>
-      </div>
-      {actions.map((action, index) => (
-        <p key={index} className="chat-action-summary">
-          <b>{actionTypeLabel(action)}</b>
-          {actionSummary(action)}
-        </p>
-      ))}
-      {status === "pending" && (
-        <>
-          <div className="chat-action-card-actions">
-            <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
-            <button type="button" className="primary-button compact green" onClick={onConfirm}>确认创建</button>
-          </div>
-          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」。</small>
-        </>
-      )}
-    </div>
-  )
-}
-
-function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
+// 旧 ChatActionCard（ChatProposedAction 确认清单）已下线，统一由 AgentDraftCard 承担。
+function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
   draft: AgentDraft
   status: AgentDraftStatus
   onConfirm: () => void
   onCancel: () => void
+  onDraftChange?: (next: AgentDraft) => void
 }) {
   const statusLabel = status === "pending"
     ? draft.kind === "createItem" ? "待确认创建"
       : draft.kind === "restock" ? "待确认补货记录"
         : draft.kind === "createItemWithRestock" ? "待确认创建并记录"
           : "待确认常购商品"
-    : status === "confirmed" ? "已处理" : status === "cancelled" ? "已取消" : "已更新为新草稿"
+    : status === "confirmed" ? "已写入" : status === "cancelled" ? "已取消" : "已更新为新草稿"
   const confirmLabel = draft.kind === "createItem"
     ? "确认创建"
     : draft.kind === "restock" ? "确认记录补货"
@@ -1372,6 +1185,10 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
         ["数量", draft.qty ? `${draft.qty}${draft.unit || ""}` : "未填写"],
         ["金额", draft.price !== undefined ? `¥${formatPrice(draft.price)}` : "未填写"],
         ["平台", draft.platform || "未填写"],
+        ["商品名", draft.purchaseProductName || "未填写"],
+        ["购买日期", draft.restockDate ? formatDate(draft.restockDate) : "未填写"],
+        ["评价", draft.review || "未填写"],
+        ...(draft.purchaseMeasureAmount && draft.purchaseMeasureUnit ? [["规格", `${draft.purchaseMeasureAmount}${draft.purchaseMeasureUnit}`] as [string, string]] : []),
         ...(draft.cycleDaysPatch ? [["周期调整", `${draft.cycleDaysPatch} 天`] as [string, string]] : [])
       ]
     }
@@ -1383,7 +1200,10 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
         ["数量", draft.restock.qty ? `${draft.restock.qty}${draft.restock.unit || draft.item.unit}` : "未填写"],
         ["金额", draft.restock.price !== undefined ? `¥${formatPrice(draft.restock.price)}` : "未填写"],
         ["平台", draft.restock.platform || "未填写"],
-        ["常购商品", draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || "不登记"]
+        ["商品名", draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || "不登记"],
+        ["购买日期", draft.restock.restockDate ? formatDate(draft.restock.restockDate) : "未填写"],
+        ["评价", draft.restock.review || "未填写"],
+        ...(draft.restock.purchaseMeasureAmount && draft.restock.purchaseMeasureUnit ? [["规格", `${draft.restock.purchaseMeasureAmount}${draft.restock.purchaseMeasureUnit}`] as [string, string]] : [])
       ]
     }
     return [
@@ -1392,6 +1212,57 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
       ["单位", draft.unit || "沿用消耗品单位"]
     ]
   }
+
+  function missingFields(): string[] {
+    if (draft.kind === "restock") {
+      const missing: string[] = []
+      if (draft.qty === undefined) missing.push("数量")
+      if (draft.price === undefined) missing.push("金额")
+      if (!draft.platform) missing.push("平台")
+      if (!draft.restockDate) missing.push("日期")
+      return missing
+    }
+    if (draft.kind === "createItemWithRestock") {
+      const missing: string[] = []
+      if (draft.restock.qty === undefined) missing.push("数量")
+      if (draft.restock.price === undefined) missing.push("金额")
+      if (!draft.restock.platform) missing.push("平台")
+      if (!draft.restock.restockDate) missing.push("日期")
+      return missing
+    }
+    return []
+  }
+
+  // 内联快速编辑：只对 pending 状态开放，改完通过 onDraftChange 回传
+  function patchRestock(patch: Partial<typeof draft & object>) {
+    if (!onDraftChange) return
+    if (draft.kind === "restock") onDraftChange({ ...draft, ...patch } as AgentDraft)
+    else if (draft.kind === "createItemWithRestock") onDraftChange({ ...draft, restock: { ...draft.restock, ...patch } } as AgentDraft)
+  }
+  function patchItem(patch: Partial<typeof draft & object>) {
+    if (!onDraftChange) return
+    if (draft.kind === "createItem") onDraftChange({ ...draft, ...patch } as AgentDraft)
+    else if (draft.kind === "createItemWithRestock") onDraftChange({ ...draft, item: { ...draft.item, ...patch } } as AgentDraft)
+  }
+
+  function toDateInput(ts?: number): string {
+    if (!ts) return ""
+    const d = new Date(ts)
+    const m = String(d.getMonth() + 1).padStart(2, "0")
+    const day = String(d.getDate()).padStart(2, "0")
+    return `${d.getFullYear()}-${m}-${day}`
+  }
+  function fromDateInput(value: string): number | undefined {
+    if (!value) return undefined
+    const [y, m, d] = value.split("-").map(Number)
+    if (!y || !m || !d) return undefined
+    const date = new Date(y, m - 1, d)
+    date.setHours(0, 0, 0, 0)
+    return date.getTime()
+  }
+
+  const editable = status === "pending" && onDraftChange
+  const restockFields = draft.kind === "restock" ? draft : draft.kind === "createItemWithRestock" ? draft.restock : null
 
   return (
     <div className={`chat-action-card is-${status}`}>
@@ -1404,26 +1275,223 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
           {value}
         </p>
       ))}
+      {(draft.kind === "restock" || draft.kind === "createItemWithRestock") && (draft.kind === "restock" ? draft.matchHint : draft.restock.matchHint) && (
+        <p className="chat-action-summary chat-action-hint-warn">
+          <b>疑似匹配</b>
+          {(draft.kind === "restock" ? draft.matchHint : draft.restock.matchHint) || ""}
+        </p>
+      )}
+      {missingFields().length > 0 && (
+        <p className="chat-action-summary chat-action-hint-warn">
+          <b>缺失字段</b>
+          {missingFields().join("、")}
+        </p>
+      )}
+      {editable && restockFields && (
+        <div className="chat-action-quickedit">
+          <label className="chat-edit-field">
+            <span>数量</span>
+            <input
+              type="number"
+              min={1}
+              value={restockFields.qty ?? ""}
+              onChange={(e) => patchRestock({ qty: e.target.value ? Number(e.target.value) : undefined })}
+              aria-label="编辑数量"
+            />
+          </label>
+          <label className="chat-edit-field">
+            <span>金额</span>
+            <input
+              type="number"
+              min={0}
+              step="0.01"
+              value={restockFields.price ?? ""}
+              onChange={(e) => patchRestock({ price: e.target.value ? Number(e.target.value) : undefined })}
+              aria-label="编辑金额"
+            />
+          </label>
+          <label className="chat-edit-field">
+            <span>平台</span>
+            <input
+              type="text"
+              value={restockFields.platform ?? ""}
+              onChange={(e) => patchRestock({ platform: e.target.value || undefined })}
+              aria-label="编辑平台"
+            />
+          </label>
+          <label className="chat-edit-field">
+            <span>日期</span>
+            <input
+              type="date"
+              value={toDateInput(restockFields.restockDate)}
+              onChange={(e) => patchRestock({ restockDate: fromDateInput(e.target.value) })}
+              aria-label="编辑购买日期"
+            />
+          </label>
+          <label className="chat-edit-field">
+            <span>评价</span>
+            <input
+              type="text"
+              value={restockFields.review ?? ""}
+              placeholder="好用/不好用/猫不爱吃…"
+              onChange={(e) => patchRestock({ review: e.target.value || undefined })}
+              aria-label="编辑评价"
+            />
+          </label>
+        </div>
+      )}
+      {editable && (draft.kind === "createItem" || draft.kind === "createItemWithRestock") && (
+        <div className="chat-action-quickedit">
+          <label className="chat-edit-field">
+            <span>分类</span>
+            <input
+              type="text"
+              value={draft.kind === "createItem" ? draft.category : draft.item.category}
+              onChange={(e) => patchItem({ category: e.target.value || undefined })}
+              aria-label="编辑分类"
+            />
+          </label>
+          <label className="chat-edit-field">
+            <span>周期</span>
+            <input
+              type="number"
+              min={1}
+              value={draft.kind === "createItem" ? draft.cycleDays : draft.item.cycleDays}
+              onChange={(e) => patchItem({ cycleDays: e.target.value ? Math.max(1, Number(e.target.value)) : undefined })}
+              aria-label="编辑补货周期"
+            />
+          </label>
+        </div>
+      )}
       {status === "pending" && (
         <>
           <div className="chat-action-card-actions">
             <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
             <button type="button" className="primary-button compact green" onClick={onConfirm}>{confirmLabel}</button>
           </div>
-          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」。</small>
+          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」，也能在上面直接改。</small>
         </>
+      )}
+      {status === "confirmed" && (
+        <small className="chat-action-hint">已写入。点上方链接查看。</small>
       )}
     </div>
   )
 }
 
-function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing }: {
+/** 批量待确认草稿卡片：订单截图导入后在对话中展示，支持逐条跳过与全部确认。 */
+function AgentDraftBatchCard({ drafts, statuses, result, onConfirmBatch, onCancelBatch, onSkipIndex, onOpenItem }: {
+  drafts: AgentDraft[]
+  statuses: AgentDraftStatus[]
+  result?: { summary: string; links: ChatMessageLink[] }
+  onConfirmBatch: () => void
+  onCancelBatch: () => void
+  onSkipIndex: (index: number) => void
+  onOpenItem: (itemId: string) => void
+}) {
+  const hasPending = statuses.some((status) => status === "pending")
+  const pendingCount = statuses.filter((status) => status === "pending").length
+  const cancelledCount = statuses.filter((status) => status === "cancelled").length
+
+  function draftLabel(draft: AgentDraft): string {
+    if (draft.kind === "createItem") return draft.itemName
+    if (draft.kind === "restock") return draft.itemName
+    if (draft.kind === "createItemWithRestock") return draft.item.itemName
+    return draft.productName
+  }
+
+  function draftDetail(draft: AgentDraft): string {
+    if (draft.kind === "createItem") return `分类 ${draft.category} · 周期 ${draft.cycleDays} 天`
+    if (draft.kind === "addPurchaseOption") return `常购商品 ${draft.productName}`
+    const parts: string[] = []
+    if (draft.kind === "restock") {
+      if (draft.qty) parts.push(`${draft.qty}${draft.unit || ""}`)
+      if (draft.price !== undefined) parts.push(`¥${draft.price}`)
+      if (draft.platform) parts.push(draft.platform)
+      if (draft.purchaseProductName) parts.push(draft.purchaseProductName)
+      if (draft.restockDate) parts.push(new Date(draft.restockDate).toLocaleDateString("zh-CN"))
+      if (draft.review) parts.push(`评价：${draft.review}`)
+      return parts.join(" · ") || "补货记录"
+    }
+    // createItemWithRestock
+    parts.push(`分类 ${draft.item.category}`)
+    if (draft.restock.qty) parts.push(`${draft.restock.qty}${draft.restock.unit || ""}`)
+    if (draft.restock.price !== undefined) parts.push(`¥${draft.restock.price}`)
+    if (draft.restock.platform) parts.push(draft.restock.platform)
+    if (draft.restock.purchaseProductName) parts.push(draft.restock.purchaseProductName)
+    if (draft.restock.restockDate) parts.push(new Date(draft.restock.restockDate).toLocaleDateString("zh-CN"))
+    return parts.join(" · ")
+  }
+
+  function statusLabel(status: AgentDraftStatus): string {
+    if (status === "pending") return "待确认"
+    if (status === "confirmed") return "已写入"
+    if (status === "cancelled") return "已跳过"
+    return "已替代"
+  }
+
+  return (
+    <div className="chat-batch-card">
+      <div className="chat-batch-card-header">
+        <strong>待确认草稿（{drafts.length} 条）</strong>
+        {hasPending && <small>可逐条跳过，或输入「第二个跳过」「价格改成 59.9」来修正。</small>}
+      </div>
+      <ol className="chat-batch-card-list">
+        {drafts.map((draft, i) => {
+          const status = statuses[i]
+          const itemId = draft.kind === "restock" ? draft.itemId
+            : draft.kind === "addPurchaseOption" ? draft.itemId
+            : undefined
+          return (
+            <li key={i} className={`chat-batch-row is-${status}`}>
+              <div className="chat-batch-row-main">
+                <span className="chat-batch-row-index">{i + 1}</span>
+                <div className="chat-batch-row-text">
+                  <span className="chat-batch-row-name">{draftLabel(draft)}</span>
+                  <span className="chat-batch-row-detail">{draftDetail(draft)}</span>
+                  {draft.kind === "restock" && draft.matchHint && (
+                    <span className="chat-batch-row-hint">{draft.matchHint}</span>
+                  )}
+                </div>
+              </div>
+              <div className="chat-batch-row-aside">
+                <span className="chat-batch-row-status">{statusLabel(status)}</span>
+                {status === "pending" && (
+                  <button type="button" className="quiet-button compact" onClick={() => onSkipIndex(i)}>跳过</button>
+                )}
+                {status === "confirmed" && itemId && (
+                  <button type="button" className="text-button compact" onClick={() => onOpenItem(itemId)}>查看</button>
+                )}
+              </div>
+            </li>
+          )
+        })}
+      </ol>
+      {hasPending && (
+        <div className="chat-batch-card-actions">
+          <button type="button" className="quiet-button compact" onClick={onCancelBatch}>全部取消</button>
+          <button type="button" className="primary-button compact green" onClick={onConfirmBatch}>
+            确认全部（{pendingCount} 条）
+          </button>
+        </div>
+      )}
+      {!hasPending && result && (
+        <small className="chat-action-hint">
+          {cancelledCount > 0 ? `已写入 ${drafts.length - cancelledCount} 条，跳过 ${cancelledCount} 条。` : `已写入 ${drafts.length} 条。`}
+        </small>
+      )}
+    </div>
+  )
+}
+
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing }: {
   state: AppState
   itemViews: ItemView[]
   messages: HouseholdChatMessage[]
   onMessagesChange: (messages: HouseholdChatMessage[]) => void
   onQuestionSent: (question: string) => void
   onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[] }
+  onConfirmBatch: (drafts: AgentDraft[]) => { summary: string; links: AgentMessageLink[] }
   onOpenItem: (itemId: string) => void
   onOpenCategory: (category: string) => void
   onClose: () => void
@@ -1484,10 +1552,119 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  }
 
 	  function cancelAgentDraft(messageIndex: number, baseMessages = messages) {
-	    onMessagesChange(baseMessages.map((message, index) => index === messageIndex
-	      ? { ...message, draftStatus: "cancelled" as const }
-	      : message))
-	  }
+    onMessagesChange(baseMessages.map((message, index) => index === messageIndex
+      ? { ...message, draftStatus: "cancelled" as const }
+      : message))
+  }
+
+  // 卡片内联编辑：直接替换 pending 草稿内容，不新增消息
+  function reviseDraftInPlace(messageIndex: number, next: AgentDraft) {
+    onMessagesChange(messages.map((message, index) => index === messageIndex && message.draftStatus === "pending"
+      ? { ...message, agentDraft: next }
+      : message))
+  }
+
+  // ---------- 批量草稿（订单截图导入）处理 ----------
+
+  function latestPendingBatchMessageIndex(list: HouseholdChatMessage[]): number {
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      const msg = list[index]
+      if (msg.role === "assistant" && msg.agentDraftBatch && msg.batchDraftStatuses &&
+          msg.batchDraftStatuses.some((status) => status === "pending")) {
+        return index
+      }
+    }
+    return -1
+  }
+
+  function patchBatch(messageIndex: number, baseMessages: HouseholdChatMessage[], patch: {
+    statuses?: AgentDraftStatus[]
+    drafts?: AgentDraft[]
+    result?: { summary: string; links: ChatMessageLink[] }
+  }): HouseholdChatMessage[] {
+    return baseMessages.map((message, index) => index === messageIndex
+      ? {
+          ...message,
+          agentDraftBatch: patch.drafts ?? message.agentDraftBatch,
+          batchDraftStatuses: patch.statuses ?? message.batchDraftStatuses,
+          batchResult: patch.result ?? message.batchResult
+        }
+      : message)
+  }
+
+  function confirmBatch(messageIndex: number, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraftBatch) return
+    const draftsToCommit = message.agentDraftBatch.filter((_, i) => message.batchDraftStatuses?.[i] !== "cancelled")
+    if (!draftsToCommit.length) {
+      onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses: message.agentDraftBatch.map(() => "cancelled") }),
+        { role: "assistant", content: "批量草稿已全部取消，没有写入任何内容。" }])
+      return
+    }
+    const result = onConfirmBatch(draftsToCommit)
+    const finalStatuses: AgentDraftStatus[] = message.agentDraftBatch.map((_, i) =>
+      message.batchDraftStatuses?.[i] === "cancelled" ? "cancelled" : "confirmed")
+    onMessagesChange([
+      ...patchBatch(messageIndex, baseMessages, { statuses: finalStatuses, result: { summary: result.summary, links: result.links } }),
+      { role: "assistant", content: result.summary, links: result.links }
+    ])
+  }
+
+  function cancelBatch(messageIndex: number, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraftBatch) return
+    const statuses: AgentDraftStatus[] = message.agentDraftBatch.map(() => "cancelled")
+    onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses }),
+      { role: "assistant", content: "已取消全部待确认草稿，没有写入任何内容。" }])
+  }
+
+  function cancelBatchIndex(messageIndex: number, index: number, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraftBatch || !message.batchDraftStatuses) return
+    if (index < 0 || index >= message.agentDraftBatch.length) return
+    if (message.batchDraftStatuses[index] !== "pending") return
+    const statuses = message.batchDraftStatuses.map((status, i) => i === index ? "cancelled" as const : status)
+    const draft = message.agentDraftBatch[index]
+    const label = draft.kind === "createItem" ? draft.itemName
+      : draft.kind === "addPurchaseOption" ? draft.productName
+      : draft.kind === "restock" ? draft.itemName
+      : draft.item.itemName
+    onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses }),
+      { role: "assistant", content: `已跳过第 ${index + 1} 条「${label}」。` }])
+  }
+
+  function reviseBatchIndex(messageIndex: number, index: number, text: string, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraftBatch || !message.batchDraftStatuses) return
+    if (index < 0 || index >= message.agentDraftBatch.length) return
+    if (message.batchDraftStatuses[index] !== "pending") return
+    const revised = reviseAgentDraft(message.agentDraftBatch[index], text, state)
+    if (!revised) {
+      onMessagesChange([...baseMessages, { role: "assistant", content: `没能从这句话里解析出第 ${index + 1} 条的修订内容，请换一种说法。` }])
+      return
+    }
+    const drafts = message.agentDraftBatch.map((draft, i) => i === index ? revised : draft)
+    onMessagesChange([...patchBatch(messageIndex, baseMessages, { drafts }),
+      { role: "assistant", content: `已更新第 ${index + 1} 条草稿。` }])
+  }
+
+  function reviseBatchAll(messageIndex: number, text: string, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraftBatch || !message.batchDraftStatuses) return
+    let anyRevise = false
+    const drafts = message.agentDraftBatch.map((draft, i) => {
+      if (message.batchDraftStatuses![i] !== "pending") return draft
+      const revised = reviseAgentDraft(draft, text, state)
+      if (revised) { anyRevise = true; return revised }
+      return draft
+    })
+    if (!anyRevise) {
+      onMessagesChange([...baseMessages, { role: "assistant", content: "没能从这句话里解析出修订内容，请换一种说法。" }])
+      return
+    }
+    onMessagesChange([...patchBatch(messageIndex, baseMessages, { drafts }),
+      { role: "assistant", content: "已更新全部待确认草稿。" }])
+  }
 
   useEffect(() => {
     inputRef.current?.focus()
@@ -1505,13 +1682,24 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	      return
 	    }
 	    const nextMessages: HouseholdChatMessage[] = [...messages, { role: "user", content: text }]
-	    onMessagesChange(nextMessages)
-	    onQuestionSent(text)
-	    setDraft("")
-	    setError(null)
-	    const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
-	    const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
-	    const intent = classifyAgentIntent(text, Boolean(pendingDraft))
+    onMessagesChange(nextMessages)
+    onQuestionSent(text)
+    setDraft("")
+    setError(null)
+    // 批量草稿（订单导入）优先于单草稿：有 pending batch 时，「确认/跳过/第N个改XX」都作用于批量
+    const pendingBatchMessageIndex = latestPendingBatchMessageIndex(messages)
+    const pendingBatchMessage = pendingBatchMessageIndex >= 0 ? messages[pendingBatchMessageIndex] : undefined
+    const batchIntent = pendingBatchMessage ? classifyBatchIntent(text) : null
+    if (pendingBatchMessage && batchIntent) {
+      if (batchIntent.intent === "batchConfirm") { confirmBatch(pendingBatchMessageIndex, nextMessages); return }
+      if (batchIntent.intent === "batchCancel") { cancelBatch(pendingBatchMessageIndex, nextMessages); return }
+      if (batchIntent.intent === "batchCancelIndex") { cancelBatchIndex(pendingBatchMessageIndex, batchIntent.index, nextMessages); return }
+      if (batchIntent.intent === "batchReviseIndex") { reviseBatchIndex(pendingBatchMessageIndex, batchIntent.index, text, nextMessages); return }
+      if (batchIntent.intent === "batchReviseAll") { reviseBatchAll(pendingBatchMessageIndex, text, nextMessages); return }
+    }
+    const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
+    const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
+    const intent = classifyAgentIntent(text, Boolean(pendingDraft))
 	    if (pendingDraft && intent === "confirmDraft") {
 	      confirmAgentDraft(pendingMessageIndex, nextMessages)
 	      return
@@ -1634,8 +1822,20 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	                      status={message.draftStatus || "pending"}
 	                      onConfirm={() => confirmAgentDraft(index)}
 	                      onCancel={() => cancelAgentDraft(index)}
+	                      onDraftChange={(next) => reviseDraftInPlace(index, next)}
 	                    />
 	                  )}
+                  {message.role === "assistant" && message.agentDraftBatch && message.batchDraftStatuses && (
+                    <AgentDraftBatchCard
+                      drafts={message.agentDraftBatch}
+                      statuses={message.batchDraftStatuses}
+                      result={message.batchResult}
+                      onConfirmBatch={() => confirmBatch(index, messages)}
+                      onCancelBatch={() => cancelBatch(index, messages)}
+                      onSkipIndex={(batchIndex) => cancelBatchIndex(index, batchIndex, messages)}
+                      onOpenItem={onOpenItem}
+                    />
+                  )}
                   {message.role === "assistant" && message.links && message.links.length > 0 && (
                     <div className="chat-message-links">
                       {message.links.map((link, linkIndex) => (
