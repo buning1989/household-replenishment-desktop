@@ -14,8 +14,10 @@
     "build": "npm run typecheck && vite build",
     "build:landing": "vite build --config vite.landing.config.ts",
     "start": "electron .",
-    "package:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg",
-    "package:win": "npm run build && electron-builder --win"
+    "package:mac": "npm run test && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg",
+    "package:win": "npm run test && npm run build && electron-builder --win --x64",
+    "test": "node --test tests/*.mjs",
+    "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64"
   },
   "dependencies": {
     "motion": "^12.40.0",

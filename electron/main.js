@@ -440,6 +440,170 @@ ipcMain.handle("state:sync", (_event, state) => {
     ? { ok: true }
     : { ok: false, error: "数据已保存在当前窗口，但桌面备份文件写入失败。请重试并建议复制当前数据备份。" }
 })
+// ---- 订单截图识别：代理 DashScope 请求，避免 renderer 侧 CORS 限制 ----
+// 只做转发，不在主进程记录 apiKey / 图片内容。
+const OCR_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+const OCR_TIMEOUT_MS = 90 * 1000
+const LLM_CHAT_TIMEOUT_MS = 45 * 1000
+
+ipcMain.handle("ocr:extract", async (_event, payload) => {
+  const { apiKey, model, imageDataUrl, prompt } = payload || {}
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    return { ok: false, error: "缺少 API Key，请先在设置中填写。" }
+  }
+  if (typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
+    return { ok: false, error: "图片数据无效，请重新选择截图。" }
+  }
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return { ok: false, error: "识别指令无效。" }
+  }
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), OCR_TIMEOUT_MS)
+  const startedAt = Date.now()
+  try {
+    const basePayload = {
+      model: typeof model === "string" && model.trim() ? model.trim() : "qwen3-vl-plus",
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image_url", image_url: { url: imageDataUrl } },
+            { type: "text", text: prompt }
+          ]
+        }
+      ],
+      // 提取任务不需要思维链：关闭思考模式可大幅降低延迟，输出上限防止啰嗦
+      enable_thinking: false,
+      max_tokens: 1280,
+      temperature: 0.1
+    }
+    const doRequest = (payload) => fetch(OCR_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey.trim()}`
+      },
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    })
+    let response = await doRequest(basePayload)
+    // 个别模型不接受 enable_thinking 参数：报参数错误时去掉该字段重试一次
+    if (response.status === 400) {
+      const errText = await response.clone().text().catch(() => "")
+      if (/enable_thinking/i.test(errText)) {
+        const { enable_thinking: _removed, ...fallbackPayload } = basePayload
+        response = await doRequest(fallbackPayload)
+      }
+    }
+    if (!response.ok) {
+      let detail = ""
+      try {
+        const errBody = await response.json()
+        detail = errBody?.error?.message || errBody?.message || ""
+      } catch { /* ignore */ }
+      if (response.status === 401 || response.status === 403) {
+        return { ok: false, error: "API Key 无效或没有权限，请在设置中检查后重试。" }
+      }
+      if (response.status === 429) {
+        return { ok: false, error: "识别服务请求过于频繁，请稍后重试。" }
+      }
+      return { ok: false, error: `识别服务返回错误（${response.status}）${detail ? `：${detail.slice(0, 200)}` : "，请稍后重试。"}` }
+    }
+    const data = await response.json()
+    const message = data?.choices?.[0]?.message
+    const content = message?.content
+    // 计时与 token 用量日志：completion_tokens 异常大（接近 max_tokens）说明思考模式没被关掉
+    const usage = data?.usage || {}
+    const hasReasoning = typeof message?.reasoning_content === "string" && message.reasoning_content.length > 0
+    const elapsedSeconds = ((Date.now() - startedAt) / 1000).toFixed(1)
+    console.log(`[main] ocr:extract elapsed=${elapsedSeconds}s prompt_tokens=${usage.prompt_tokens ?? "?"} completion_tokens=${usage.completion_tokens ?? "?"} reasoning=${hasReasoning}`)
+    if (typeof content !== "string" || !content.trim()) {
+      return {
+        ok: false,
+        error: hasReasoning
+          ? "模型只输出了思考过程没有给出结果，请在设置中确认使用的是非思考型视觉模型。"
+          : "识别服务没有返回内容，请换一张更清晰的截图重试。"
+      }
+    }
+    return { ok: true, content, diagnostics: { elapsedSeconds: Number(elapsedSeconds), promptTokens: usage.prompt_tokens, completionTokens: usage.completion_tokens, hasReasoning } }
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return { ok: false, error: "识别超时（90 秒），请检查网络后重试。" }
+    }
+    console.warn("[main] ocr:extract failed", error?.message)
+    return { ok: false, error: "无法连接识别服务，请检查网络后重试。" }
+  } finally {
+    clearTimeout(timeout)
+  }
+})
+
+ipcMain.handle("llm:chat", async (_event, payload) => {
+  const { apiKey, model, messages } = payload || {}
+  if (typeof apiKey !== "string" || !apiKey.trim()) {
+    return { ok: false, error: "缺少 API Key，请先在设置中填写。" }
+  }
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return { ok: false, error: "对话内容为空，请输入问题后重试。" }
+  }
+
+  const sanitizedMessages = messages
+    .map((message) => ({
+      role: message?.role === "assistant" || message?.role === "system" ? message.role : "user",
+      content: typeof message?.content === "string" ? message.content.slice(0, 12000) : ""
+    }))
+    .filter((message) => message.content.trim())
+
+  if (!sanitizedMessages.length) {
+    return { ok: false, error: "对话内容为空，请输入问题后重试。" }
+  }
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), LLM_CHAT_TIMEOUT_MS)
+  try {
+    const response = await fetch(OCR_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey.trim()}`
+      },
+      body: JSON.stringify({
+        model: typeof model === "string" && model.trim() ? model.trim() : "qwen-plus",
+        messages: sanitizedMessages,
+        temperature: 0.2
+      }),
+      signal: controller.signal
+    })
+    if (!response.ok) {
+      let detail = ""
+      try {
+        const errBody = await response.json()
+        detail = errBody?.error?.message || errBody?.message || ""
+      } catch { /* ignore */ }
+      if (response.status === 401 || response.status === 403) {
+        return { ok: false, error: "API Key 无效或没有权限，请在设置中检查后重试。" }
+      }
+      if (response.status === 429) {
+        return { ok: false, error: "对话服务请求过于频繁，请稍后重试。" }
+      }
+      return { ok: false, error: `对话服务返回错误（${response.status}）${detail ? `：${detail.slice(0, 200)}` : "，请稍后重试。"}` }
+    }
+    const data = await response.json()
+    const content = data?.choices?.[0]?.message?.content
+    if (typeof content !== "string" || !content.trim()) {
+      return { ok: false, error: "对话服务没有返回内容，请换个问法重试。" }
+    }
+    return { ok: true, content }
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      return { ok: false, error: "对话超时（45 秒），请检查网络后重试。" }
+    }
+    console.warn("[main] llm:chat failed", error?.message)
+    return { ok: false, error: "无法连接对话服务，请检查网络后重试。" }
+  } finally {
+    clearTimeout(timeout)
+  }
+})
+
 ipcMain.on("window:show", showWindow)
 ipcMain.handle("external:open", async (_event, url) => {
   let target

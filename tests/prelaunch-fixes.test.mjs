@@ -2,7 +2,7 @@
 // 运行方式：node --test tests/prelaunch-fixes.test.mjs
 //
 // 覆盖场景：
-// 1. 周期建议确认与撤销（P1-5）- 复制 domain.ts restockItem 的核心逻辑
+// 1. 周期建议确认与撤销（P1-5）- 直接调用共享 restockItemCore
 // 2. onboarding 重新运行去重（P1-4）- 复制 handleOnboardingComplete 的去重逻辑
 // 3. 正常状态直接补货（P1-3 的 domain 层验证）
 // 4. 双数据源启动协调（P1-1 store.ts reconcileState 逻辑）
@@ -17,64 +17,14 @@ import assert from "node:assert/strict"
 import {
   canConfirmRestock,
   applyDeleteCategory,
-  calculateMonthlySpend
+  calculateMonthlySpend,
+  restockItemCore
 } from "../src/pure-logic.mjs"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
-// ---------- 复制 domain.ts 中的纯逻辑函数 ----------
+// ---------- 真实补货核心逻辑的兼容调用包装 ----------
 
-function startOfDay(timestamp) {
-  const date = new Date(timestamp)
-  date.setHours(0, 0, 0, 0)
-  return date.getTime()
-}
-
-function addDays(timestamp, days) {
-  const date = new Date(timestamp)
-  date.setDate(date.getDate() + days)
-  return startOfDay(date.getTime())
-}
-
-function calendarDayNumber(timestamp) {
-  const date = new Date(timestamp)
-  return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / DAY_MS)
-}
-
-function differenceInDays(later, earlier) {
-  return calendarDayNumber(later) - calendarDayNumber(earlier)
-}
-
-function weightedCycle(intervals, currentCycle) {
-  if (!intervals.length) return undefined
-  const lower = Math.max(1, currentCycle * 0.5)
-  const upper = currentCycle * 1.5
-  let weightedTotal = 0
-  let weightTotal = 0
-  intervals.slice(-5).forEach((interval, index, list) => {
-    const weight = index + 2
-    const clipped = Math.min(upper, Math.max(lower, interval))
-    weightedTotal += clipped * weight
-    weightTotal += weight
-    if (index === list.length - 1) {
-      weightedTotal += clipped
-      weightTotal += 1
-    }
-  })
-  return Math.max(1, Math.round(weightedTotal / weightTotal))
-}
-
-function safeRestockQty(value) {
-  return Number.isFinite(value) && value >= 1 ? Math.round(value) : 1
-}
-
-function makeId(prefix) {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-}
-
-// 复制修复后的 restockItem 逻辑（P1-5: 先建议后确认；PR15: 完整 purchaseOption 参数）
-// 注意：这里是 domain.ts restockItem 的复制版，仅用于 .mjs 测试。
-// PR15 新增的 canConfirmRestock / applyDeleteCategory / calculateMonthlySpend 已改为直接 import。
 function restockItem(
   item,
   now = Date.now(),
@@ -91,76 +41,23 @@ function restockItem(
   review,
   restockDate
 ) {
-  const effectiveRestockAt = restockDate !== undefined ? startOfDay(restockDate) : startOfDay(now)
-  const actualInterval = item.anchorEstimated
-    ? undefined
-    : Math.max(1, differenceInDays(effectiveRestockAt, item.lastRestockedAt))
-
-  const safeQty = safeRestockQty(qty)
-
-  const history = [
-    ...item.history,
-    {
-      id: makeId("restock"),
-      at: effectiveRestockAt,
-      intervalDays: actualInterval,
-      price,
-      qty: safeQty,
-      platform: platform?.trim() || undefined,
-      purchaseOptionId: purchaseOptionId?.trim() || undefined,
-      purchaseProductName: purchaseProductName?.trim() || undefined,
-      purchaseUnit: purchaseUnit?.trim() || undefined,
-      purchasePricingMode,
-      purchaseMeasureBaseAmount: Number.isFinite(purchaseMeasureBaseAmount) && purchaseMeasureBaseAmount > 0 ? purchaseMeasureBaseAmount : undefined,
-      purchaseMeasureAmount: Number.isFinite(purchaseMeasureAmount) && purchaseMeasureAmount > 0 ? purchaseMeasureAmount : undefined,
-      purchaseMeasureUnit: purchaseMeasureUnit?.trim() || undefined,
-      review: review?.trim() || undefined
-    }
-  ]
-
-  const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)
-  const currentSingleItemCycle = Math.max(1, Math.round(item.cycleDays / previousQty))
-
-  const singleItemIntervals = history.flatMap((event, index) => {
-    if (!event.intervalDays) return []
-    const batchQty = index > 0 ? safeRestockQty(history[index - 1]?.qty) : 1
-    return [Math.max(1, event.intervalDays / batchQty)]
+  return restockItemCore({
+    item,
+    eventId: `restock-test-${item.history.length + 1}`,
+    now,
+    price,
+    qty,
+    platform,
+    purchaseOptionId,
+    purchaseProductName,
+    purchaseUnit,
+    purchasePricingMode,
+    purchaseMeasureBaseAmount,
+    purchaseMeasureAmount,
+    purchaseMeasureUnit,
+    review,
+    restockDate
   })
-
-  const singleItemCandidate = item.learningEnabled !== false
-    ? weightedCycle(singleItemIntervals, currentSingleItemCycle)
-    : undefined
-
-  const candidateCycleDays = singleItemCandidate
-    ? Math.max(1, Math.round(singleItemCandidate * safeQty))
-    : undefined
-
-  // P1-5 修复：周期学习必须先建议，用户确认后才生效
-  const hasSuggestion = candidateCycleDays !== undefined && Math.abs(candidateCycleDays - item.cycleDays) >= 1
-  const newCycleDays = hasSuggestion ? item.cycleDays : (candidateCycleDays ?? item.cycleDays)
-  const suggestedCycleDays = hasSuggestion ? candidateCycleDays : undefined
-
-  const confidence = item.source === "onboarding"
-    ? history.length >= 2 ? "high" : "medium"
-    : item.confidence
-
-  const latestRestock = history[history.length - 1]
-
-  return {
-    ...item,
-    cycleDays: newCycleDays,
-    lastRestockedAt: latestRestock?.at ?? effectiveRestockAt,
-    inventoryDepletionAt: undefined,
-    anchorEstimated: false,
-    history,
-    price: price ?? item.price,
-    platform: platform || item.platform,
-    snoozeUntil: undefined,
-    suggestedCycleDays,
-    confidence,
-    inventoryStatus: "justRestocked",
-    updatedAt: now
-  }
 }
 
 // ---------- 工具函数 ----------

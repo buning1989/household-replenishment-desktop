@@ -3,6 +3,7 @@ import { createInitialOnboardingState } from "./model/onboarding"
 // calculateMonthlySpend 的实现放在 pure-logic.mjs，供 .mjs 测试直接 import；
 // 这里仅按类型重新导出，保持 domain.ts 对外 API 不变。
 export { calculateMonthlySpend } from "./pure-logic.mjs"
+import { restockItemCore } from "./pure-logic.mjs"
 
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -163,83 +164,25 @@ export function restockItem(
   review?: string,
   restockDate?: number
 ): ReplenishmentItem {
-  const effectiveRestockAt = restockDate !== undefined ? startOfDay(restockDate) : startOfDay(now)
-  const actualInterval = item.anchorEstimated
-    ? undefined
-    : Math.max(1, differenceInDays(effectiveRestockAt, item.lastRestockedAt))
-
-  const safeQty = safeRestockQty(qty)
-
-  const history = normalizeRestockHistory([
-    ...item.history,
-    {
-      id: id("restock"),
-      at: effectiveRestockAt,
-      intervalDays: actualInterval,
-      price,
-      qty: safeQty,
-      platform: platform?.trim() || undefined,
-      purchaseOptionId: purchaseOptionId?.trim() || undefined,
-      purchaseProductName: purchaseProductName?.trim() || undefined,
-      purchaseUnit: purchaseUnit?.trim() || undefined,
-      purchasePricingMode,
-      purchaseMeasureBaseAmount: Number.isFinite(purchaseMeasureBaseAmount) && purchaseMeasureBaseAmount! > 0 ? purchaseMeasureBaseAmount : undefined,
-      purchaseMeasureAmount: Number.isFinite(purchaseMeasureAmount) && purchaseMeasureAmount! > 0 ? purchaseMeasureAmount : undefined,
-      purchaseMeasureUnit: purchaseMeasureUnit?.trim() || undefined,
-      review: review?.trim() || undefined
-    }
-  ])
-
-  const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)
-  const currentSingleItemCycle = Math.max(1, Math.round(item.cycleDays / previousQty))
-
-  const singleItemIntervals = history.flatMap((event, index) => {
-    if (!event.intervalDays) return []
-    const batchQty = index > 0 ? safeRestockQty(history[index - 1]?.qty) : 1
-    return [Math.max(1, event.intervalDays / batchQty)]
+  return restockItemCore({
+    item,
+    eventId: id("restock"),
+    now,
+    price,
+    qty,
+    platform,
+    purchaseOptionId,
+    purchaseProductName,
+    purchaseUnit,
+    purchasePricingMode,
+    purchaseMeasureBaseAmount,
+    purchaseMeasureAmount,
+    purchaseMeasureUnit,
+    review,
+    restockDate
   })
-
-  const singleItemCandidate = item.learningEnabled !== false
-    ? weightedCycle(singleItemIntervals, currentSingleItemCycle)
-    : undefined
-
-  const candidateCycleDays = singleItemCandidate
-    ? Math.max(1, Math.round(singleItemCandidate * safeQty))
-    : undefined
-
-  // 周期学习必须先建议，用户确认后才生效：
-  // - 候选周期与当前 cycleDays 不同时，写入 suggestedCycleDays，不覆盖 cycleDays；
-  // - 固定周期或关闭学习的物品不生成建议；
-  // - 差异过小（<1 天）时不生成建议，避免频繁打扰。
-  const hasSuggestion = candidateCycleDays !== undefined && Math.abs(candidateCycleDays - item.cycleDays) >= 1
-  const newCycleDays = hasSuggestion ? item.cycleDays : (candidateCycleDays ?? item.cycleDays)
-  const suggestedCycleDays = hasSuggestion ? candidateCycleDays : undefined
-
-  const confidence = item.source === "onboarding"
-    ? history.length >= 2 ? "high" : "medium"
-    : item.confidence
-
-  const latestRestock = history[history.length - 1]
-
-  return {
-    ...item,
-    cycleDays: newCycleDays,
-    lastRestockedAt: latestRestock?.at ?? effectiveRestockAt,
-    inventoryDepletionAt: undefined,
-    anchorEstimated: false,
-    history,
-    price: price ?? item.price,
-    platform: platform || item.platform,
-    snoozeUntil: undefined,
-    suggestedCycleDays,
-    confidence,
-    inventoryStatus: "justRestocked",
-    modelNote: item.source === "onboarding"
-      ? history.length >= 2 ? "已根据多次真实补货记录学习周期" : "已记录首次真实补货，继续观察中"
-      : item.modelNote,
-    updatedAt: now
-  }
 }
+
 
 export function updateRestockRecord(
   item: ReplenishmentItem,
@@ -355,7 +298,8 @@ export function createInitialState(): AppState {
       reminderIntervalHours: 1,
       quietStart: "22:00",
       quietEnd: "08:00",
-      notificationEnabled: true
+      notificationEnabled: true,
+      aiOrderMode: "accurate"
     },
     householdProfile: null,
     onboarding: createInitialOnboardingState(now),

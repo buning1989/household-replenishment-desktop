@@ -1,6 +1,155 @@
-// 跨 renderer / 测试共享的纯逻辑。
+// 跨 renderer / main / 测试共享的纯逻辑。
 // 这些函数不得依赖 React、Electron 或任何副作用，仅做纯计算。
 // 类型声明见 pure-logic.d.ts。
+
+const DAY_MS = 24 * 60 * 60 * 1000
+
+export function startOfDay(timestamp) {
+  const date = new Date(timestamp)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
+export function addDays(timestamp, days) {
+  const date = new Date(timestamp)
+  date.setDate(date.getDate() + days)
+  return startOfDay(date.getTime())
+}
+
+function calendarDayNumber(timestamp) {
+  const date = new Date(timestamp)
+  return Math.floor(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()) / DAY_MS)
+}
+
+export function differenceInDays(later, earlier) {
+  return calendarDayNumber(later) - calendarDayNumber(earlier)
+}
+
+function weightedCycle(intervals, currentCycle) {
+  if (!intervals.length) return undefined
+  const lower = Math.max(1, currentCycle * 0.5)
+  const upper = currentCycle * 1.5
+  let weightedTotal = 0
+  let weightTotal = 0
+  intervals.slice(-5).forEach((interval, index, list) => {
+    const weight = index + 2
+    const clipped = Math.min(upper, Math.max(lower, interval))
+    weightedTotal += clipped * weight
+    weightTotal += weight
+    if (index === list.length - 1) {
+      weightedTotal += clipped
+      weightTotal += 1
+    }
+  })
+  return Math.max(1, Math.round(weightedTotal / weightTotal))
+}
+
+function safeRestockQty(value) {
+  return Number.isFinite(value) && value >= 1 ? Math.round(value) : 1
+}
+
+function normalizeRestockHistory(history) {
+  return history
+    .slice()
+    .sort((a, b) => a.at - b.at)
+    .map((event, index, list) => ({
+      ...event,
+      at: startOfDay(event.at),
+      intervalDays: index > 0 ? Math.max(1, differenceInDays(event.at, list[index - 1].at)) : event.intervalDays
+    }))
+}
+
+export function restockItemCore(input) {
+  const {
+    item,
+    eventId,
+    now = Date.now(),
+    price,
+    qty,
+    platform,
+    purchaseOptionId,
+    purchaseProductName,
+    purchaseUnit,
+    purchasePricingMode,
+    purchaseMeasureBaseAmount,
+    purchaseMeasureAmount,
+    purchaseMeasureUnit,
+    review,
+    restockDate
+  } = input
+  const effectiveRestockAt = restockDate !== undefined ? startOfDay(restockDate) : startOfDay(now)
+  const actualInterval = item.anchorEstimated
+    ? undefined
+    : Math.max(1, differenceInDays(effectiveRestockAt, item.lastRestockedAt))
+
+  const safeQty = safeRestockQty(qty)
+
+  const history = normalizeRestockHistory([
+    ...item.history,
+    {
+      id: eventId,
+      at: effectiveRestockAt,
+      intervalDays: actualInterval,
+      price,
+      qty: safeQty,
+      platform: platform?.trim() || undefined,
+      purchaseOptionId: purchaseOptionId?.trim() || undefined,
+      purchaseProductName: purchaseProductName?.trim() || undefined,
+      purchaseUnit: purchaseUnit?.trim() || undefined,
+      purchasePricingMode,
+      purchaseMeasureBaseAmount: Number.isFinite(purchaseMeasureBaseAmount) && purchaseMeasureBaseAmount > 0 ? purchaseMeasureBaseAmount : undefined,
+      purchaseMeasureAmount: Number.isFinite(purchaseMeasureAmount) && purchaseMeasureAmount > 0 ? purchaseMeasureAmount : undefined,
+      purchaseMeasureUnit: purchaseMeasureUnit?.trim() || undefined,
+      review: review?.trim() || undefined
+    }
+  ])
+
+  const previousQty = safeRestockQty(item.history[item.history.length - 1]?.qty)
+  const currentSingleItemCycle = Math.max(1, Math.round(item.cycleDays / previousQty))
+
+  const singleItemIntervals = history.flatMap((event, index) => {
+    if (!event.intervalDays) return []
+    const batchQty = index > 0 ? safeRestockQty(history[index - 1]?.qty) : 1
+    return [Math.max(1, event.intervalDays / batchQty)]
+  })
+
+  const singleItemCandidate = item.learningEnabled !== false
+    ? weightedCycle(singleItemIntervals, currentSingleItemCycle)
+    : undefined
+
+  const candidateCycleDays = singleItemCandidate
+    ? Math.max(1, Math.round(singleItemCandidate * safeQty))
+    : undefined
+
+  const hasSuggestion = candidateCycleDays !== undefined && Math.abs(candidateCycleDays - item.cycleDays) >= 1
+  const newCycleDays = hasSuggestion ? item.cycleDays : (candidateCycleDays ?? item.cycleDays)
+  const suggestedCycleDays = hasSuggestion ? candidateCycleDays : undefined
+
+  const confidence = item.source === "onboarding"
+    ? history.length >= 2 ? "high" : "medium"
+    : item.confidence
+
+  const latestRestock = history[history.length - 1]
+
+  return {
+    ...item,
+    cycleDays: newCycleDays,
+    lastRestockedAt: latestRestock?.at ?? effectiveRestockAt,
+    inventoryDepletionAt: undefined,
+    anchorEstimated: false,
+    history,
+    price: price ?? item.price,
+    platform: platform || item.platform,
+    snoozeUntil: undefined,
+    suggestedCycleDays,
+    confidence,
+    inventoryStatus: "justRestocked",
+    modelNote: item.source === "onboarding"
+      ? history.length >= 2 ? "已根据多次真实补货记录学习周期" : "已记录首次真实补货，继续观察中"
+      : item.modelNote,
+    updatedAt: now
+  }
+}
 
 /**
  * 计算 RestockModal 的 canConfirm 状态。

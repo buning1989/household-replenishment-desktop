@@ -17,10 +17,16 @@ import {
   getLatestRating,
   nextSnoozeTime,
   restockItem,
+  startOfDay,
   updateRestockRecord,
   updateItemFromDraft
 } from "./domain"
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
+import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
+import { answerHouseholdQuickly, askHouseholdAssistant, buildHouseholdChatStarter, type ChatMessageLink, type ChatProposedAction, type HouseholdChatMessage } from "./llm/householdChat"
+import { buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
+import { classifyAgentIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
+import { commitAgentDraft, type AgentMessageLink } from "./agent/executor"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
@@ -135,6 +141,95 @@ function PersistenceAlert({ issue, backupState, onRetry, onCopyBackup, onDismiss
   )
 }
 
+function dayKey(timestamp: number): string {
+  const date = new Date(timestamp)
+  date.setHours(0, 0, 0, 0)
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, "0")
+  const day = String(date.getDate()).padStart(2, "0")
+  return `${year}-${month}-${day}`
+}
+
+function RestockHeatmap({ items, now }: { items: ReplenishmentItem[]; now: number }) {
+  const today = startOfDay(now)
+  const monthStartDate = new Date(today)
+  monthStartDate.setDate(1)
+  const monthEndDate = new Date(monthStartDate)
+  monthEndDate.setMonth(monthEndDate.getMonth() + 1)
+  monthEndDate.setDate(0)
+  const firstDayOffset = (monthStartDate.getDay() + 6) % 7
+  const startDate = new Date(monthStartDate)
+  startDate.setDate(startDate.getDate() - firstDayOffset)
+  const lastDayOffset = (monthEndDate.getDay() + 6) % 7
+  const endDate = new Date(monthEndDate)
+  endDate.setDate(endDate.getDate() + (6 - lastDayOffset))
+  const startMs = startOfDay(startDate.getTime())
+  const endMs = startOfDay(endDate.getTime())
+  const spendByDay = new Map<string, { amount: number; count: number }>()
+
+  for (const item of items) {
+    for (const event of item.history || []) {
+      const price = Number(event.price)
+      if (!Number.isFinite(event.at) || !Number.isFinite(price) || price <= 0) continue
+      const eventDay = startOfDay(event.at)
+      if (eventDay < startMs || eventDay > endMs) continue
+      const key = dayKey(eventDay)
+      const current = spendByDay.get(key) || { amount: 0, count: 0 }
+      spendByDay.set(key, { amount: current.amount + price, count: current.count + 1 })
+    }
+  }
+
+  const monthSpend = calculateMonthlySpend(items, now)
+  const cellCount = Math.round((endMs - startMs) / (24 * 60 * 60 * 1000)) + 1
+  const currentMonth = monthStartDate.getMonth()
+  const monthLabel = new Intl.DateTimeFormat("zh-CN", { month: "long" }).format(monthStartDate)
+  const cells = Array.from({ length: cellCount }, (_, index) => {
+    const date = new Date(startMs)
+    date.setDate(date.getDate() + index)
+    const timestamp = startOfDay(date.getTime())
+    const value = spendByDay.get(dayKey(timestamp))
+    const amount = value?.amount || 0
+    const level = amount <= 0 ? 0 : amount < 50 ? 1 : amount < 150 ? 2 : amount < 300 ? 3 : 4
+    const title = `${formatDate(timestamp)} · ${amount > 0 ? `¥${formatPrice(amount)} · ${value?.count || 0} 项` : "无补货"}`
+    return { key: dayKey(timestamp), level, title, inMonth: date.getMonth() === currentMonth }
+  })
+
+  return (
+    <section className="sidebar-heatmap" aria-label="花费">
+      <div className="sidebar-heatmap-heading">
+        <span className="sidebar-section-label">花费</span>
+        <span className="sidebar-heatmap-total">{monthLabel} ¥{formatPrice(monthSpend)}</span>
+      </div>
+      {spendByDay.size > 0 ? (
+        <>
+          <div className="sidebar-heatmap-grid">
+            {cells.map((cell) => (
+              <span
+                key={cell.key}
+                className="sidebar-heatmap-cell"
+                data-level={cell.level}
+                data-muted={!cell.inMonth || undefined}
+                title={cell.title}
+                aria-label={cell.title}
+              />
+            ))}
+          </div>
+          <div className="sidebar-heatmap-legend" aria-hidden="true">
+            <span>少</span>
+            <span className="sidebar-heatmap-cell" data-level={1} />
+            <span className="sidebar-heatmap-cell" data-level={2} />
+            <span className="sidebar-heatmap-cell" data-level={3} />
+            <span className="sidebar-heatmap-cell" data-level={4} />
+            <span>多</span>
+          </div>
+        </>
+      ) : (
+        <p className="sidebar-heatmap-empty">有价格记录后显示</p>
+      )}
+    </section>
+  )
+}
+
 function App() {
   const [state, setState] = useState<AppState>(() => loadState())
   const [persistenceIssue, setPersistenceIssue] = useState<PersistenceIssue | null>(() => takePendingLoadIssue())
@@ -154,9 +249,6 @@ function App() {
   const [restockToast, setRestockToast] = useState<{ itemName: string } | null>(null)
   const [restockModalOpen, setRestockModalOpen] = useState(false)
   const [restockModalItemId, setRestockModalItemId] = useState<string | null>(null)
-  const [selectedPurchaseOption, setSelectedPurchaseOption] = useState<PurchaseOption | null>(null)
-  const [restockQty, setRestockQty] = useState<number | ''>('')
-  const [restockPrice, setRestockPrice] = useState<number | ''>('')
   const [now, setNow] = useState(() => Date.now())
   // Panel exit animation states
   const [categoryPanelClosing, setCategoryPanelClosing] = useState(false)
@@ -165,6 +257,10 @@ function App() {
   const [settingsClosing, setSettingsClosing] = useState(false)
   const [categoryCreatorClosing, setCategoryCreatorClosing] = useState(false)
   const [categoryManagerClosing, setCategoryManagerClosing] = useState(false)
+  const [householdChatOpen, setHouseholdChatOpen] = useState(false)
+  const [householdChatClosing, setHouseholdChatClosing] = useState(false)
+  const [householdChatMessages, setHouseholdChatMessages] = useState<HouseholdChatMessage[]>([])
+  const [householdChatLastQuestion, setHouseholdChatLastQuestion] = useState("")
   // Item creator dialog state
   const [isItemCreatorOpen, setIsItemCreatorOpen] = useState(false)
   const [creatingCategory, setCreatingCategory] = useState<string | null>(null)
@@ -179,6 +275,8 @@ function App() {
   const [editingRestockRecord, setEditingRestockRecord] = useState<{ itemId: string; recordId: string } | null>(null)
   // 当从补货弹窗中录入新商品后，用于在 RestockModal 中自动选中该商品
   const [preferredPurchaseOptionId, setPreferredPurchaseOptionId] = useState<string | null>(null)
+  // 订单截图批量导入弹窗
+  const [orderImportOpen, setOrderImportOpen] = useState(false)
   function deferredClose(setClosing: (v: boolean) => void, actualClose: () => void, delay = 200) {
     setClosing(true)
     setTimeout(() => { setClosing(false); actualClose() }, delay)
@@ -209,16 +307,21 @@ function App() {
       warning: views.filter(({ computed }) => computed.displayStatus === "warning").length
     }
   }), [itemViews, state.categories])
+  const householdChatSubtitle = householdChatLastQuestion.trim() || "库存与补货"
 
   useEffect(() => {
-    // 启动协调完成前禁止将空初始状态写回主进程，避免覆盖桌面备份
+    // 启动协调完成前禁止将空初始状态写回主进程，避免覆盖桌面备份。
+    // 用户连续操作时合并保存，减少 localStorage / 主进程文件的重复写入。
     if (!persistenceReady) return
     const sequence = ++persistenceSequence.current
-    void persistState(state).then((issue) => {
-      if (sequence !== persistenceSequence.current) return
-      setPersistenceIssue((current) => issue ?? (current?.kind === "read" ? current : null))
-      if (issue) setBackupCopyState("idle")
-    })
+    const timer = window.setTimeout(() => {
+      void persistState(state).then((issue) => {
+        if (sequence !== persistenceSequence.current) return
+        setPersistenceIssue((current) => issue ?? (current?.kind === "read" ? current : null))
+        if (issue) setBackupCopyState("idle")
+      })
+    }, 300)
+    return () => window.clearTimeout(timer)
   }, [state, persistenceReady])
 
   // 启动时协调 localStorage 与主进程 JSON 两份数据，选择较新或有效的版本
@@ -258,12 +361,13 @@ function App() {
       if (pendingCategoryDelete) setPendingCategoryDelete(null)
       else if (categoryDialog) setCategoryDialog(null)
       else if (detailItemId) deferredClose(setDetailPanelClosing, () => setDetailItemId(null))
+      else if (householdChatOpen) deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
       else if (settingsOpen) deferredClose(setSettingsClosing, () => setSettingsOpen(false))
       else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
     }
     window.addEventListener("keydown", closeTopPanel)
     return () => window.removeEventListener("keydown", closeTopPanel)
-  }, [categoryCreatorOpen, categoryDialog, detailItemId, editingItem, pendingCategoryDelete, settingsOpen])
+  }, [categoryCreatorOpen, categoryDialog, detailItemId, editingItem, householdChatOpen, pendingCategoryDelete, settingsOpen])
 
   function commit(next: AppState) {
     setState({ ...next, updatedAt: Date.now() })
@@ -281,15 +385,102 @@ function App() {
     // 打开补货弹窗，而不是展开内联输入卡
     setRestockModalItemId(item.id)
     setRestockModalOpen(true)
-    setSelectedPurchaseOption(null)
-    setRestockQty('')
-    setRestockPrice('')
   }
 
   function performRestock(itemId: string, qty?: number, price?: number, platform?: string, purchaseOptionId?: string, purchaseProductName?: string, purchaseUnit?: string, purchasePricingMode?: PricingMode, purchaseMeasureBaseAmount?: number, purchaseMeasureAmount?: number, purchaseMeasureUnit?: string, review?: string, restockDate?: number) {
     const currentItem = state.items.find((item) => item.id === itemId)
     if (!currentItem) return
     updateItems([itemId], (current) => restockItem(current, Date.now(), price, qty, platform, purchaseOptionId, purchaseProductName, purchaseUnit, purchasePricingMode, purchaseMeasureBaseAmount, purchaseMeasureAmount, purchaseMeasureUnit, review, restockDate))
+  }
+
+  // 订单截图批量导入确认：一次 setState 写入全部补货记录，
+  // 必要时新建物品/常购商品，写入路径与补货面板一致（带 purchaseOptionId 快照）
+  function handleOrderImportConfirm(payload: { rows: OrderImportConfirmedRow[] }) {
+    const now = Date.now()
+    const actionableRows = payload.rows.filter((row) => row.targetItem !== "__skip__")
+    setOrderImportOpen(false)
+    if (!actionableRows.length) return
+    type ImportRow = typeof actionableRows[number]
+    setState((current) => {
+      let items = [...current.items]
+      let categories = current.categories
+
+      // 与 RestockModal 相同的写入口径：带 option id/名称/单位/计价方式/含量快照
+      const restockWith = (item: ReplenishmentItem, row: ImportRow, option?: PurchaseOption): ReplenishmentItem =>
+        restockItem(
+          item,
+          now,
+          row.price,
+          row.qty,
+          row.platform,
+          option?.id,
+          option?.productName || row.coreName || row.brandName || row.productName,
+          option?.unit || item.unit,
+          option ? (option.pricingMode || (option.measureUnit ? "measure" : "spec")) : undefined,
+          option?.measureBaseAmount,
+          row.measureAmount,
+          row.measureUnit,
+          row.review,
+          row.restockDate
+        )
+
+      const newOptionFrom = (row: ImportRow, unit: string): PurchaseOption => ({
+        id: crypto.randomUUID(),
+        productName: (row.coreName || row.brandName || row.productName).trim(),
+        unit,
+        pricingMode: "spec"
+      })
+
+      const applyToItem = (itemId: string, row: ImportRow) => {
+        items = items.map((item) => {
+          if (item.id !== itemId) return item
+          const targetCategory = (row.category || item.category || "其他").trim() || "其他"
+          const itemWithCategory = item.category === targetCategory
+            ? item
+            : { ...item, category: targetCategory, updatedAt: now }
+          if (row.targetOption === "__newopt__") {
+            // 顺带建档：把识别出的品牌商品登记为常购商品
+            const option = newOptionFrom(row, itemWithCategory.unit || "件")
+            return restockWith({ ...itemWithCategory, purchaseOptions: [...(itemWithCategory.purchaseOptions || []), option] }, row, option)
+          }
+          const option = (itemWithCategory.purchaseOptions || []).find((candidate) => candidate.id === row.targetOption)
+          return restockWith(itemWithCategory, row, option)
+        })
+      }
+
+      for (const row of actionableRows) {
+        if (row.targetItem === "__create__") {
+          const name = (row.genericName || row.coreName || row.brandName || row.productName).trim()
+          if (!name) continue
+          // 同名物品已存在时直接补货到该物品，避免重复建档
+          const existing = items.find((item) => item.name.trim().toLocaleLowerCase("zh-CN") === name.toLocaleLowerCase("zh-CN"))
+          if (existing) {
+            applyToItem(existing.id, { ...row, targetOption: "__newopt__" })
+            continue
+          }
+          const categoryName = (row.category || "其他").trim() || "其他"
+          const newItem = createItem({
+            name,
+            category: categoryName,
+            cycleDays: 30,
+            bufferDays: 2,
+            link: "",
+            remainingDays: "",
+            learningEnabled: true,
+            unit: "件",
+            defaultQty: "",
+            platform: ""
+          }, now)
+          if (!categories.includes(categoryName)) categories = [...categories, categoryName]
+          const option = newOptionFrom(row, "件")
+          items = [...items, restockWith({ ...newItem, purchaseOptions: [option] }, row, option)]
+        } else {
+          applyToItem(row.targetItem, row)
+        }
+      }
+      return { ...current, categories, items, updatedAt: now }
+    })
+    setRestockToast({ itemName: `${actionableRows.length} 项商品` })
   }
 
   function saveEditedRestockRecord(itemId: string, recordId: string, patch: Pick<RestockEvent, "at" | "qty" | "price"> & Partial<Pick<RestockEvent, "platform" | "purchasePricingMode" | "purchaseMeasureBaseAmount" | "purchaseMeasureAmount" | "purchaseMeasureUnit" | "review">>) {
@@ -341,6 +532,95 @@ function App() {
     })
     setEditingItem(undefined)
     setNewItemCategory(undefined)
+  }
+
+  // 对话确认清单的写入执行器：一次 setState 批量创建，重名跳过，
+  // addPurchaseOption 可以引用同一批 createItem 刚建出来的物品；返回跳转入口
+  function handleChatActionsConfirm(actions: ChatProposedAction[]): { created: string[]; skipped: string[]; links: ChatMessageLink[] } {
+    const now = Date.now()
+    const created: string[] = []
+    const skipped: string[] = []
+    const links: ChatMessageLink[] = []
+    const linkedItemIds = new Set<string>()
+    const norm = (value: string) => value.trim().toLocaleLowerCase("zh-CN")
+    let categories = [...state.categories]
+    let items = [...state.items]
+
+    const addItemLink = (itemId: string, name: string) => {
+      if (linkedItemIds.has(itemId)) return
+      linkedItemIds.add(itemId)
+      links.push({ label: `查看「${name}」`, target: { kind: "item", itemId } })
+    }
+
+    for (const action of actions) {
+      if (action.type === "createCategory") {
+        const name = action.name.trim()
+        if (categories.some((category) => norm(category) === norm(name))) {
+          skipped.push(`分类「${name}」已存在`)
+        } else {
+          categories = [...categories, name]
+          created.push(`分类「${name}」`)
+          links.push({ label: `打开分类「${name}」`, target: { kind: "category", category: name } })
+        }
+      } else if (action.type === "createItem") {
+        const name = action.name.trim()
+        if (items.some((item) => norm(item.name) === norm(name))) {
+          skipped.push(`消耗品「${name}」已存在`)
+          continue
+        }
+        const category = action.category.trim() || "其他"
+        if (!categories.includes(category)) {
+          categories = [...categories, category]
+          created.push(`分类「${category}」`)
+        }
+        const newItem = createItem({
+          name,
+          category,
+          cycleDays: action.cycleDays,
+          bufferDays: action.bufferDays,
+          link: "",
+          remainingDays: "",
+          learningEnabled: true,
+          unit: action.unit.trim() || "件",
+          defaultQty: "",
+          platform: ""
+        }, now)
+        items = [...items, newItem]
+        created.push(`消耗品「${name}」`)
+        addItemLink(newItem.id, name)
+      } else {
+        const target = items.find((item) => norm(item.name) === norm(action.itemName))
+          || items.find((item) => action.itemName.includes(item.name) || item.name.includes(action.itemName))
+        if (!target) {
+          skipped.push(`找不到消耗品「${action.itemName}」，未添加「${action.productName}」`)
+          continue
+        }
+        if ((target.purchaseOptions || []).some((option) => norm(option.productName) === norm(action.productName))) {
+          skipped.push(`「${target.name}」下已有商品「${action.productName}」`)
+          continue
+        }
+        const option: PurchaseOption = {
+          id: crypto.randomUUID(),
+          productName: action.productName.trim(),
+          unit: action.unit.trim() || target.unit || "件",
+          pricingMode: "spec"
+        }
+        items = items.map((item) => item.id === target.id
+          ? { ...item, purchaseOptions: [...(item.purchaseOptions || []), option], updatedAt: now }
+          : item)
+        created.push(`常购商品「${action.productName}」（${target.name}）`)
+        addItemLink(target.id, target.name)
+      }
+    }
+
+    commit({ ...state, categories, items })
+    return { created, skipped, links: links.slice(0, 3) }
+  }
+
+  function handleAgentDraftConfirm(agentDraft: AgentDraft): { summary: string; links: AgentMessageLink[] } {
+    const result = commitAgentDraft(state, agentDraft)
+    if (result.state !== state) commit(result.state)
+    return { summary: result.summary, links: result.links }
   }
 
   function addCategory(name: string): string | undefined {
@@ -508,9 +788,6 @@ function App() {
   function handleCancelRestock() {
     setRestockModalOpen(false)
     setRestockModalItemId(null)
-    setSelectedPurchaseOption(null)
-    setRestockQty('')
-    setRestockPrice('')
   }
 
   function applyCycleSuggestion(item: ReplenishmentItem) {
@@ -706,6 +983,8 @@ function App() {
         <Sidebar
           dueCount={dueItems.length}
           categorySummaries={categorySummaries}
+          allItems={state.items}
+          now={now}
           activeCategory={activeCategory}
           onSelectCategory={setActiveCategory}
           onCreateCategory={() => setCategoryCreatorOpen(true)}
@@ -768,6 +1047,8 @@ function App() {
                 setCreatingCategory(state.categories[0] || null)
                 setIsItemCreatorOpen(true)
               }}
+              onOpenChat={() => setHouseholdChatOpen(true)}
+              onOpenOrderImport={() => setOrderImportOpen(true)}
             />
           )}
           {restockToast && (
@@ -798,6 +1079,30 @@ function App() {
         })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
       {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} onRestartOnboarding={startOnboardingRerun} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
+      {(householdChatOpen || householdChatClosing) && (
+        <HouseholdChatPanel
+          state={state}
+          itemViews={itemViews}
+	          messages={householdChatMessages}
+	          onMessagesChange={setHouseholdChatMessages}
+	          onQuestionSent={setHouseholdChatLastQuestion}
+	          onConfirmDraft={handleAgentDraftConfirm}
+          onOpenItem={(itemId) => {
+            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            setDetailItemId(itemId)
+          }}
+          onOpenCategory={(category) => {
+            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            setActiveCategory(category)
+          }}
+          isClosing={householdChatClosing}
+          onClose={() => deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))}
+          onOpenSettings={() => {
+            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            setSettingsOpen(true)
+          }}
+        />
+      )}
       {isItemCreatorOpen && (
         <ItemCreatorDialog
           category={creatingCategory || ''}
@@ -883,6 +1188,22 @@ function App() {
         }}
       />
 
+      {/* 订单截图批量导入 */}
+      <OrderImportModal
+        isOpen={orderImportOpen}
+        onClose={() => setOrderImportOpen(false)}
+        items={state.items}
+        categories={state.categories}
+        apiKey={state.settings.aiApiKey}
+        model={state.settings.aiOrderModel ?? state.settings.aiModel}
+        recognitionMode={state.settings.aiOrderMode ?? "accurate"}
+        onOpenSettings={() => {
+          setOrderImportOpen(false)
+          setSettingsOpen(true)
+        }}
+        onConfirm={handleOrderImportConfirm}
+      />
+
       {/* 添加商品弹窗（统一在 App 根部渲染，供分类页与补货弹窗复用） */}
       <PurchaseOptionModal
         isOpen={showAddPurchaseModal}
@@ -913,6 +1234,462 @@ function RestockToast({ itemName, onDismiss }: { itemName: string; onDismiss: ()
         <path d="M4.5 8l2.5 2.5 4.5-5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
       </svg>
       <span><strong>{itemName}</strong> 已补货</span>
+    </div>
+  )
+}
+
+function cleanChatLine(line: string): string {
+  return line
+    .trim()
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/^[-*•]\s*/, "")
+    .replace(/\*\*/g, "")
+    .replace(/__/g, "")
+    .replace(/`/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function renderChatAnswer(content: string) {
+  const lines = content
+    .split(/\n+/)
+    .map(cleanChatLine)
+    .filter(Boolean)
+
+  if (!lines.length) return <p className="chat-answer-paragraph">没有返回可显示的内容。</p>
+
+  return (
+    <div className="chat-answer">
+      {lines.map((line, index) => {
+        const noteMatch = line.match(/^(提示|建议|下一步|可以这样做|注意)[:：]\s*(.+)$/)
+        if (noteMatch) {
+          return (
+            <div className="chat-answer-note" key={`${line}-${index}`}>
+              <b>{noteMatch[1]}</b>
+              <span>{noteMatch[2]}</span>
+            </div>
+          )
+        }
+
+        const sectionMatch = line.match(/^(.{2,12})[:：]\s*$/)
+        if (sectionMatch) {
+          return <strong className="chat-answer-heading" key={`${line}-${index}`}>{sectionMatch[1]}</strong>
+        }
+
+        const rowMatch = line.match(/^([^：:]{2,16})[:：]\s*(.+)$/)
+        if (rowMatch) {
+          return (
+            <div className="chat-answer-row" key={`${line}-${index}`}>
+              <b>{rowMatch[1]}</b>
+              <span>{rowMatch[2]}</span>
+            </div>
+          )
+        }
+
+        return <p className="chat-answer-paragraph" key={`${line}-${index}`}>{line}</p>
+      })}
+    </div>
+  )
+}
+
+// 对话创建提案的确认清单：只读展示，修改通过继续对话完成
+function ChatActionCard({ actions, status, onConfirm, onCancel }: {
+  actions: ChatProposedAction[]
+  status: "pending" | "confirmed" | "cancelled" | "superseded"
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const statusLabel = status === "pending"
+    ? `将创建 ${actions.length} 项`
+    : status === "confirmed" ? "已创建" : status === "cancelled" ? "已取消" : "已更新为新方案"
+
+  function actionTypeLabel(action: ChatProposedAction): string {
+    if (action.type === "createCategory") return "分类"
+    if (action.type === "createItem") return "消耗品"
+    return "常购商品"
+  }
+
+  function actionSummary(action: ChatProposedAction): string {
+    if (action.type === "createCategory") return action.name
+    if (action.type === "createItem") return `${action.name} · 归入${action.category} · 约 ${action.cycleDays} 天一轮 · 单位 ${action.unit}`
+    return `${action.productName} → ${action.itemName}`
+  }
+
+  return (
+    <div className={`chat-action-card is-${status}`}>
+      <div className="chat-action-card-head">
+        <span>{statusLabel}</span>
+      </div>
+      {actions.map((action, index) => (
+        <p key={index} className="chat-action-summary">
+          <b>{actionTypeLabel(action)}</b>
+          {actionSummary(action)}
+        </p>
+      ))}
+      {status === "pending" && (
+        <>
+          <div className="chat-action-card-actions">
+            <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
+            <button type="button" className="primary-button compact green" onClick={onConfirm}>确认创建</button>
+          </div>
+          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」。</small>
+        </>
+      )}
+    </div>
+  )
+}
+
+function AgentDraftCard({ draft, status, onConfirm, onCancel }: {
+  draft: AgentDraft
+  status: AgentDraftStatus
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const statusLabel = status === "pending"
+    ? draft.kind === "createItem" ? "待确认创建"
+      : draft.kind === "restock" ? "待确认补货记录"
+        : draft.kind === "createItemWithRestock" ? "待确认创建并记录"
+          : "待确认常购商品"
+    : status === "confirmed" ? "已处理" : status === "cancelled" ? "已取消" : "已更新为新草稿"
+  const confirmLabel = draft.kind === "createItem"
+    ? "确认创建"
+    : draft.kind === "restock" ? "确认记录补货"
+      : draft.kind === "createItemWithRestock" ? "确认创建并记录"
+        : "确认添加常购商品"
+
+  function rows(): Array<[string, string]> {
+    if (draft.kind === "createItem") {
+      return [
+        ["消耗品", draft.itemName],
+        ["分类", draft.category],
+        ["补货周期", `${draft.cycleDays} 天，提前 ${draft.bufferDays} 天提醒`],
+        ["单位", draft.unit]
+      ]
+    }
+    if (draft.kind === "restock") {
+      return [
+        ["物品", draft.itemName],
+        ["数量", draft.qty ? `${draft.qty}${draft.unit || ""}` : "未填写"],
+        ["金额", draft.price !== undefined ? `¥${formatPrice(draft.price)}` : "未填写"],
+        ["平台", draft.platform || "未填写"],
+        ...(draft.cycleDaysPatch ? [["周期调整", `${draft.cycleDaysPatch} 天`] as [string, string]] : [])
+      ]
+    }
+    if (draft.kind === "createItemWithRestock") {
+      return [
+        ["消耗品", draft.item.itemName],
+        ["分类", draft.item.category],
+        ["补货周期", `${draft.item.cycleDays} 天，提前 ${draft.item.bufferDays} 天提醒`],
+        ["数量", draft.restock.qty ? `${draft.restock.qty}${draft.restock.unit || draft.item.unit}` : "未填写"],
+        ["金额", draft.restock.price !== undefined ? `¥${formatPrice(draft.restock.price)}` : "未填写"],
+        ["平台", draft.restock.platform || "未填写"],
+        ["常购商品", draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || "不登记"]
+      ]
+    }
+    return [
+      ["常购商品", draft.productName],
+      ["挂到", draft.itemName],
+      ["单位", draft.unit || "沿用消耗品单位"]
+    ]
+  }
+
+  return (
+    <div className={`chat-action-card is-${status}`}>
+      <div className="chat-action-card-head">
+        <span>{statusLabel}</span>
+      </div>
+      {rows().map(([label, value]) => (
+        <p key={label} className="chat-action-summary">
+          <b>{label}</b>
+          {value}
+        </p>
+      ))}
+      {status === "pending" && (
+        <>
+          <div className="chat-action-card-actions">
+            <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
+            <button type="button" className="primary-button compact green" onClick={onConfirm}>{confirmLabel}</button>
+          </div>
+          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」。</small>
+        </>
+      )}
+    </div>
+  )
+}
+
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing }: {
+  state: AppState
+  itemViews: ItemView[]
+  messages: HouseholdChatMessage[]
+  onMessagesChange: (messages: HouseholdChatMessage[]) => void
+  onQuestionSent: (question: string) => void
+  onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[] }
+  onOpenItem: (itemId: string) => void
+  onOpenCategory: (category: string) => void
+  onClose: () => void
+  onOpenSettings: () => void
+  isClosing?: boolean
+}) {
+  const [draft, setDraft] = useState("")
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
+  const starter = buildHouseholdChatStarter(itemViews)
+	  const quickQuestions = [
+	    "今天优先补什么？",
+	    "哪些东西可以暂时不用管？",
+	    "最近价格记录有什么异常？",
+	    "帮我添加一个消耗品"
+	  ]
+	  function latestPendingDraftMessageIndex(list: HouseholdChatMessage[]): number {
+	    for (let index = list.length - 1; index >= 0; index -= 1) {
+	      if (list[index].role === "assistant" && list[index].draftStatus === "pending" && list[index].agentDraft) return index
+	    }
+	    return -1
+	  }
+
+	  function draftIntro(agentDraft: AgentDraft): string {
+	    if (agentDraft.kind === "createItem") return "我整理成了一个待确认的消耗品草稿。"
+	    if (agentDraft.kind === "restock") return "我整理成了一条待确认的补货记录。"
+	    if (agentDraft.kind === "createItemWithRestock") return "我整理成了一个待确认的创建并补货草稿。"
+	    return "我整理成了一个待确认的常购商品草稿。"
+	  }
+
+	  function buildPendingDraftReminder(agentDraft: AgentDraft): string {
+	    return [
+	      "还没有真正写入。",
+	      `当前草稿：${describeAgentDraft(agentDraft)}。`,
+	      "下一步：点卡片里的确认按钮，或直接输入「确认记录」。"
+	    ].join("\n")
+	  }
+
+	  function safeQueryFallback(content: string): string {
+	    const text = content.trim()
+	    if (!text) return "我没能整理出可靠回答，请换一句问法。"
+	    if (/已创建|已记录|已更新|已登记|已为您|已帮/.test(text)) return "我没能整理成可确认草稿，请换一句描述。"
+	    return text
+	  }
+
+	  function confirmAgentDraft(messageIndex: number, baseMessages = messages) {
+	    const message = baseMessages[messageIndex]
+	    if (!message?.agentDraft) return
+	    const result = onConfirmDraft(message.agentDraft)
+	    onMessagesChange([
+	      ...baseMessages.map((current, index) => index === messageIndex
+	        ? { ...current, draftStatus: "confirmed" as const }
+	        : current),
+	      { role: "assistant" as const, content: result.summary, links: result.links }
+	    ])
+	  }
+
+	  function cancelAgentDraft(messageIndex: number, baseMessages = messages) {
+	    onMessagesChange(baseMessages.map((message, index) => index === messageIndex
+	      ? { ...message, draftStatus: "cancelled" as const }
+	      : message))
+	  }
+
+  useEffect(() => {
+    inputRef.current?.focus()
+  }, [])
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+  }, [messages, loading])
+
+	  async function sendMessage(value = draft) {
+	    const text = value.trim()
+	    if (!text) {
+	      setError("先输入一个想了解的问题。")
+	      inputRef.current?.focus()
+	      return
+	    }
+	    const nextMessages: HouseholdChatMessage[] = [...messages, { role: "user", content: text }]
+	    onMessagesChange(nextMessages)
+	    onQuestionSent(text)
+	    setDraft("")
+	    setError(null)
+	    const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
+	    const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
+	    const intent = classifyAgentIntent(text, Boolean(pendingDraft))
+	    if (pendingDraft && intent === "confirmDraft") {
+	      confirmAgentDraft(pendingMessageIndex, nextMessages)
+	      return
+	    }
+	    if (pendingDraft && intent === "cancelDraft") {
+	      cancelAgentDraft(pendingMessageIndex, nextMessages)
+	      return
+	    }
+	    if (pendingDraft && intent === "pendingStatus") {
+	      onMessagesChange([...nextMessages, { role: "assistant", content: buildPendingDraftReminder(pendingDraft) }])
+	      return
+	    }
+	    if (pendingDraft && intent === "reviseDraft") {
+	      const revised = reviseAgentDraft(pendingDraft, text)
+	      if (revised) {
+	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
+	          ? { ...message, draftStatus: "superseded" as const }
+	          : message)
+	        onMessagesChange([...base, { role: "assistant", content: "好的，我更新了待确认草稿。", agentDraft: revised, draftStatus: "pending" as const }])
+	      } else {
+	        onMessagesChange([...nextMessages, { role: "assistant", content: buildPendingDraftReminder(pendingDraft) }])
+	      }
+	      return
+	    }
+	    if (intent === "writeDraft") {
+	      const localDraft = buildLocalDraftFromText(text, state)
+	      if (localDraft) {
+	        onMessagesChange([...nextMessages, { role: "assistant", content: draftIntro(localDraft), agentDraft: localDraft, draftStatus: "pending" as const }])
+	        return
+	      }
+	    }
+	    const quickAnswer = pendingDraft || shouldSkipQuickAnswerForAgent(text) ? null : answerHouseholdQuickly(text, state, itemViews)
+	    if (quickAnswer) {
+	      onMessagesChange([...nextMessages, { role: "assistant", content: quickAnswer }])
+	      return
+    }
+    if (!state.settings.aiApiKey?.trim()) {
+      setError("还没有设置 AI API Key。这个问题需要模型分析，设置后就可以继续问。")
+      inputRef.current?.focus()
+      return
+    }
+    setLoading(true)
+    const result = await askHouseholdAssistant({
+      apiKey: state.settings.aiApiKey,
+      model: state.settings.aiChatModel ?? state.settings.aiModel,
+	      state,
+	      itemViews,
+	      messages: nextMessages,
+	      pendingDraft
+	    })
+	    if (result.ok) {
+	      setLoading(false)
+		      const parsed = parseAgentResponse(result.content.trim(), state)
+		      if (!parsed) {
+		        onMessagesChange([...nextMessages, {
+		          role: "assistant",
+		          content: intent === "writeDraft" || pendingDraft
+		            ? (pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，请换一句描述。")
+		            : safeQueryFallback(result.content)
+		        }])
+		        return
+		      }
+	      if (parsed.kind === "draft") {
+	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
+	          ? { ...message, draftStatus: "superseded" as const }
+	          : message)
+	        onMessagesChange([...base, { role: "assistant", content: draftIntro(parsed.draft), agentDraft: parsed.draft, draftStatus: "pending" as const }])
+	      } else {
+	        if (intent === "writeDraft" || pendingDraft) {
+	          onMessagesChange([...nextMessages, { role: "assistant", content: pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，请换一句描述。" }])
+	        } else {
+	          onMessagesChange([...nextMessages, { role: "assistant", content: parsed.answer }])
+	        }
+	      }
+	    } else {
+	      setLoading(false)
+	      onMessagesChange(nextMessages)
+      setError(result.error)
+      inputRef.current?.focus()
+    }
+  }
+
+	  function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!loading) void sendMessage()
+  }
+
+  return (
+    <div className={`overlay chat-overlay ${isClosing ? "is-closing" : ""}`}>
+      <aside className={`panel chat-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="household-chat-title">
+        <div className="panel-header chat-panel-header">
+          <div className="panel-header-info">
+            <h2 id="household-chat-title">问问当前库存和补货</h2>
+          </div>
+          <button className="icon-button close-btn" aria-label="关闭家庭问答" onClick={onClose}><Icon name="close" size={16} /></button>
+        </div>
+
+        <div className="chat-panel-body">
+          <div className="chat-log" ref={logRef} aria-live="polite">
+            {messages.length === 0 ? (
+              <div className="chat-empty">
+                <strong>{starter}</strong>
+                <div className="chat-suggestions">
+                  {quickQuestions.map((question) => (
+                    <button key={question} type="button" onClick={() => void sendMessage(question)} disabled={loading}>{question}</button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              messages.map((message, index) => (
+                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
+                  {message.role === "assistant" ? (
+                    <div className="chat-message-content">{renderChatAnswer(message.content)}</div>
+                  ) : (
+                    <p>{message.content}</p>
+                  )}
+	                  {message.role === "assistant" && message.agentDraft && (
+	                    <AgentDraftCard
+	                      draft={message.agentDraft}
+	                      status={message.draftStatus || "pending"}
+	                      onConfirm={() => confirmAgentDraft(index)}
+	                      onCancel={() => cancelAgentDraft(index)}
+	                    />
+	                  )}
+                  {message.role === "assistant" && message.links && message.links.length > 0 && (
+                    <div className="chat-message-links">
+                      {message.links.map((link, linkIndex) => (
+                        <button
+                          key={linkIndex}
+                          type="button"
+                          className="chat-link-button"
+                          onClick={() => link.target.kind === "item" ? onOpenItem(link.target.itemId) : onOpenCategory(link.target.category)}
+                        >
+                          {link.label} →
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))
+            )}
+            {loading && (
+              <div className="chat-message assistant is-loading">
+                <p>正在查看当前记录…</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        <form className="chat-composer" onSubmit={submit}>
+          {error && (
+            <div className="chat-error" role="alert">
+              <span>{error}</span>
+              {!state.settings.aiApiKey?.trim() && <button type="button" onClick={onOpenSettings}>去设置</button>}
+            </div>
+          )}
+          <div className="chat-input-row">
+            <textarea
+              id="household-chat-input"
+              ref={inputRef}
+              value={draft}
+              rows={2}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault()
+                  if (!loading) void sendMessage()
+                }
+              }}
+              placeholder=""
+            />
+            <button type="submit" className="primary-button chat-send-button" disabled={loading}>
+              {loading && <span className="chat-send-spinner" aria-hidden="true" />}
+              发送
+            </button>
+          </div>
+        </form>
+      </aside>
     </div>
   )
 }
@@ -1149,7 +1926,7 @@ function TaskActions({ item, onRestock, onDismiss, isExpanded }: {
   )
 }
 
-function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onColdStartFeedback, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem }: {
+function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onColdStartFeedback, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem, onOpenChat, onOpenOrderImport }: {
   items: ItemView[]
   snoozedItems: ItemView[]
   allItems: ItemView[]
@@ -1160,17 +1937,37 @@ function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onCo
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onOpenItem: (item: ReplenishmentItem) => void
   onAddItem: () => void
+  onOpenChat: () => void
+  onOpenOrderImport: () => void
 }) {
   const hasCurrentTasks = items.length > 0
   const hasSnoozedTasks = snoozedItems.length > 0
   const hasAnyTasks = hasCurrentTasks || hasSnoozedTasks
   const hasNoItemsAtAll = allItems.length === 0
+  const quickActions = (
+    <div className="home-quick-actions" aria-label="首页快捷操作">
+      <button type="button" className="quiet-button home-chat-trigger" onClick={onOpenChat}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.6 8.6 0 0 1-7.7 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.5A8.4 8.4 0 0 1 4 11.6 8.6 8.6 0 0 1 12.6 3 8.4 8.4 0 0 1 21 11.5Z" /><path d="M8.5 10.5h7" /><path d="M8.5 14h4.5" /></svg>
+        问问家里现在情况
+      </button>
+      {!hasNoItemsAtAll && (
+        <button type="button" className="quiet-button order-import-trigger" onClick={onOpenOrderImport}>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>
+          从订单截图导入
+        </button>
+      )}
+    </div>
+  )
 
   return (
     <div className={`current-section${!hasAnyTasks ? " is-empty" : ""}`}>
+      {!hasAnyTasks && quickActions}
       {hasAnyTasks && (
         <section className="task-module" aria-labelledby="current-title">
-          <div className="current-heading"><h2 id="current-title">当前待处理</h2><span>{items.length} 项</span></div>
+          <div className="current-heading">
+            <h2 id="current-title">当前待处理 <span>{items.length} 项</span></h2>
+            {quickActions}
+          </div>
           {hasCurrentTasks && (
             <div className="current-list">
               {items.map(({ item, computed }, i) => {
@@ -2026,9 +2823,47 @@ function SettingsPanel({ state, onChange, onRestartOnboarding, onClose, isClosin
   const [budgetDraft, setBudgetDraft] = useState(settings.monthlyBudget ? String(settings.monthlyBudget) : "")
   const [editingReminderHours, setEditingReminderHours] = useState(false)
   const [reminderHoursDraft, setReminderHoursDraft] = useState(String(settings.reminderIntervalHours))
+  const [editingApiKey, setEditingApiKey] = useState(false)
+  const [apiKeyDraft, setApiKeyDraft] = useState("")
+  const [editingChatModel, setEditingChatModel] = useState(false)
+  const [chatModelDraft, setChatModelDraft] = useState(settings.aiChatModel ?? settings.aiModel ?? "")
+  const [editingOrderModel, setEditingOrderModel] = useState(false)
+  const [orderModelDraft, setOrderModelDraft] = useState(settings.aiOrderModel ?? settings.aiModel ?? "")
 
   function patch(values: Partial<typeof settings>) {
     onChange({ ...state, settings: { ...settings, ...values } })
+  }
+
+  function saveApiKey() {
+    const trimmed = apiKeyDraft.trim()
+    patch({ aiApiKey: trimmed || undefined })
+    setEditingApiKey(false)
+    setApiKeyDraft("")
+  }
+
+  function cancelApiKeyEdit() {
+    setEditingApiKey(false)
+    setApiKeyDraft("")
+  }
+
+  function saveChatModel() {
+    patch({ aiChatModel: chatModelDraft.trim() || undefined })
+    setEditingChatModel(false)
+  }
+
+  function cancelChatModelEdit() {
+    setChatModelDraft(settings.aiChatModel ?? settings.aiModel ?? "")
+    setEditingChatModel(false)
+  }
+
+  function saveOrderModel() {
+    patch({ aiOrderModel: orderModelDraft.trim() || undefined })
+    setEditingOrderModel(false)
+  }
+
+  function cancelOrderModelEdit() {
+    setOrderModelDraft(settings.aiOrderModel ?? settings.aiModel ?? "")
+    setEditingOrderModel(false)
   }
 
   function saveBudget() {
@@ -2169,6 +3004,129 @@ function SettingsPanel({ state, onChange, onRestartOnboarding, onClose, isClosin
                 <button type="button" className={!settings.notificationEnabled ? "active" : ""} aria-pressed={!settings.notificationEnabled} onClick={() => patch({ notificationEnabled: false })}>关闭</button>
                 <button type="button" className={settings.notificationEnabled ? "active" : ""} aria-pressed={settings.notificationEnabled} onClick={() => patch({ notificationEnabled: true })}>开启</button>
               </div>
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-row-label">AI API Key</span>
+            <div className="settings-row-control settings-api-key-control">
+              {editingApiKey ? (
+                <div className="settings-secret-editor">
+                  <input
+                    autoFocus
+                    aria-label="阿里云百炼 API Key"
+                    type="password"
+                    value={apiKeyDraft}
+                    onChange={(event) => setApiKeyDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") saveApiKey()
+                      if (event.key === "Escape") {
+                        event.stopPropagation()
+                        cancelApiKeyEdit()
+                      }
+                    }}
+                    placeholder="sk-..."
+                  />
+                  <button type="button" className="settings-secret-action" onClick={saveApiKey}>确认</button>
+                  <button type="button" className="settings-secret-action muted" onClick={cancelApiKeyEdit}>取消</button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="editable-value settings-editable-value"
+                  onClick={() => {
+                    setApiKeyDraft(settings.aiApiKey ?? "")
+                    setEditingApiKey(true)
+                  }}
+                >
+                  <span>{settings.aiApiKey ? `已设置（尾号 ${settings.aiApiKey.slice(-4)}）` : "未设置"}</span>
+                  <Icon name="edit" size={13} />
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-row-label">问答模型</span>
+            <div className="settings-row-control settings-api-key-control">
+              {editingChatModel ? (
+                <div className="settings-secret-editor settings-model-editor">
+                  <input
+                    autoFocus
+                    aria-label="家庭问答模型 ID"
+                    type="text"
+                    value={chatModelDraft}
+                    onChange={(event) => setChatModelDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") saveChatModel()
+                      if (event.key === "Escape") {
+                        event.stopPropagation()
+                        cancelChatModelEdit()
+                      }
+                    }}
+                    placeholder="默认 qwen-plus"
+                  />
+                  <button type="button" className="settings-secret-action" onClick={saveChatModel}>确认</button>
+                  <button type="button" className="settings-secret-action muted" onClick={cancelChatModelEdit}>取消</button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="editable-value settings-editable-value settings-model-value"
+                  onClick={() => {
+                    setChatModelDraft(settings.aiChatModel ?? settings.aiModel ?? "")
+                    setEditingChatModel(true)
+                  }}
+                >
+                  <span>{settings.aiChatModel || settings.aiModel || "默认 qwen-plus"}</span>
+                  <Icon name="edit" size={13} />
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-row-label">订单识别模式</span>
+            <div className="settings-row-control">
+              <div className="segment-control notification-segment" role="group" aria-label="订单识别模式">
+                <button type="button" className={(settings.aiOrderMode ?? "accurate") === "accurate" ? "active" : ""} aria-pressed={(settings.aiOrderMode ?? "accurate") === "accurate"} onClick={() => patch({ aiOrderMode: "accurate" })}>准确</button>
+                <button type="button" className={(settings.aiOrderMode ?? "accurate") === "fast" ? "active" : ""} aria-pressed={(settings.aiOrderMode ?? "accurate") === "fast"} onClick={() => patch({ aiOrderMode: "fast" })}>快速</button>
+              </div>
+            </div>
+          </div>
+          <div className="settings-row">
+            <span className="settings-row-label">订单识别模型</span>
+            <div className="settings-row-control settings-api-key-control">
+              {editingOrderModel ? (
+                <div className="settings-secret-editor settings-model-editor">
+                  <input
+                    autoFocus
+                    aria-label="订单识别模型 ID"
+                    type="text"
+                    value={orderModelDraft}
+                    onChange={(event) => setOrderModelDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") saveOrderModel()
+                      if (event.key === "Escape") {
+                        event.stopPropagation()
+                        cancelOrderModelEdit()
+                      }
+                    }}
+                    placeholder={(settings.aiOrderMode ?? "accurate") === "fast" ? "快速模式默认模型" : "准确模式默认模型"}
+                  />
+                  <button type="button" className="settings-secret-action" onClick={saveOrderModel}>确认</button>
+                  <button type="button" className="settings-secret-action muted" onClick={cancelOrderModelEdit}>取消</button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  className="editable-value settings-editable-value settings-model-value"
+                  onClick={() => {
+                    setOrderModelDraft(settings.aiOrderModel ?? settings.aiModel ?? "")
+                    setEditingOrderModel(true)
+                  }}
+                >
+                  <span>{settings.aiOrderModel || settings.aiModel || ((settings.aiOrderMode ?? "accurate") === "fast" ? "快速模式默认" : "准确模式默认")}</span>
+                  <Icon name="edit" size={13} />
+                </button>
+              )}
             </div>
           </div>
         </div>
@@ -2670,6 +3628,536 @@ function RestockRecordEditModal({ isOpen, item, record, onClose, onSave }: Resto
         <div className="modal-footer">
           <button className="btn btn-secondary" onClick={onClose}>取消</button>
           <button className="btn btn-primary" onClick={handleSubmit}>保存修改</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---------- 订单截图批量导入 ----------
+
+/** 同一天且价格一致的记录视为疑似重复导入 */
+function hasSimilarRestockRecord(item: ReplenishmentItem, orderDate?: number, price?: number): boolean {
+  if (!orderDate) return false
+  return item.history.some((event) =>
+    startOfDay(event.at) === orderDate && (price === undefined || event.price === price)
+  )
+}
+
+/** 单次批量导入的截图数量上限，控制识别成本与确认列表长度 */
+const MAX_ORDER_IMAGES = 5
+
+type OrderImportRow = {
+  key: string
+  productName: string
+  brandName?: string
+  coreName?: string
+  qty: number | ''
+  price: number | ''
+  measureAmount: number | ''
+  measureUnit: string
+  review: string
+  date: string
+  platform: string
+  genericName?: string
+  /** itemId | "__create__" | "__skip__" */
+  targetItem: string
+  /** "" (不指定) | optionId | "__newopt__" (新建常购商品) */
+  targetOption: string
+  /** 目标分类；"__newcat__" 表示使用 customCategory */
+  category: string
+  customCategory: string
+  duplicate: boolean
+}
+
+export type OrderImportConfirmedRow = {
+  productName: string
+  brandName?: string
+  coreName?: string
+  qty: number
+  price?: number
+  measureAmount?: number
+  measureUnit?: string
+  review?: string
+  restockDate?: number
+  platform?: string
+  genericName?: string
+  targetItem: string
+  targetOption: string
+  /** 已解析的目标分类 */
+  category: string
+}
+
+interface OrderImportModalProps {
+  isOpen: boolean
+  onClose: () => void
+  items: ReplenishmentItem[]
+  categories: string[]
+  apiKey?: string
+  model?: string
+  recognitionMode: OrderRecognitionMode
+  onOpenSettings: () => void
+  onConfirm: (payload: { rows: OrderImportConfirmedRow[] }) => void
+}
+
+/** 该常购商品最近一次补货记录里的含量快照，用于预填（如皇家猫粮 L40 每袋 2kg） */
+function latestMeasureForOption(item: ReplenishmentItem, optionId: string | undefined): { amount?: number; unit?: string } {
+  if (!optionId) return {}
+  for (let i = item.history.length - 1; i >= 0; i--) {
+    const event = item.history[i]
+    if (event.purchaseOptionId === optionId && event.purchaseMeasureAmount && event.purchaseMeasureUnit) {
+      return { amount: event.purchaseMeasureAmount, unit: event.purchaseMeasureUnit }
+    }
+  }
+  return {}
+}
+
+function OrderImportModal({ isOpen, onClose, items, categories, apiKey, model, recognitionMode, onOpenSettings, onConfirm }: OrderImportModalProps) {
+  const [step, setStep] = useState<"pick" | "loading" | "review">("pick")
+  const [error, setError] = useState("")
+  const [rows, setRows] = useState<OrderImportRow[]>([])
+  const [progress, setProgress] = useState({ done: 0, total: 0 })
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  // 弹窗关闭或重选图片后递增，丢弃已经在途的识别结果
+  const requestTokenRef = useRef(0)
+
+  useEffect(() => {
+    if (isOpen) {
+      setStep("pick")
+      setError("")
+      setRows([])
+      setProgress({ done: 0, total: 0 })
+      requestTokenRef.current++
+    }
+  }, [isOpen])
+
+  function buildRowsFromOrder(order: ExtractedOrder, imageIndex: number): OrderImportRow[] {
+    const defaultDate = toDateInputValue(order.orderDate ?? Date.now())
+    const defaultCategory = categories.includes("其他") ? "其他" : (categories[0] || "其他")
+    return order.lines.map((line, index) => {
+      const matchedItem = (line.matchedItemName ? items.find((item) => item.name === line.matchedItemName) : undefined)
+        || fuzzyMatchItem([line.coreName, line.productName, line.brandName, line.genericName], items)
+      const matchedOption = matchedItem
+        ? ((line.matchedOptionName ? (matchedItem.purchaseOptions || []).find((option) => option.productName === line.matchedOptionName) : undefined)
+          || fuzzyMatchOption(matchedItem, [line.coreName, line.productName, line.brandName]))
+        : undefined
+      // 含量预填优先级：标题里识别出的规格 > 该常购商品最近一次记录的含量快照
+      const historyMeasure = matchedItem && matchedOption ? latestMeasureForOption(matchedItem, matchedOption.id) : {}
+      return {
+        key: `img${imageIndex}_line${index}`,
+        productName: line.productName,
+        brandName: line.brandName,
+        coreName: line.coreName,
+        qty: line.qty,
+        price: line.price ?? '',
+        measureAmount: line.measureAmount ?? historyMeasure.amount ?? '',
+        measureUnit: line.measureUnit ?? historyMeasure.unit ?? '',
+        review: '',
+        date: defaultDate,
+        platform: order.platform || '',
+        genericName: line.genericName,
+        targetItem: matchedItem ? matchedItem.id : "__create__",
+        // 匹配到物品但没有对应常购商品时，默认顺带新建常购商品（可在下拉改为不指定）
+        targetOption: matchedItem
+          ? (matchedOption ? matchedOption.id : ((line.coreName || line.brandName || line.productName) ? "__newopt__" : ""))
+          : "",
+        category: matchedItem?.category || defaultCategory,
+        customCategory: "",
+        duplicate: matchedItem ? hasSimilarRestockRecord(matchedItem, order.orderDate, line.price) : false
+      }
+    })
+  }
+
+  async function recognize(files: File[]) {
+    if (!apiKey) {
+      setError("还没有配置识别服务，请先在设置中填写订单识别 API Key。")
+      return
+    }
+    const imageFiles = files.filter((file) => file.type.startsWith("image/"))
+    if (!imageFiles.length) return
+    const limited = imageFiles.slice(0, MAX_ORDER_IMAGES)
+    const skippedCount = imageFiles.length - limited.length
+    const token = ++requestTokenRef.current
+    setStep("loading")
+    setError("")
+    setProgress({ done: 0, total: limited.length })
+
+    const catalog = [...items]
+      .sort((a, b) => {
+        const latestA = Math.max(a.updatedAt || 0, ...a.history.map((event) => event.at || 0))
+        const latestB = Math.max(b.updatedAt || 0, ...b.history.map((event) => event.at || 0))
+        return latestB - latestA
+      })
+      .map((item) => ({
+        name: item.name,
+        options: (item.purchaseOptions || []).map((option) => option.productName)
+      }))
+    // 并发识别，单张失败不阻塞其他截图
+    const results = await Promise.all(limited.map(async (file) => {
+      try {
+        const dataUrl = await fileToCompressedDataUrl(file)
+        return await extractOrderFromImage(apiKey, dataUrl, catalog, model, recognitionMode)
+      } catch {
+        return { ok: false as const, error: "图片读取失败" }
+      } finally {
+        if (token === requestTokenRef.current) {
+          setProgress((current) => ({ ...current, done: current.done + 1 }))
+        }
+      }
+    }))
+    if (token !== requestTokenRef.current) return
+
+    const nextRows = results.flatMap((result, imageIndex) => result.ok ? buildRowsFromOrder(result.order, imageIndex) : [])
+    const failedCount = results.filter((result) => !result.ok).length
+    if (!nextRows.length) {
+      setStep("pick")
+      const firstError = results.find((result) => !result.ok)
+      setError(firstError && !firstError.ok ? firstError.error : "没有识别出商品条目，请换清晰的订单截图重试。")
+      return
+    }
+    setRows(nextRows)
+    const notices: string[] = []
+    if (failedCount > 0) notices.push(`有 ${failedCount} 张截图识别失败，已跳过`)
+    if (skippedCount > 0) notices.push(`超出单次 ${MAX_ORDER_IMAGES} 张上限，已忽略 ${skippedCount} 张`)
+    setError(notices.join("；"))
+    setStep("review")
+  }
+
+  function handleFileChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files || [])
+    if (files.length) void recognize(files)
+    event.target.value = ''
+  }
+
+  // 支持直接粘贴截图
+  useEffect(() => {
+    if (!isOpen || step !== "pick") return
+    function handlePaste(event: ClipboardEvent) {
+      const files = Array.from(event.clipboardData?.items || [])
+        .filter((entry) => entry.type.startsWith("image/"))
+        .flatMap((entry) => {
+          const file = entry.getAsFile()
+          return file ? [file] : []
+        })
+      if (files.length) {
+        event.preventDefault()
+        void recognize(files)
+      }
+    }
+    window.addEventListener("paste", handlePaste)
+    return () => window.removeEventListener("paste", handlePaste)
+  }, [isOpen, step, items, apiKey, model, categories])
+
+  if (!isOpen) return null
+
+  function updateRow(key: string, patch: Partial<OrderImportRow>) {
+    setRows((current) => current.map((row) => row.key === key ? { ...row, ...patch } : row))
+  }
+
+  const includedCount = rows.filter((row) => row.targetItem !== "__skip__" && row.qty !== '' && Number(row.qty) > 0).length
+
+  function handleConfirm() {
+    onConfirm({
+      rows: rows
+        .filter((row) => row.targetItem !== "__skip__" && row.qty !== '' && Number(row.qty) > 0)
+        .map((row) => {
+          const measureAmount = row.measureAmount === '' ? undefined : Math.max(0, Number(row.measureAmount)) || undefined
+          return {
+            productName: row.productName,
+            brandName: row.brandName,
+            coreName: row.coreName,
+            qty: Math.max(1, Math.round(Number(row.qty))),
+            price: row.price === '' ? undefined : Math.max(0, Number(row.price)),
+            measureAmount,
+            measureUnit: measureAmount && row.measureUnit ? row.measureUnit : undefined,
+            review: row.review.trim() || undefined,
+            restockDate: parseDateInputValue(row.date),
+            platform: row.platform || undefined,
+            genericName: row.genericName,
+            targetItem: row.targetItem,
+            targetOption: row.targetOption,
+            category: row.category === "__newcat__" ? row.customCategory.trim() || "其他" : row.category
+          }
+        })
+    })
+  }
+
+  return (
+    <div className="restock-modal-overlay">
+      <div className="restock-modal order-import-modal" onClick={(event) => event.stopPropagation()}>
+        <div className="modal-header">
+          <h3>从订单截图导入</h3>
+          <button className="icon-button modal-close-btn" onClick={onClose} aria-label="关闭">
+            <Icon name="close" size={18} />
+          </button>
+        </div>
+
+        <div className="modal-body">
+          {step === "pick" && (
+            <div className="order-import-pick">
+              <div
+                className="order-import-dropzone"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={(event) => {
+                  event.preventDefault()
+                  const files = Array.from(event.dataTransfer.files).filter((entry) => entry.type.startsWith("image/"))
+                  if (files.length) void recognize(files)
+                }}
+              >
+                <button type="button" className="primary-button green" onClick={() => fileInputRef.current?.click()}>选择订单截图</button>
+                <p className="order-import-hint">支持京东、拼多多、淘宝等订单页截图，一次最多 {MAX_ORDER_IMAGES} 张。</p>
+                <input ref={fileInputRef} type="file" accept="image/*" multiple style={{ display: "none" }} onChange={handleFileChange} />
+              </div>
+              {!apiKey && (
+                <p className="order-import-key-hint">
+                  识别能力需要 API Key 才能使用。
+                  <button type="button" className="text-button" onClick={onOpenSettings}>去设置填写</button>
+                </p>
+              )}
+              {error && <p className="form-error" role="alert">{error}</p>}
+            </div>
+          )}
+
+          {step === "loading" && (
+            <div className="order-import-loading" role="status" aria-live="polite">
+              <span className="order-import-spinner" aria-hidden="true" />
+              <p>{progress.total > 1 ? `正在识别订单内容（${progress.done}/${progress.total} 张）…` : "正在识别订单内容…"}</p>
+              <small>通常需要几秒到十几秒</small>
+            </div>
+          )}
+
+          {step === "review" && (
+            <div className="order-import-review">
+              <div className="order-import-rows">
+                {rows.map((row) => {
+                  const resolvedCategory = row.category === "__newcat__" ? (row.customCategory.trim() || "其他") : row.category
+                  const targetItemObj = items.find((item) => item.id === row.targetItem)
+                  const categoryItems = items.filter((item) => item.category === resolvedCategory || item.id === row.targetItem)
+                  const selectedOption = targetItemObj?.purchaseOptions?.find((option) => option.id === row.targetOption)
+                  const unitLabel = selectedOption?.unit || targetItemObj?.unit || "件"
+                  const editableName = row.coreName ?? row.brandName ?? row.productName
+                  const coreLabel = editableName.trim() || row.brandName || row.productName
+                  const matchStatus = row.targetItem === "__skip__"
+                    ? "已跳过"
+                    : row.targetItem === "__create__"
+                      ? "将新建消耗品"
+                      : selectedOption
+                        ? "已匹配常购商品"
+                        : row.targetOption === "__newopt__"
+                          ? "将新建常购商品"
+                          : "可能需要手动确认"
+                  const measureUnitChoices = selectedOption?.measureUnit
+                    ? getCompatibleMeasureUnits(selectedOption.measureUnit)
+                    : measureUnitDefinitions
+                  return (
+                    <div key={row.key} className={`order-import-row${row.targetItem === "__skip__" ? " is-skipped" : ""}`}>
+                      <div className="order-import-card-title">
+                        <label className="order-import-name-field">
+                          <span>商品名</span>
+                          <input
+                            type="text"
+                            value={editableName}
+                            aria-label="商品名"
+                            title={row.productName}
+                            onChange={(event) => updateRow(row.key, { coreName: event.target.value })}
+                          />
+                        </label>
+                        <span className="order-import-match-status">{matchStatus}</span>
+                      </div>
+
+                      <div className="order-import-card-section order-import-target-section" aria-label={`${coreLabel}归类方式`}>
+                        <div className="order-import-target-selects">
+                          <label className="order-import-select-field">
+                            <span>分类</span>
+                            <select
+                              value={row.category}
+                              aria-label={`${coreLabel}分类`}
+                              onChange={(event) => {
+                                const nextCategory = event.target.value
+                                const nextResolvedCategory = nextCategory === "__newcat__" ? (row.customCategory.trim() || "其他") : nextCategory
+                                const firstItem = items.find((item) => item.category === nextResolvedCategory)
+                                const nextOption = firstItem
+                                  ? fuzzyMatchOption(firstItem, [row.coreName, row.productName, row.brandName])
+                                  : undefined
+                                updateRow(row.key, {
+                                  category: nextCategory,
+                                  targetItem: firstItem ? firstItem.id : "__create__",
+                                  targetOption: firstItem
+                                    ? (nextOption ? nextOption.id : ((row.coreName || row.brandName || row.productName) ? "__newopt__" : ""))
+                                    : ""
+                                })
+                              }}
+                            >
+                              {categories.map((name) => <option key={name} value={name}>{name}</option>)}
+                              {!categories.includes("其他") && <option value="其他">其他</option>}
+                              <option value="__newcat__">新建分类</option>
+                            </select>
+                          </label>
+                          {row.category === "__newcat__" && (
+                            <label className="order-import-select-field">
+                              <span>新分类</span>
+                              <input
+                                type="text"
+                                className="order-import-newcat-input"
+                                aria-label={`${coreLabel}新分类名称`}
+                                value={row.customCategory}
+                                onChange={(event) => updateRow(row.key, { customCategory: event.target.value })}
+                                placeholder="如：宝宝用品"
+                              />
+                            </label>
+                          )}
+                          <label className="order-import-select-field">
+                            <span>消耗品</span>
+                            <select
+                              value={row.targetItem}
+                              aria-label={`${coreLabel}消耗品`}
+                              onChange={(event) => {
+                                const nextItemId = event.target.value
+                                const nextItem = items.find((item) => item.id === nextItemId)
+                                // 切换目标物品后重新做常购商品匹配；没有命中且有品牌名时默认顺带新建
+                                const nextOption = nextItem
+                                  ? fuzzyMatchOption(nextItem, [row.coreName, row.productName, row.brandName])
+                                  : undefined
+                                updateRow(row.key, {
+                                  targetItem: nextItemId,
+                                  category: nextItem?.category || row.category,
+                                  targetOption: nextItem
+                                    ? (nextOption ? nextOption.id : ((row.coreName || row.brandName || row.productName) ? "__newopt__" : ""))
+                                    : ""
+                                })
+                              }}
+                            >
+                              {categoryItems.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                              <option value="__create__">新建消耗品「{row.genericName || coreLabel}」</option>
+                              <option value="__skip__">跳过，不导入</option>
+                            </select>
+                          </label>
+                          {targetItemObj && (
+                            <label className="order-import-select-field">
+                              <span>常购商品</span>
+                              <select
+                                value={row.targetOption}
+                                aria-label={`${coreLabel}常购商品`}
+                                onChange={(event) => updateRow(row.key, { targetOption: event.target.value })}
+                              >
+                                <option value="">不指定常购商品</option>
+                                {(targetItemObj.purchaseOptions || []).map((option) => (
+                                  <option key={option.id} value={option.id}>{option.productName}</option>
+                                ))}
+                                <option value="__newopt__">新建「{coreLabel}」</option>
+                              </select>
+                            </label>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="order-import-card-section order-import-row-specs">
+                        <label className="order-import-inline-field">
+                          <span>数量</span>
+                          <input
+                            type="number"
+                            min="1"
+                            aria-label={`${coreLabel}数量`}
+                            value={row.qty}
+                            onChange={(event) => updateRow(row.key, { qty: event.target.value === '' ? '' : Number(event.target.value) })}
+                          />
+                          <b>{unitLabel}</b>
+                        </label>
+                        <label className="order-import-inline-field">
+                          <span>含量</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            aria-label={`${coreLabel}单件含量`}
+                            value={row.measureAmount}
+                            onChange={(event) => updateRow(row.key, { measureAmount: event.target.value === '' ? '' : Number(event.target.value) })}
+                            placeholder="选填"
+                          />
+                          <select
+                            value={row.measureUnit}
+                            aria-label={`${coreLabel}含量单位`}
+                            onChange={(event) => updateRow(row.key, { measureUnit: event.target.value })}
+                          >
+                            <option value="">单位</option>
+                            {measureUnitChoices.map((unit) => <option key={unit.value} value={unit.value}>{unit.label}</option>)}
+                            {row.measureUnit && !measureUnitChoices.some((unit) => unit.value === row.measureUnit) && (
+                              <option value={row.measureUnit}>{row.measureUnit}</option>
+                            )}
+                          </select>
+                        </label>
+                        <label className="order-import-inline-field">
+                          <span>价格</span>
+                          <input
+                            type="number"
+                            min="0"
+                            step="0.01"
+                            aria-label={`${coreLabel}总价`}
+                            value={row.price}
+                            onChange={(event) => updateRow(row.key, { price: event.target.value === '' ? '' : Number(event.target.value) })}
+                            placeholder="总价"
+                          />
+                          <b>元</b>
+                        </label>
+                      </div>
+
+                      <div className="order-import-card-section order-import-row-meta">
+                        <label className="order-import-inline-field">
+                          <span>日期</span>
+                          <input
+                            type="date"
+                            aria-label={`${coreLabel}购买日期`}
+                            value={row.date}
+                            onChange={(event) => updateRow(row.key, { date: event.target.value })}
+                          />
+                        </label>
+                        <label className="order-import-inline-field">
+                          <span>平台</span>
+                          <select
+                            value={row.platform}
+                            aria-label={`${coreLabel}购买平台`}
+                            onChange={(event) => updateRow(row.key, { platform: event.target.value })}
+                          >
+                            <option value="">选填</option>
+                            {platforms.map((name) => <option key={name} value={name}>{name}</option>)}
+                          </select>
+                        </label>
+                        <label className="order-import-inline-field order-import-review-field">
+                          <span>评价</span>
+                          <input
+                            type="text"
+                            aria-label={`${coreLabel}商品评价`}
+                            value={row.review}
+                            onChange={(event) => updateRow(row.key, { review: event.target.value })}
+                            placeholder="选填"
+                          />
+                        </label>
+                      </div>
+
+                      {row.duplicate && row.targetItem !== "__skip__" && (
+                        <span className="order-import-duplicate-hint">当天已有相同记录，可能重复</span>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+              {error && <p className="form-error" role="alert">{error}</p>}
+            </div>
+          )}
+        </div>
+
+        <div className="modal-footer">
+          {step === "review" ? (
+            <>
+              <button className="btn btn-secondary" onClick={() => { setStep("pick"); setError("") }}>重新选图</button>
+              <button className="btn btn-secondary" onClick={onClose}>取消</button>
+              <button className="btn btn-primary" onClick={handleConfirm} disabled={includedCount === 0}>
+                确认导入 {includedCount} 项
+              </button>
+            </>
+          ) : (
+            <button className="btn btn-secondary" onClick={onClose}>取消</button>
+          )}
         </div>
       </div>
     </div>
@@ -3575,16 +5063,36 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
         {views.map(({ item, computed }) => (
           <div key={item.id} className={`category-item-group ${expandedId === item.id ? "is-expanded" : ""}`}>
             <div className={`category-item ${expandedId === item.id ? "is-expanded" : ""}`}>
-              <div className="category-item-main">
+              <div
+                className="category-item-main"
+                role="button"
+                tabIndex={0}
+                aria-expanded={expandedId === item.id}
+                onClick={() => toggleExpand(item, computed)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault()
+                    toggleExpand(item, computed)
+                  }
+                }}
+              >
                 {/* 左侧状态圆点 */}
                 <span className={`status-dot ${computed.displayStatus}`} />
                 <div className="category-item-copy">
-                  <button type="button" className="category-item-title-action" onClick={() => toggleExpand(item, computed)} aria-expanded={expandedId === item.id}>
-                    <div className="item-title-row"><strong>{item.name}</strong></div>
-                  </button>
+                  <div className="item-title-row"><strong>{item.name}</strong></div>
                   <div className="category-item-meta-row">
-                    <button type="button" className="category-item-status-action" onClick={() => toggleExpand(item, computed)} aria-expanded={expandedId === item.id}>{formatItemStatusText(item, computed)}</button>
-                    <button type="button" className="inline-detail-action" onClick={() => onOpenItem(item)} aria-label={`查看${item.name}详情`}>查看详情</button>
+                    <span className="category-item-status-action">{formatItemStatusText(item, computed)}</span>
+                    <button
+                      type="button"
+                      className="inline-detail-action"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        onOpenItem(item)
+                      }}
+                      aria-label={`查看${item.name}详情`}
+                    >
+                      查看详情
+                    </button>
                   </div>
                 </div>
               </div>
@@ -3800,6 +5308,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
                                   <div key={record.id} className="restock-record compact">
                                     {/* 左侧：所有关键信息 */}
                                     <div className="record-info">
+                                      {record.platform && <span className="purchase-shelf-platform record-platform-tag" data-platform={record.platform}>{record.platform}</span>}
                                       <span className="record-date">{formatFullDate(record.at)}</span>
                                       <span className="record-separator">·</span>
                                       <span className="record-product">{recordProductName}</span>
@@ -3895,9 +5404,11 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
   )
 }
 
-function Sidebar({ dueCount, categorySummaries, activeCategory, pendingDelete, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onRequestDeleteCategory, onCancelDeleteCategory, onConfirmDeleteCategory }: {
+function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, pendingDelete, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onRequestDeleteCategory, onCancelDeleteCategory, onConfirmDeleteCategory }: {
   dueCount: number
   categorySummaries: Array<{ category: string; views: ItemView[]; urgent: number; warning: number }>
+  allItems: ReplenishmentItem[]
+  now: number
   activeCategory: string | null
   onSelectCategory: (category: string | null) => void
   onCreateCategory: () => void
@@ -3938,7 +5449,18 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, pendingDelete, o
       </button>
 
       <div className="sidebar-divider" />
-      <span className="sidebar-section-label">分类</span>
+      <div className="sidebar-section-heading">
+        <span className="sidebar-section-label">分类</span>
+        <button
+          type="button"
+          className="sidebar-section-add"
+          onClick={onCreateCategory}
+          aria-label="新建分类"
+          title="新建分类"
+        >
+          <Icon name="plus" size={13} />
+        </button>
+      </div>
 
       {categorySummaries.map(({ category, views, urgent, warning }) => {
         const dotStatus = urgent ? "urgent" : warning ? "warning" : "normal"
@@ -4104,12 +5626,8 @@ function Sidebar({ dueCount, categorySummaries, activeCategory, pendingDelete, o
         )
       })}
 
-      <div className="sidebar-divider" />
-      <button className="sidebar-add" onClick={onCreateCategory}>
-        <Icon name="plus" size={13} />
-        新建分类
-      </button>
-      
+      <RestockHeatmap items={allItems} now={now} />
+
       <button className="sidebar-settings" onClick={onOpenSettings}>
         <Icon name="settings" size={13} />
         设置

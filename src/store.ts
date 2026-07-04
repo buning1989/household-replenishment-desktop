@@ -119,7 +119,12 @@ function migrateSettings(raw: unknown): ReminderSettings {
     notificationEnabled: raw.notificationEnabled !== false,
     monthlyBudget: asFiniteNumber(raw.monthlyBudget) !== undefined && (asFiniteNumber(raw.monthlyBudget) as number) > 0
       ? asFiniteNumber(raw.monthlyBudget)
-      : undefined
+      : undefined,
+    aiApiKey: asString(raw.aiApiKey),
+    aiModel: asString(raw.aiModel),
+    aiChatModel: asString(raw.aiChatModel),
+    aiOrderModel: asString(raw.aiOrderModel),
+    aiOrderMode: raw.aiOrderMode === "fast" ? "fast" : "accurate"
   }
 }
 

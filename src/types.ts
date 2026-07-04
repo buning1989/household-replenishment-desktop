@@ -141,6 +141,16 @@ export type ReminderSettings = {
   quietEnd: string
   notificationEnabled: boolean
   monthlyBudget?: number
+  /** 阿里云百炼（DashScope）API Key，用于订单截图识别；仅存本地。 */
+  aiApiKey?: string
+  /** @deprecated 旧版共用模型 ID；迁移时作为问答和订单识别的兜底。 */
+  aiModel?: string
+  /** 家庭问答使用的文本模型 ID。 */
+  aiChatModel?: string
+  /** 订单截图识别使用的视觉模型 ID。 */
+  aiOrderModel?: string
+  /** 订单识别默认模型策略：准确优先或速度优先。 */
+  aiOrderMode?: "accurate" | "fast"
 }
 
 export type AppState = {
