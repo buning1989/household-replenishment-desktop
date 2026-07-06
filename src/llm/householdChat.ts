@@ -88,6 +88,11 @@ export type HouseholdChatMessage = {
   orderImportStatus?: "pending" | "confirmed" | "cancelled"
   /** 订单截图导入确认后的写入结果摘要与跳转入口 */
   orderImportResult?: { summary: string; links: ChatMessageLink[] }
+  /**
+   * 临时 loading 消息标记：响应节奏层（respondWithPacing）在等待最终结果时插入。
+   * 最终结果返回后会被替换掉，不进入长期历史，也不进入 LLM 上下文（compactRecentMessages 会跳过）。
+   */
+  isTransient?: boolean
 }
 
 /**

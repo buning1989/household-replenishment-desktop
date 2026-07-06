@@ -186,6 +186,9 @@ export function compactRecentMessages(
   const compacted: Array<{ role: "user" | "assistant"; content: string }> = []
 
   for (const msg of messages) {
+    // 临时 loading 消息不进入 LLM 上下文
+    if (msg.isTransient) continue
+
     if (msg.role === "user") {
       // 图片只保留「用户上传了订单截图」
       if (msg.imageAttachments?.length) {

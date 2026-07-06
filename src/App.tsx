@@ -25,11 +25,12 @@ import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMa
 import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
 import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
-import { classifyBatchIntent } from "./agent/intent"
+import { classifyBatchIntent, classifyAgentIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
 import { buildAgentContextPack, supersedeOldPendingDraft } from "./agent/conversationContext"
 import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
+import { computeRemainingDelay, getResponseTiming } from "./agent/responsePacing"
 import {
   buildOrderImportRowsFromExtract,
   orderImportRowsToConfirmed,
@@ -1576,6 +1577,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 }) {
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
+  /** 响应节奏层：等待期间显示的场景化 loading 文案；为空时只显示轻微 typing 指示器 */
+  const [loadingText, setLoadingText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
@@ -1834,6 +1837,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     ]
     onMessagesChange(baseMessages)
     setLoading(true)
+    setLoadingText("我看一下这张订单。")
     // 构造 catalog：与 OrderImportModal 一致，按最近活跃度排序
     const catalog = [...state.items]
       .sort((a, b) => {
@@ -1847,6 +1851,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       }))
     const result = await extractOrderFromImage(orderImageApiKey, dataUrl, catalog, orderImageModel, orderRecognitionMode || "accurate")
     setLoading(false)
+    setLoadingText(null)
     if (!result.ok) {
       onMessagesChange([...baseMessages, { role: "assistant", content: result.error }])
       return
@@ -1935,22 +1940,37 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       dateContext
     })
 
+    // 响应节奏层：根据意图/turn/上下文决定这一轮的最小延迟和 loading 文案。
+    // sync 路径用 loading 状态显示短暂思考；LLM 路径用 loading 同时承担真实等待。
+    const pacingIntent = classifyAgentIntent(text, Boolean(pendingDraft))
+    const timing = getResponseTiming({
+      text,
+      intent: pacingIntent,
+      turn: decision.kind === "sync" ? decision.turn : null,
+      hasPendingDraft: Boolean(pendingDraft)
+    })
+
     if (decision.kind === "sync") {
       const turn = decision.turn
       // 批量意图标记：交回外层 batch 处理函数（应该在上面已处理，走到这里说明 batch 已失效）
       if (isBatchIntentMarker(turn)) {
+        // 仍走节奏，避免秒回
+        await waitWithLoading(timing)
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
         return
       }
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft === pendingDraft) {
-        // confirmDraft：orchestrator 标记 proposal(原 draft)，实际执行 commit
+        // confirmDraft：立即反馈，不显示思考
         confirmAgentDraft(pendingMessageIndex, nextMessages)
         return
       }
       if (turn.kind === "cancelled") {
+        // 取消：立即反馈，不显示思考
         cancelAgentDraft(pendingMessageIndex, nextMessages)
         return
       }
+      // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal）：走节奏
+      await waitWithLoading(timing)
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft !== pendingDraft) {
         // 修订：旧 pending 标 superseded，新 draft 标 pending
         const base = nextMessages.map((message, index) => index === pendingMessageIndex
@@ -1968,7 +1988,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       inputRef.current?.focus()
       return
     }
+    // LLM 路径：loading 同时承担真实等待 + 最小延迟
     setLoading(true)
+    if (timing.showTyping) setLoadingText(timing.loadingText ?? null)
+    const llmStart = Date.now()
     // 构造上下文包：LLM 只看 contextPack 里的内容，不再接收完整 messages
     const contextPack = buildAgentContextPack({
       messages: nextMessages,
@@ -1983,8 +2006,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       model: state.settings.aiChatModel ?? state.settings.aiModel,
       contextPack
     })
+    // 实际耗时已超过 minDelayMs 时不再额外等待
+    const remaining = computeRemainingDelay(timing.minDelayMs, Date.now() - llmStart)
+    if (remaining > 0) await sleep(remaining)
+    setLoading(false)
+    setLoadingText(null)
 	    if (result.ok) {
-	      setLoading(false)
 	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
 	        text, state, itemViews, pendingDraft, dateContext
 	      })
@@ -2007,7 +2034,6 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	      }
 	      onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
 	    } else {
-	      setLoading(false)
       // 任务四 A：LLM 失败/超时时用 answerHouseholdQuickly 作为兜底回答
       const fallbackAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext, seenObservationKeys)
       if (fallbackAnswer) {
@@ -2018,6 +2044,23 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       const boundaryFallback = composeBoundaryAnswer(classifyConversationBoundary(text), text)
       onMessagesChange([...nextMessages, { role: "assistant", content: boundaryFallback }])
     }
+  }
+
+  /** 响应节奏层辅助：根据 timing 显示 loading 并等待 minDelayMs */
+  async function waitWithLoading(timing: { minDelayMs: number; loadingText?: string; showTyping: boolean }) {
+    if (timing.minDelayMs <= 0) return
+    if (timing.showTyping) {
+      setLoading(true)
+      setLoadingText(timing.loadingText ?? null)
+    }
+    await sleep(timing.minDelayMs)
+    setLoading(false)
+    setLoadingText(null)
+  }
+
+  /** 简单的 sleep 工具 */
+  function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms))
   }
 
   /** 把 AgentTurn 映射成 HouseholdChatMessage。UI 只读 message + 附带字段，不直接读 executableDraft 字段表。 */
@@ -2162,7 +2205,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
             )}
             {loading && (
               <div className="chat-message assistant is-loading">
-                <p>正在查看当前记录…</p>
+                <p>{loadingText || "…"}</p>
               </div>
             )}
           </div>
