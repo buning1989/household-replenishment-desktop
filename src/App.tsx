@@ -27,6 +27,7 @@ import { buildManagerBriefing, buildManagerObservations } from "./agent/observat
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
+import { buildAgentContextPack, supersedeOldPendingDraft } from "./agent/conversationContext"
 import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
 import {
@@ -1968,15 +1969,19 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       return
     }
     setLoading(true)
+    // 构造上下文包：LLM 只看 contextPack 里的内容，不再接收完整 messages
+    const contextPack = buildAgentContextPack({
+      messages: nextMessages,
+      currentUserText: text,
+      state,
+      itemViews,
+      dateContext,
+      seenObservationKeys
+    })
     const result = await askHouseholdAssistant({
       apiKey: state.settings.aiApiKey,
       model: state.settings.aiChatModel ?? state.settings.aiModel,
-      state,
-      itemViews,
-      messages: nextMessages,
-      pendingDraft,
-      dateContext,
-      seenObservationKeys
+      contextPack
     })
 	    if (result.ok) {
 	      setLoading(false)

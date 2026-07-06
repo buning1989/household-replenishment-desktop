@@ -4,6 +4,7 @@ import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
 import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "../agent/drafts"
 import type { OrderImportRow } from "../OrderImportReview"
 import { buildManagerObservations, filterUnseenObservations, markObservationsSeen, observationKey, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
+import type { AgentContextPack, ConversationFocus } from "../agent/conversationContext"
 
 const DEFAULT_CHAT_MODEL = "qwen-plus"
 
@@ -109,13 +110,11 @@ function buildHouseholdManagerSystemPrompt(opts: {
   pendingActions?: ChatProposedAction[]
   repairMissingActionBlock?: boolean
   dateContext: ChatDateContext
-  state: AppState
 }): string {
-  const { pendingDraft, pendingActions, repairMissingActionBlock, dateContext, state } = opts
+  const { pendingDraft, pendingActions, repairMissingActionBlock, dateContext } = opts
   return [
     "你是「403 家庭管家」里长期负责这个家庭日常消耗品的管家，不是通用 AI 助手，也不是表格录入机器人。",
     "",
-    buildManagedItemsLine(state.items),
     "用户说一句很随意的话时，你要先查已有记录、历史补货习惯、常购商品、家庭画像和常识，再替用户整理出一个合理处理方案。",
     "你的目标不是让用户补字段，而是尽量替用户做判断：能根据上下文和生活常识判断的，就先给出一个可执行方案；只有在可能记错物品、重复创建、或用户表达明显冲突时，才追问。",
     "",
@@ -891,40 +890,68 @@ export function buildHouseholdChatStarter(itemViews: HouseholdChatItemView[]): s
   return "当前库存看起来比较稳，你随时跟我说买了什么、记一笔就行。"
 }
 
+/**
+ * 把 ConversationFocus 序列化为 LLM 可读的焦点描述。
+ * 让 LLM 知道当前在处理什么任务，用户的话优先解释为什么。
+ */
+function describeActiveFocus(focus: ConversationFocus): string {
+  if (focus.kind === "pendingDraft") {
+    return `当前有一张待确认草稿（${describeAgentDraft(focus.draft)}）。用户这一轮的话优先解释为对这张草稿的补充或修订。`
+  }
+  if (focus.kind === "orderImport") {
+    return `当前有 ${focus.rows.length} 行订单识别结果待确认。用户这一轮的话优先解释为对订单行的修改、跳过或确认。`
+  }
+  if (focus.kind === "clarification") {
+    return `上一轮你发起了追问：${focus.clarification.question}。用户这一轮的话可能是对追问的回答。`
+  }
+  if (focus.kind === "queryTopic") {
+    return `用户在问 ${focus.topic} 类问题。请基于【相关业务事实】中的数字回答，不要自行推算或编造。`
+  }
+  return "无特定焦点。用户这一轮的话可能是新任务或闲聊。"
+}
+
+/** 根据 focus 类型给 LLM 的动作指引 */
+function describeAllowedActionsGuidance(focus: ConversationFocus): string {
+  if (focus.kind === "pendingDraft") {
+    return [
+      "如果用户在补充商品评价（如「还挺好用的」「不起灰」「猫爱吃」），输出修订后的 draft，把评价写入 review 字段。",
+      "如果用户说纯数字，优先补到 price 字段。",
+      "如果说平台名（京东/淘宝/天猫等），补到 platform 字段。",
+      "如果说日期，补到 restockDate 字段。",
+      "明显跳题才输出 queryAnswer。"
+    ].join("")
+  }
+  if (focus.kind === "orderImport") {
+    return "可输出 queryAnswer 说明订单处理方式，或输出 draft 修订某行。"
+  }
+  if (focus.kind === "queryTopic") {
+    return "输出 queryAnswer，数字必须取自【相关业务事实】段。"
+  }
+  return "根据用户意图输出 queryAnswer / draft / clarification 之一。"
+}
+
 export async function askHouseholdAssistant({
   apiKey,
   model,
-  state,
-  itemViews,
-  messages,
-  pendingActions,
-  pendingDraft,
-  repairMissingActionBlock,
-  dateContext = buildChatDateContext(),
-  seenObservationKeys
+  contextPack,
+  repairMissingActionBlock
 }: {
   apiKey: string
   model?: string
-  state: AppState
-  itemViews: HouseholdChatItemView[]
-  messages: HouseholdChatMessage[]
-  /** 当前处于待确认状态的创建清单；用户若要求修改，模型需输出修订后的完整动作块 */
-  pendingActions?: ChatProposedAction[]
-  /** 当前处于待确认状态的 agent 草稿；用户若要求修改，模型需输出修订后的完整 JSON draft */
-  pendingDraft?: AgentDraft
+  /** 上下文包：包含 activeFocus / recentMessages / relevantAppFacts / pendingExecutable / allowedActions 等。
+   *  LLM 只看到 contextPack 里的内容，不再接收完整 messages。 */
+  contextPack: AgentContextPack
   /** 上一轮疑似忘记动作块时，仅重试一次并把协议纠正放进系统提示 */
   repairMissingActionBlock?: boolean
-  /** 对话日期上下文，所有「今天/这周/未来 7 天」判断以此为准 */
-  dateContext?: ChatDateContext
-  /** 任务四 A：会话级观察去重状态，由调用方维护，面板关闭后重置 */
-  seenObservationKeys?: Set<string>
 }): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
-  const latestQuestion = [...messages].reverse().find((message) => message.role === "user")?.content || ""
-  // 任务四 A：查询类问题把本地计算结果序列化为【本地计算的事实】注入 LLM 上下文，
-  // 系统提示约束数字必须取自该段，不得自行推算或编造。
-  const queryFacts = buildQueryFacts(latestQuestion, state, itemViews, dateContext)
+  const { dateContext, activeFocus, recentMessages, relevantAppFacts, pendingExecutable, allowedActions } = contextPack
+
   const systemPrompt = [
-    buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock, dateContext, state }),
+    buildHouseholdManagerSystemPrompt({
+      pendingDraft: pendingExecutable,
+      repairMissingActionBlock,
+      dateContext
+    }),
     "",
     "【当前时间】",
     `今天是：${dateContext.todayLabel}`,
@@ -933,14 +960,20 @@ export async function askHouseholdAssistant({
     "所有「今天、明天、昨天、这周、下周、未来 7 天」的判断都必须以这个日期为准。",
     "如果家庭数据里出现早于今天的提醒日期，它表示已经过了提醒点，不要说成未来要发生。",
     "",
-    "【当前家庭数据】",
-    buildHouseholdContext(state, itemViews, latestQuestion, dateContext, seenObservationKeys),
-    ...(queryFacts ? ["", queryFacts] : [])
+    "【当前对话焦点】",
+    describeActiveFocus(activeFocus),
+    "",
+    "【允许的动作】",
+    allowedActions.join("、"),
+    describeAllowedActionsGuidance(activeFocus),
+    "",
+    "【相关业务事实】",
+    relevantAppFacts
   ].join("\n")
 
   const requestMessages = [
     { role: "system" as const, content: systemPrompt },
-    ...messages.slice(-8).map((message) => ({ role: message.role, content: message.content }))
+    ...recentMessages.map((message) => ({ role: message.role, content: message.content }))
   ]
 
   if (window.desktop?.chatComplete) {
