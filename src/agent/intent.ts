@@ -32,11 +32,19 @@ type IntentRule = {
 
 // 确认草稿：用户对当前 pending 草稿表达「就这样定下来」。
 // 注意：单字「好」太容易误命中（如「不好用」），故只保留「好的」「好吧」。
-const CONFIRM_PHRASES = [
+//
+// 任务二：把确认词拆成两类，避免「可以帮我看下预算吗」这类含泛化词的长句被误判为确认。
+//   - 明确动词（确认/保存/执行/可以了…）：不受长度限制，整句任意位置命中即算确认。
+//   - 泛化应答（可以/对的/好的/好吧/ok…）：仅当整句去标点后长度 ≤ CONFIRM_CASUAL_MAX_LENGTH 才算确认。
+const CONFIRM_EXPLICIT_PHRASES = [
   "确认吧", "确认创建", "确认记录", "确认补货", "确认补货单", "确认这条", "确认",
   "可以了", "就按这个", "没问题", "保存", "记上", "执行", "执行吧",
-  "可以创建", "可以记录", "可以", "就这样", "对的", "好的", "好吧", "ok", "OK"
+  "可以创建", "可以记录", "就这样"
 ]
+const CONFIRM_CASUAL_PHRASES = ["可以", "对的", "好的", "好吧", "ok", "OK"]
+const CONFIRM_CASUAL_MAX_LENGTH = 6
+// 合并数组，供 classifyBatchIntent 等批量场景复用（批量场景不受长度限制）。
+const CONFIRM_PHRASES = [...CONFIRM_EXPLICIT_PHRASES, ...CONFIRM_CASUAL_PHRASES]
 
 // 取消草稿：用户想撤回当前 pending 草稿。
 // 注意「不要保存」「别记」这类否定要整词命中，避免误伤「不要保存吗」之类的询问。
@@ -81,6 +89,12 @@ const REVISE_KEYWORDS = [
 // 任务一观察引擎的 negativeReviewRepurchase 判定复用此列表的负面子集。
 export const REVIEW_KEYWORDS = ["好用", "不好用", "味道大", "猫不爱吃", "质量一般", "下次不买", "下次别买", "回购", "不回购"]
 
+// 任务二：revise 劫持修复参数。
+// 命中 REVISE_KEYWORDS 时，若整句去标点后长度 > REVISE_MAX_LENGTH，或含疑问信号，
+// 不走本地修订，透传给 LLM（LLM 系统提示里已有 pendingDraft 上下文，能自行判断是修订还是闲聊）。
+const REVISE_MAX_LENGTH = 15
+const REVISE_INTERROGATIVE_PATTERN = /[吗？?]|怎么|什么|多少/
+
 function includesAny(text: string, phrases: string[]): boolean {
   return phrases.some((phrase) => text.includes(phrase))
 }
@@ -100,12 +114,22 @@ const RULES: IntentRule[] = [
   },
   {
     needsPending: true,
-    matches: (text) => includesAny(text, CONFIRM_PHRASES),
+    // 任务二：明确动词不受长度限制；泛化应答仅当整句去标点后 ≤ CONFIRM_CASUAL_MAX_LENGTH 才命中。
+    matches: (text) => {
+      if (includesAny(text, CONFIRM_EXPLICIT_PHRASES)) return true
+      if (text.length <= CONFIRM_CASUAL_MAX_LENGTH && includesAny(text, CONFIRM_CASUAL_PHRASES)) return true
+      return false
+    },
     intent: "confirmDraft"
   },
   {
     needsPending: true,
-    matches: (text, raw) => includesAny(text, REVISE_KEYWORDS) || includesAny(text, REVIEW_KEYWORDS) || /[0-9０-９]+号|[0-9０-９]+月[0-9０-９]+日|20\d{2}-\d{1,2}-\d{1,2}/.test(raw),
+    // 任务二：含疑问信号或整句过长时不走本地修订，透传给 LLM。
+    matches: (text, raw) => {
+      if (REVISE_INTERROGATIVE_PATTERN.test(raw)) return false
+      if (text.length > REVISE_MAX_LENGTH) return false
+      return includesAny(text, REVISE_KEYWORDS) || includesAny(text, REVIEW_KEYWORDS) || /[0-9０-９]+号|[0-9０-９]+月[0-9０-９]+日|20\d{2}-\d{1,2}-\d{1,2}/.test(raw)
+    },
     intent: "reviseDraft"
   },
   {

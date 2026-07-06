@@ -101,6 +101,70 @@ test("agent-intent: shouldSkipQuickAnswerForAgent 仅在 writeDraft 时跳过", 
   assert.equal(shouldSkipQuickAnswerForAgent("帮我加一个洗发水"), true)
 })
 
+// ---------- 任务二：误确认 / 修订劫持修复 ----------
+
+test("任务二验收: 有 pending 时「可以帮我看下预算吗」不是 confirmDraft", () => {
+  // 含泛化词「可以」但整句长度 > 6，不应触发确认；含疑问信号「吗」也不应触发 revise
+  assert.notEqual(classifyAgentIntent("可以帮我看下预算吗", true), "confirmDraft")
+})
+
+test("任务二验收: 「今天天气怎么样」不是 reviseDraft", () => {
+  // 含 REVISE_KEYWORDS「今天」，但含疑问信号「怎么」，应透传给 LLM
+  assert.notEqual(classifyAgentIntent("今天天气怎么样", true), "reviseDraft")
+})
+
+test("任务二验收: 「可以」单独仍是 confirmDraft", () => {
+  assert.equal(classifyAgentIntent("可以", true), "confirmDraft")
+})
+
+test("任务二: 泛化应答 ≤ 6 字符命中 confirm", () => {
+  assert.equal(classifyAgentIntent("可以", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("对的", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("好的", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("好吧", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("ok", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("OK", true), "confirmDraft")
+})
+
+test("任务二: 泛化应答 > 6 字符不命中 confirm", () => {
+  assert.notEqual(classifyAgentIntent("可以帮我看下预算", true), "confirmDraft")
+  assert.notEqual(classifyAgentIntent("对的可以帮我吗", true), "confirmDraft")
+  assert.notEqual(classifyAgentIntent("好的帮我看看吧", true), "confirmDraft")
+})
+
+test("任务二: 明确动词不受长度限制", () => {
+  assert.equal(classifyAgentIntent("确认吧，就这样定下来", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("没问题，按这个来就行", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("可以了，先这样记着", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("保存一下", true), "confirmDraft")
+})
+
+test("任务二: revise 含疑问信号透传 LLM", () => {
+  assert.notEqual(classifyAgentIntent("价格改成多少", true), "reviseDraft")
+  assert.notEqual(classifyAgentIntent("换成什么平台", true), "reviseDraft")
+  assert.notEqual(classifyAgentIntent("京东可以吗", true), "reviseDraft")
+  assert.notEqual(classifyAgentIntent("怎么改价格", true), "reviseDraft")
+})
+
+test("任务二: revise 整句 > 15 字符透传 LLM", () => {
+  // 含 REVISE_KEYWORDS 但整句过长，透传给 LLM
+  assert.notEqual(classifyAgentIntent("不是两袋是一袋请帮我改成两袋谢谢", true), "reviseDraft")
+})
+
+test("任务二: revise 正常短句仍命中", () => {
+  // 确保修复不破坏既有 revise 用例
+  assert.equal(classifyAgentIntent("不是两袋，是一袋", true), "reviseDraft")
+  assert.equal(classifyAgentIntent("改成三袋", true), "reviseDraft")
+  assert.equal(classifyAgentIntent("换成京东", true), "reviseDraft")
+  assert.equal(classifyAgentIntent("昨天买的", true), "reviseDraft")
+  assert.equal(classifyAgentIntent("这个不好用，下次别推荐", true), "reviseDraft")
+})
+
+test("任务二: 无 pending 时泛化词不命中 confirm", () => {
+  assert.equal(classifyAgentIntent("可以", false), "query")
+  assert.equal(classifyAgentIntent("好的", false), "query")
+})
+
 // ---------- 表驱动：批量草稿意图 ----------
 
 const BATCH_CASES = [

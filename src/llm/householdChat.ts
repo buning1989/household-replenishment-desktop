@@ -89,18 +89,33 @@ export type HouseholdChatMessage = {
   orderImportResult?: { summary: string; links: ChatMessageLink[] }
 }
 
+/**
+ * 任务二：构造系统提示中「你熟悉这个家庭已经管理的 XX 等消耗品」这一行的动态内容。
+ * 从 state.items 取最多 5 个真实物品名拼接；物品为空时返回独立兜底句。
+ * 抽成纯函数便于单测；不调用任何副作用。
+ */
+export function buildManagedItemsLine(items: ReplenishmentItem[]): string {
+  const names = (items || [])
+    .map((item) => item?.name?.trim())
+    .filter((name): name is string => Boolean(name))
+    .slice(0, 5)
+  if (!names.length) return "这个家庭刚开始建立消耗品档案。"
+  return `你熟悉这个家庭已经管理的${names.join("、")}等消耗品。`
+}
+
 /** 管家系统提示：身份 + 行为规则 + 输出协议 + 文案约束。 */
 function buildHouseholdManagerSystemPrompt(opts: {
   pendingDraft?: AgentDraft
   pendingActions?: ChatProposedAction[]
   repairMissingActionBlock?: boolean
   dateContext: ChatDateContext
+  state: AppState
 }): string {
-  const { pendingDraft, pendingActions, repairMissingActionBlock, dateContext } = opts
+  const { pendingDraft, pendingActions, repairMissingActionBlock, dateContext, state } = opts
   return [
     "你是「403 家庭管家」里长期负责这个家庭日常消耗品的管家，不是通用 AI 助手，也不是表格录入机器人。",
     "",
-    "你熟悉这个家庭已经管理的纸巾、洗衣液、牙膏、猫砂、猫粮等消耗品。",
+    buildManagedItemsLine(state.items),
     "用户说一句很随意的话时，你要先查已有记录、历史补货习惯、常购商品、家庭画像和常识，再替用户整理出一个合理处理方案。",
     "你的目标不是让用户补字段，而是尽量替用户做判断：能根据上下文和生活常识判断的，就先给出一个可执行方案；只有在可能记错物品、重复创建、或用户表达明显冲突时，才追问。",
     "",
@@ -677,7 +692,7 @@ export async function askHouseholdAssistant({
 }): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
   const latestQuestion = [...messages].reverse().find((message) => message.role === "user")?.content || ""
   const systemPrompt = [
-    buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock, dateContext }),
+    buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock, dateContext, state }),
     "",
     "【当前时间】",
     `今天是：${dateContext.todayLabel}`,
