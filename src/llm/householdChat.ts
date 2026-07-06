@@ -1,7 +1,9 @@
 import { calculateConsumption, DEFAULT_CYCLES, estimateRemainingQty, formatDate, formatPrice, startOfDay } from "../domain"
 import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
-import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus } from "../agent/drafts"
+import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "../agent/drafts"
+import type { OrderImportRow } from "../OrderImportReview"
+import { buildManagerObservations, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
 
 const DEFAULT_CHAT_MODEL = "qwen-plus"
 
@@ -70,6 +72,21 @@ export type HouseholdChatMessage = {
   batchDraftStatuses?: AgentDraftStatus[]
   /** 批量草稿确认后的写入结果摘要与跳转入口 */
   batchResult?: { summary: string; links: ChatMessageLink[] }
+  /** 用户消息里附带的订单截图缩略图（png/jpg/jpeg/webp）。仅在用户上传图片时存在。 */
+  imageAttachments?: { name: string; dataUrl: string }[]
+  /** 订单截图识别后被判断为非消耗品而跳过的行（手机壳、数据线等）。仅在 proposalBatch 场景下存在。 */
+  skippedOrderRows?: OrderRow[]
+  /** 订单截图识别后待用户确认归入哪个物品的歧义行。仅在 proposalBatch 场景下存在。 */
+  uncertainOrderRows?: OrderRow[]
+  /**
+   * 订单截图识别后的可编辑行（与 OrderImportModal 同一结构）。
+   * 对话模式复用 OrderImportReviewList 渲染；用户确认后调 buildAgentDraftsFromOrderRows + commitAgentDraftBatch。
+   */
+  orderImportRows?: OrderImportRow[]
+  /** 订单截图导入是否已处理（pending / confirmed / cancelled） */
+  orderImportStatus?: "pending" | "confirmed" | "cancelled"
+  /** 订单截图导入确认后的写入结果摘要与跳转入口 */
+  orderImportResult?: { summary: string; links: ChatMessageLink[] }
 }
 
 /** 管家系统提示：身份 + 行为规则 + 输出协议 + 文案约束。 */
@@ -157,7 +174,7 @@ export function describeActionLine(action: ChatProposedAction): string {
   return `- 常购商品：${action.productName}，挂到消耗品「${action.itemName}」`
 }
 
-type HouseholdChatItemView = {
+export type HouseholdChatItemView = {
   item: ReplenishmentItem
   computed: ItemComputed
 }
@@ -249,7 +266,12 @@ function selectContextItems(question: string, itemViews: HouseholdChatItemView[]
   return [...urgentOrWarning, ...[...itemViews].sort((a, b) => a.computed.dueAt - b.computed.dueAt)].slice(0, 30)
 }
 
-function buildHouseholdContext(state: AppState, itemViews: HouseholdChatItemView[], question: string): string {
+function buildHouseholdContext(
+  state: AppState,
+  itemViews: HouseholdChatItemView[],
+  question: string,
+  dateContext?: ChatDateContext
+): string {
   const contextItems = selectContextItems(question, itemViews)
   const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent")
   const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning")
@@ -265,16 +287,35 @@ function buildHouseholdContext(state: AppState, itemViews: HouseholdChatItemView
     .map(buildItemLine)
     .join("\n")
 
-  return [
+  const lines = [
     "当前家庭消耗品数据如下。请只基于这些数据回答；不确定时直接说明还缺什么记录。",
     `总数：${itemViews.length} 项。急需补充：${urgent.length} 项。快用完：${warning.length} 项。充足：${safe.length} 项。`,
     `缺少价格记录：${missingPrice.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}。`,
     `缺少平台/商家：${missingPlatform.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}。`,
     `分类：${state.categories.join("、") || "无"}。`,
-    buildBudgetLine(state),
-    `物品明细（按当前问题筛选 ${contextItems.length} 项）：`,
-    orderedItems || "暂无物品。"
-  ].join("\n")
+    buildBudgetLine(state)
+  ]
+
+  // 修复既有缺陷：系统提示要求模型参考「家庭画像」，但上下文从未提供。
+  // 把 householdProfile 序列化进来；画像为空则该段落省略。
+  const profileSegment = serializeHouseholdProfile(state.householdProfile)
+  if (profileSegment) {
+    lines.push(profileSegment)
+  }
+
+  lines.push(`物品明细（按当前问题筛选 ${contextItems.length} 项）：`)
+  lines.push(orderedItems || "暂无物品。")
+
+  // 接入点 1：末尾追加【管家最近注意到】（至多 5 条），让模型同步看到管家视角的注意点
+  if (dateContext) {
+    const observations = buildManagerObservations(state, itemViews, dateContext)
+    if (observations.length) {
+      const obsText = observations.slice(0, 5).map((obs) => `- ${obs.text}`).join("\n")
+      lines.push(`【管家最近注意到】\n${obsText}`)
+    }
+  }
+
+  return lines.join("\n")
 }
 
 // ---------- 对话创建动作：解析与校验 ----------
@@ -450,7 +491,19 @@ export function answerHouseholdQuickly(
   // 添加/新建/记一笔意图需要走 agent 草稿流程，不能被本地快捷回答拦截
   if (/添加|新建|创建|录入|登记|帮我加|记一笔|记录一下|买了|下单|购入|入手/.test(text)) return null
 
-  // 身份问题：你是谁 / 你能做什么 —— 用管家口吻短句回答，不展开能力清单
+  // 接入点 2：观察引擎懒加载 + 跨维度提示。
+  // 每类模板回答末尾追加至多 1 条与当前问题不同维度的观察；同维度不追加，避免重复。
+  let _observations: ManagerObservation[] | null = null
+  const getObservations = (): ManagerObservation[] => {
+    if (_observations === null) _observations = buildManagerObservations(state, itemViews, dateContext)
+    return _observations
+  }
+  const withObs = (answer: string, preferences: ManagerObservation["kind"][]): string => {
+    const obs = pickObservationByPreference(getObservations(), preferences)
+    return obs ? `${answer}\n${obs.text}` : answer
+  }
+
+  // 身份问题：你是谁 / 你能做什么 —— 用管家口吻短句回答，不展开能力清单（不追加观察）
   if (/你是谁|你是干嘛|你能做什么|你是啥|你是什么|介绍下自己|介绍一下你自己/.test(text)) {
     return "我是 403 家庭管家，平时就帮你盯着家里的消耗品。你随口说买了什么、快没什么，我先按家里的习惯替你记好，拿不准的时候才问你。"
   }
@@ -458,23 +511,25 @@ export function answerHouseholdQuickly(
   const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
   const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
 
-  // 本月预算
+  // 本月预算：追加 dueSoon / negativeReviewRepurchase / priceAnomaly / cycleDrift（排除 budgetThreshold，同维度）
   if (/预算|还剩|花了|支出|超支|本月预算|月预算/.test(text)) {
     const spend = calculateMonthlySpend(state.items)
     const budget = state.settings.monthlyBudget
+    const budgetPrefs: ManagerObservation["kind"][] = ["dueSoon", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
     if (!budget || budget <= 0) {
-      return `本月已经记了 ¥${formatPrice(spend)} 的补货支出，还没设月预算。要不你在设置里填一个？我下次好帮你盯着别超。`
+      return withObs(`本月已经记了 ¥${formatPrice(spend)} 的补货支出，还没设月预算。要不你在设置里填一个？我下次好帮你盯着别超。`, budgetPrefs)
     }
     const remaining = budget - spend
     const percent = Math.round((spend / budget) * 100)
     if (remaining >= 0) {
       const tail = percent >= 90 ? "这月尽量先别再补非急需品了。" : "保持当前节奏就行。"
-      return `本月预算还剩 ¥${formatPrice(remaining)}（已用 ${percent}%）。${tail}`
+      return withObs(`本月预算还剩 ¥${formatPrice(remaining)}（已用 ${percent}%）。${tail}`, budgetPrefs)
     }
-    return `本月预算已经超了 ¥${formatPrice(Math.abs(remaining))}（使用率 ${percent}%）。接下来非急需的可以先放放。`
+    return withObs(`本月预算已经超了 ¥${formatPrice(Math.abs(remaining))}（使用率 ${percent}%）。接下来非急需的可以先放放。`, budgetPrefs)
   }
 
   // 这周 / 下周 要补什么：严格区分 overdue 和 upcoming
+  // 追加 budgetThreshold / negativeReviewRepurchase / priceAnomaly / cycleDrift（排除 dueSoon，答案已列到点物品）
   if (/下周|未来一周|未来7天|未来七天|这周|本周|一周内/.test(text)) {
     const overdue = itemViews
       .filter(({ computed }) => computed.daysUntilDue <= 0)
@@ -483,8 +538,10 @@ export function answerHouseholdQuickly(
       .filter(({ computed }) => computed.daysUntilDue > 0 && computed.daysUntilDue <= 7)
       .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
 
+    const weekPrefs: ManagerObservation["kind"][] = ["budgetThreshold", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
+
     if (!overdue.length && !upcoming.length) {
-      return "这周没有新的补货提醒，可以先不用处理。"
+      return withObs("这周没有新的补货提醒，可以先不用处理。", weekPrefs)
     }
 
     const lines: string[] = []
@@ -508,12 +565,14 @@ export function answerHouseholdQuickly(
         : `接下来 7 天要留意：${groupLines.join("；")}。`
       )
     }
-    return lines.join("\n")
+    return withObs(lines.join("\n"), weekPrefs)
   }
 
   // 今天优先买什么：urgent > warning > dueAt，最多 5 项，附原因
+  // 追加 budgetThreshold / negativeReviewRepurchase / priceAnomaly / cycleDrift（排除 dueSoon，答案已列到点物品）
   if (/今天|优先|现在|急|补什么|买什么|今天买|优先买/.test(text)) {
-    if (!urgent.length && !warning.length) return "今天没有需要优先处理的，可以先放放。"
+    const todayPrefs: ManagerObservation["kind"][] = ["budgetThreshold", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
+    if (!urgent.length && !warning.length) return withObs("今天没有需要优先处理的，可以先放放。", todayPrefs)
     const priority = [...urgent, ...warning].slice(0, 5)
     const lines = priority.map(({ item, computed }, index) => {
       const reason = computed.daysUntilDepletion <= 0
@@ -523,13 +582,14 @@ export function answerHouseholdQuickly(
           : `${computed.daysUntilDue} 天后到提醒点，${computed.remainingText}`
       return `${index + 1}. ${item.name}：${reason}。`
     })
-    return [
+    return withObs([
       urgent.length ? `今天先看 ${urgent.length} 项急需补货。` : `今天没有急需的，另有 ${warning.length} 项快用完。`,
       ...lines
-    ].join("\n")
+    ].join("\n"), todayPrefs)
   }
 
   // 哪些信息缺失：按 价格 / 平台 / 常购商品 / 评价 分组
+  // 信息缺失与五类观察无直接重叠，全部维度都可追加，优先 dueSoon / budgetThreshold
   if (/缺|没有|补全|信息|哪些信息|信息缺失/.test(text)) {
     const missingPrice = itemViews.filter(({ item }) => !item.history.some((event) => Number.isFinite(event.price) && event.price! > 0))
     const missingPlatform = itemViews.filter(({ item }) => {
@@ -541,18 +601,20 @@ export function answerHouseholdQuickly(
       const latest = latestHistory(item)
       return !(latest?.review || item.purchaseOptions.some((option) => option.review))
     })
+    const missingPrefs: ManagerObservation["kind"][] = ["dueSoon", "budgetThreshold", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
     if (!missingPrice.length && !missingPlatform.length && !missingOption.length && !missingReview.length) {
-      return "价格、平台、常购商品、评价记录都还齐全，暂时不用补。"
+      return withObs("价格、平台、常购商品、评价记录都还齐全，暂时不用补。", missingPrefs)
     }
     const groups: string[] = []
     if (missingPrice.length) groups.push(`价格：${missingPrice.map(({ item }) => item.name).slice(0, 10).join("、")}`)
     if (missingPlatform.length) groups.push(`平台：${missingPlatform.map(({ item }) => item.name).slice(0, 10).join("、")}`)
     if (missingOption.length) groups.push(`常购商品：${missingOption.map(({ item }) => item.name).slice(0, 10).join("、")}`)
     if (missingReview.length) groups.push(`评价：${missingReview.map(({ item }) => item.name).slice(0, 10).join("、")}`)
-    return `有几处信息还缺，补上之后提醒会更准：${groups.join("；")}。不急的话下次补货时顺手补就行。`
+    return withObs(`有几处信息还缺，补上之后提醒会更准：${groups.join("；")}。不急的话下次补货时顺手补就行。`, missingPrefs)
   }
 
   // 哪些价格异常：本次单价 vs 历史均价，超过 10% 标记
+  // 追加 dueSoon / budgetThreshold / negativeReviewRepurchase / cycleDrift（排除 priceAnomaly，同维度）
   if (/价格异常|异常|均价|偏贵|贵了|涨价/.test(text)) {
     const anomalies: string[] = []
     for (const { item } of itemViews) {
@@ -571,8 +633,9 @@ export function answerHouseholdQuickly(
         anomalies.push(`${item.name}这次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，便宜了 ${pct}%`)
       }
     }
-    if (!anomalies.length) return "最近几次补货的单价都还算正常，没明显异常。"
-    return `这几样本次单价和均价偏离超过 10%：${anomalies.join("；")}。`
+    const pricePrefs: ManagerObservation["kind"][] = ["dueSoon", "budgetThreshold", "negativeReviewRepurchase", "cycleDrift"]
+    if (!anomalies.length) return withObs("最近几次补货的单价都还算正常，没明显异常。", pricePrefs)
+    return withObs(`这几样本次单价和均价偏离超过 10%：${anomalies.join("；")}。`, pricePrefs)
   }
 
   return null
@@ -624,7 +687,7 @@ export async function askHouseholdAssistant({
     "如果家庭数据里出现早于今天的提醒日期，它表示已经过了提醒点，不要说成未来要发生。",
     "",
     "【当前家庭数据】",
-    buildHouseholdContext(state, itemViews, latestQuestion)
+    buildHouseholdContext(state, itemViews, latestQuestion, dateContext)
   ].join("\n")
 
   const requestMessages = [

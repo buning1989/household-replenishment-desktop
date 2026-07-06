@@ -1,6 +1,8 @@
 import { createItem, restockItem } from "../domain"
 import type { AppState, PurchaseOption, ReplenishmentItem } from "../types"
-import { findItemMatch, type AgentDraft, type CreateItemDraft, type RestockDraftDetails } from "./drafts"
+import { fuzzyMatchItem, type ExtractedOrder, type ExtractedOrderLine } from "../llm/orderImport"
+import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
+import { createItemDraftFromName, findItemMatch, type AgentDraft, type CreateItemDraft, type OrderRow, type RestockDraftDetails } from "./drafts"
 
 export type AgentMessageLink = {
   label: string
@@ -78,19 +80,24 @@ export function buildAgentDraftsFromOrderRows(
       // 新建消耗品并补货；若要求新建常购商品则附 addPurchaseOption
       const itemName = genericName || productName
       if (!itemName) continue
+      // 使用 createItemDraftFromName 推断分类/周期/单位，避免硬编码 30/2
+      const inferred = createItemDraftFromName(itemName, state, row.measureUnit)
+      // 尊重调用方传入的 category（弹窗流程里用户已选择分类）
+      const resolvedCategory = category && category !== "其他" ? category : inferred.category
       drafts.push({
         kind: "createItemWithRestock",
         item: {
           kind: "createItem",
           itemName,
-          category,
-          cycleDays: 30,
-          bufferDays: 2,
-          unit: row.measureUnit || "件"
+          category: resolvedCategory,
+          cycleDays: inferred.cycleDays,
+          // bufferDays 按周期的 20% 向上取整，上限 7 天；比固定 2 更贴近消耗品节奏
+          bufferDays: Math.min(Math.ceil(inferred.cycleDays * 0.2), 7),
+          unit: row.measureUnit || inferred.unit || "件"
         },
         restock: restockDetails,
         addPurchaseOption: productName && productName !== itemName
-          ? { productName, unit: row.measureUnit || "件" }
+          ? { productName, unit: row.measureUnit || inferred.unit || "件" }
           : undefined
       })
       continue
@@ -299,4 +306,220 @@ export function commitAgentDraftBatch(state: AppState, drafts: AgentDraft[], now
     summary: summaries.join("\n"),
     links
   }
+}
+
+// ---------- 订单截图自动映射（对话上传截图用） ----------
+
+/** 明显非消耗品的关键词：命中即跳过，不生成草稿。 */
+const NON_CONSUMABLE_KEYWORDS = [
+  "手机壳", "手机膜", "保护膜", "保护壳", "数据线", "充电线", "充电器", "充电宝", "移动电源",
+  "耳机", "蓝牙耳机", "音箱", "音响", "智能手表", "手表", "手环",
+  "键盘", "鼠标", "鼠标垫", "显示器", "电脑", "笔记本", "平板", "电纸书",
+  "路由器", "网线", "转换器", "扩展坞", "读卡器", "U盘", "移动硬盘", "硬盘",
+  "衣服", "上衣", "裤子", "鞋子", "运动鞋", "拖鞋", "袜子", "包包", "钱包", "皮带", "帽子", "围巾", "手套", "眼镜",
+  "玩具", "手办", "图书", "书籍", "小说", "杂志", "文具", "本子", "笔袋",
+  "刀", "剪刀", "工具", "螺丝", "胶带", "电池"
+]
+
+/** 订单行自动映射结果。drafts 是可执行草稿；skippedRows 是非消耗品；uncertainRows 是歧义行。 */
+export type OrderLineMapping = {
+  drafts: AgentDraft[]
+  skippedRows: OrderRow[]
+  uncertainRows: OrderRow[]
+}
+
+function isNonConsumable(line: ExtractedOrderLine): boolean {
+  const haystack = [line.productName, line.brandName, line.coreName, line.genericName]
+    .filter((text): text is string => Boolean(text))
+    .join(" ")
+    .toLocaleLowerCase("zh-CN")
+  return NON_CONSUMABLE_KEYWORDS.some((keyword) => haystack.includes(keyword.toLocaleLowerCase("zh-CN")))
+}
+
+function templateMatches(line: ExtractedOrderLine): { name: string; category: string; cycleDays: number; bufferDays: number; unit: string } | null {
+  const texts = [line.genericName, line.coreName, line.brandName, line.productName].filter((text): text is string => Boolean(text))
+  for (const text of texts) {
+    const lower = text.toLocaleLowerCase("zh-CN")
+    const template = CONSUMABLE_TEMPLATES.find((template) =>
+      template.name === text
+      || template.name.toLocaleLowerCase("zh-CN") === lower
+      || lower.includes(template.name)
+      || template.name.includes(text)
+    )
+    if (template) {
+      return {
+        name: template.name,
+        category: template.category,
+        cycleDays: template.defaultCycleDays,
+        bufferDays: template.bufferDays,
+        unit: template.unit
+      }
+    }
+  }
+  return null
+}
+
+function buildOrderRow(line: ExtractedOrderLine, platform?: string, orderDate?: number, reason?: string, candidates?: string[]): OrderRow {
+  return {
+    productName: line.productName,
+    coreName: line.coreName,
+    brandName: line.brandName,
+    genericName: line.genericName,
+    qty: line.qty,
+    price: line.price,
+    measureAmount: line.measureAmount,
+    measureUnit: line.measureUnit,
+    platform,
+    orderDate,
+    reason,
+    candidates
+  }
+}
+
+/**
+ * 把订单截图识别结果自动映射为 AgentDraft + skippedRows + uncertainRows。
+ *
+ * 对话上传截图后调用此函数（不经弹窗的逐行编辑），由本地匹配 + 模型信号共同判断：
+ *   1. 模型返回 matchedItemName 或本地 findItemMatch 命中已有物品 → restock draft
+ *   2. 模型返回 genericName 或本地模板命中但无已有物品 → createItemWithRestock draft
+ *   3. findItemMatch 返回 ambiguous 且有多个候选 → uncertainRows（仍生成 best-guess draft 带 matchHint）
+ *   4. 命中非消耗品关键词或模型 + 本地都无消耗品信号 → skippedRows
+ *
+ * 订单弹窗和对话上传都复用此函数的输出（drafts）走 commitAgentDraftBatch。
+ */
+export function mapOrderLinesToDrafts(
+  order: ExtractedOrder,
+  state: AppState,
+  now: number
+): OrderLineMapping {
+  const drafts: AgentDraft[] = []
+  const skippedRows: OrderRow[] = []
+  const uncertainRows: OrderRow[] = []
+  const platform = order.platform
+  const orderDate = order.orderDate
+
+  for (const line of order.lines) {
+    if (line.qty <= 0) continue
+
+    // 1) 非消耗品关键词命中 → 直接跳过
+    if (isNonConsumable(line)) {
+      skippedRows.push(buildOrderRow(line, platform, orderDate, "不像日常消耗品，先不管"))
+      continue
+    }
+
+    const productName = (line.coreName || line.brandName || line.productName).trim()
+    const matchQuery = line.genericName || line.coreName || line.brandName || line.productName
+
+    // 2) 已有物品匹配：模型信号 + 本地 findItemMatch + 模糊兜底
+    let matchedItemId: string | undefined
+    let matchedItemName: string | undefined
+    let matchHint: string | undefined
+    let uncertain = false
+    let candidates: string[] = []
+
+    // 2a) 模型指定 matchedItemName
+    if (line.matchedItemName) {
+      const byName = state.items.find((item) => item.name === line.matchedItemName)
+      if (byName) {
+        matchedItemId = byName.id
+        matchedItemName = byName.name
+      }
+    }
+    // 2b) 本地 findItemMatch（覆盖模型未命中的情况）
+    if (!matchedItemId && matchQuery) {
+      const match = findItemMatch(state, matchQuery)
+      if (match.item) {
+        if (match.confidence === "ambiguous" && match.candidates.length > 1) {
+          uncertain = true
+          candidates = match.candidates
+          matchHint = match.hint || `「${matchQuery}」可能对应：${match.candidates.join("、")}，请确认是哪一个。`
+        }
+        matchedItemId = match.item.id
+        matchedItemName = match.item.name
+      }
+    }
+    // 2c) 模糊兜底（覆盖 findItemMatch 漏掉的情况，与弹窗逻辑一致）
+    if (!matchedItemId) {
+      const fuzzy = fuzzyMatchItem([line.coreName, line.productName, line.brandName, line.genericName], state.items)
+      if (fuzzy) {
+        matchedItemId = fuzzy.id
+        matchedItemName = fuzzy.name
+      }
+    }
+
+    // 3) 命中已有物品 → restock draft
+    if (matchedItemId && matchedItemName) {
+      const restockDetails: RestockDraftDetails = {
+        qty: Math.max(1, Math.round(line.qty)),
+        unit: line.measureUnit,
+        price: line.price,
+        platform,
+        purchaseProductName: productName,
+        restockDate: orderDate,
+        review: undefined,
+        purchaseMeasureAmount: line.measureAmount,
+        purchaseMeasureUnit: line.measureUnit,
+        matchHint
+      }
+      drafts.push({
+        kind: "restock",
+        itemId: matchedItemId,
+        itemName: matchedItemName,
+        ...restockDetails
+      })
+      if (uncertain) {
+        uncertainRows.push(buildOrderRow(line, platform, orderDate, matchHint, candidates))
+      }
+      continue
+    }
+
+    // 4) 无已有物品但有消耗品信号 → createItemWithRestock
+    const template = templateMatches(line)
+    const hasConsumableSignal = Boolean(line.genericName) || Boolean(template) || Boolean(line.matchedItemName)
+    if (hasConsumableSignal) {
+      const itemName = (line.genericName || template?.name || line.coreName || line.brandName || line.productName).trim()
+      if (!itemName) continue
+      const inferred = createItemDraftFromName(itemName, state, line.measureUnit)
+      // 周期/缓冲天数优先用 createItemDraftFromName 推断（基于 DEFAULT_CYCLES），
+      // 模板只作为分类和消耗品信号的来源；bufferDays 按周期 20% 向上取整，上限 7 天。
+      const resolvedCategory = template?.category || inferred.category
+      const cycleDays = inferred.cycleDays || template?.cycleDays || 30
+      const bufferDays = Math.min(Math.ceil(cycleDays * 0.2), 7)
+      const unit = line.measureUnit || template?.unit || inferred.unit || "件"
+      drafts.push({
+        kind: "createItemWithRestock",
+        item: {
+          kind: "createItem",
+          itemName,
+          category: resolvedCategory,
+          cycleDays,
+          bufferDays,
+          unit
+        },
+        restock: {
+          qty: Math.max(1, Math.round(line.qty)),
+          unit: line.measureUnit || unit,
+          price: line.price,
+          platform,
+          purchaseProductName: productName,
+          restockDate: orderDate,
+          purchaseMeasureAmount: line.measureAmount,
+          purchaseMeasureUnit: line.measureUnit,
+          matchHint
+        },
+        addPurchaseOption: productName && productName !== itemName
+          ? { productName, unit: line.measureUnit || unit }
+          : undefined
+      })
+      if (uncertain) {
+        uncertainRows.push(buildOrderRow(line, platform, orderDate, matchHint, candidates))
+      }
+      continue
+    }
+
+    // 5) 无消耗品信号 → 跳过
+    skippedRows.push(buildOrderRow(line, platform, orderDate, "不像日常消耗品，先不管"))
+  }
+
+  return { drafts, skippedRows, uncertainRows }
 }

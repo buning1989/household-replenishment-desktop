@@ -60,6 +60,27 @@ export type AgentDraft =
   | CreateItemWithRestockDraft
   | AddPurchaseOptionDraft
 
+/**
+ * 订单截图行的展示摘要。用于 proposalBatch 中被跳过（非消耗品）或待确认（多匹配）的行。
+ * 与 ExtractedOrderLine 的区别：这是面向对话展示的精简结构，只保留卡片需要的字段。
+ */
+export type OrderRow = {
+  productName: string
+  coreName?: string
+  brandName?: string
+  genericName?: string
+  qty: number
+  price?: number
+  measureAmount?: number
+  measureUnit?: string
+  platform?: string
+  orderDate?: number
+  /** 跳过或待确认的原因，供卡片展示 */
+  reason?: string
+  /** 待确认行可能对应的物品名列表，供用户选择 */
+  candidates?: string[]
+}
+
 export type ClarificationOption = {
   label: string
   /** 选中该选项时附带的修订意图；UI 可直接把 label 当作新的用户消息继续走流程。 */

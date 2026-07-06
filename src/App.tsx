@@ -24,9 +24,32 @@ import {
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
 import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
-import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus } from "./agent/drafts"
+import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
-import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, type AgentMessageLink } from "./agent/executor"
+import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
+import { composeFallbackMessage, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage } from "./agent/responseComposer"
+import {
+  buildOrderImportRowsFromExtract,
+  orderImportRowsToConfirmed,
+  OrderImportReviewList,
+  MAX_ORDER_IMAGES as ORDER_IMPORT_MAX_IMAGES,
+  type OrderImportRow as SharedOrderImportRow,
+  type OrderImportConfirmedRow as SharedOrderImportConfirmedRow
+} from "./OrderImportReview"
+import {
+  measureUnitDefinitions,
+  getMeasureUnitDefinition,
+  getMeasureUnitLabel,
+  getMeasureUnitShortLabel,
+  getCompatibleMeasureUnits,
+  convertMeasureAmount,
+  encodeCustomMeasureUnit,
+  parseCustomMeasureUnit,
+  getMeasureBaseAmount as getOptionMeasureBaseAmount,
+  type MeasureUnitDefinition
+} from "./orderImportHelpers"
+import { createHouseholdOrchestrator, isBatchIntentMarker } from "./agent/householdOrchestrator"
+import type { AgentTurn } from "./agent/orchestrator"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
@@ -959,6 +982,9 @@ function App() {
             deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
             setSettingsOpen(true)
           }}
+          orderImageApiKey={state.settings.aiApiKey}
+          orderImageModel={state.settings.aiOrderModel ?? state.settings.aiModel}
+          orderRecognitionMode={state.settings.aiOrderMode ?? "accurate"}
         />
       )}
       {isItemCreatorOpen && (
@@ -1380,10 +1406,12 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
 }
 
 /** 批量待确认草稿卡片：订单截图导入后在对话中展示，支持逐条跳过与全部确认。 */
-function AgentDraftBatchCard({ drafts, statuses, result, onConfirmBatch, onCancelBatch, onSkipIndex, onOpenItem }: {
+function AgentDraftBatchCard({ drafts, statuses, result, skippedRows, uncertainRows, onConfirmBatch, onCancelBatch, onSkipIndex, onOpenItem }: {
   drafts: AgentDraft[]
   statuses: AgentDraftStatus[]
   result?: { summary: string; links: ChatMessageLink[] }
+  skippedRows?: OrderRow[]
+  uncertainRows?: OrderRow[]
   onConfirmBatch: () => void
   onCancelBatch: () => void
   onSkipIndex: (index: number) => void
@@ -1400,41 +1428,58 @@ function AgentDraftBatchCard({ drafts, statuses, result, onConfirmBatch, onCance
     return draft.productName
   }
 
+  /** 卡片只展示管家口吻的字段：物品名/数量/平台/金额/日期。空字段不展示。 */
   function draftDetail(draft: AgentDraft): string {
-    if (draft.kind === "createItem") return `分类 ${draft.category} · 周期 ${draft.cycleDays} 天`
-    if (draft.kind === "addPurchaseOption") return `常购商品 ${draft.productName}`
     const parts: string[] = []
+    if (draft.kind === "createItem") {
+      if (draft.category) parts.push(draft.category)
+      return parts.join(" · ")
+    }
+    if (draft.kind === "addPurchaseOption") {
+      if (draft.productName) parts.push(draft.productName)
+      return parts.join(" · ")
+    }
     if (draft.kind === "restock") {
       if (draft.qty) parts.push(`${draft.qty}${draft.unit || ""}`)
-      if (draft.price !== undefined) parts.push(`¥${draft.price}`)
       if (draft.platform) parts.push(draft.platform)
-      if (draft.purchaseProductName) parts.push(draft.purchaseProductName)
+      if (draft.price !== undefined) parts.push(`¥${draft.price}`)
       if (draft.restockDate) parts.push(new Date(draft.restockDate).toLocaleDateString("zh-CN"))
-      if (draft.review) parts.push(`评价：${draft.review}`)
-      return parts.join(" · ") || "补货记录"
+      return parts.join(" · ")
     }
     // createItemWithRestock
-    parts.push(`分类 ${draft.item.category}`)
     if (draft.restock.qty) parts.push(`${draft.restock.qty}${draft.restock.unit || ""}`)
-    if (draft.restock.price !== undefined) parts.push(`¥${draft.restock.price}`)
     if (draft.restock.platform) parts.push(draft.restock.platform)
-    if (draft.restock.purchaseProductName) parts.push(draft.restock.purchaseProductName)
+    if (draft.restock.price !== undefined) parts.push(`¥${draft.restock.price}`)
     if (draft.restock.restockDate) parts.push(new Date(draft.restock.restockDate).toLocaleDateString("zh-CN"))
     return parts.join(" · ")
   }
 
   function statusLabel(status: AgentDraftStatus): string {
-    if (status === "pending") return "待确认"
-    if (status === "confirmed") return "已写入"
+    if (status === "pending") return "准备记"
+    if (status === "confirmed") return "已记下"
     if (status === "cancelled") return "已跳过"
     return "已替代"
+  }
+
+  /** 跳过行的展示名：优先 coreName > brandName > productName */
+  function rowLabel(row: OrderRow): string {
+    return row.coreName || row.brandName || row.productName || "未命名"
+  }
+
+  /** 跳过行展示字段：数量/平台/金额（识别到才展示） */
+  function rowDetail(row: OrderRow): string {
+    const parts: string[] = []
+    if (row.qty) parts.push(`${row.qty}${row.measureUnit || ""}`)
+    if (row.platform) parts.push(row.platform)
+    if (row.price !== undefined) parts.push(`¥${row.price}`)
+    return parts.join(" · ")
   }
 
   return (
     <div className="chat-batch-card">
       <div className="chat-batch-card-header">
-        <strong>待确认草稿（{drafts.length} 条）</strong>
-        {hasPending && <small>可逐条跳过，或输入「第二个跳过」「价格改成 59.9」来修正。</small>}
+        <strong>这张订单里要记的消耗品（{drafts.length} 样）</strong>
+        {hasPending && <small>可以逐条跳过，或输入「第二个跳过」「洗衣液数量改成 2」来修正。</small>}
       </div>
       <ol className="chat-batch-card-list">
         {drafts.map((draft, i) => {
@@ -1457,7 +1502,7 @@ function AgentDraftBatchCard({ drafts, statuses, result, onConfirmBatch, onCance
               <div className="chat-batch-row-aside">
                 <span className="chat-batch-row-status">{statusLabel(status)}</span>
                 {status === "pending" && (
-                  <button type="button" className="quiet-button compact" onClick={() => onSkipIndex(i)}>跳过</button>
+                  <button type="button" className="quiet-button compact" onClick={() => onSkipIndex(i)}>单条跳过</button>
                 )}
                 {status === "confirmed" && itemId && (
                   <button type="button" className="text-button compact" onClick={() => onOpenItem(itemId)}>查看</button>
@@ -1467,24 +1512,63 @@ function AgentDraftBatchCard({ drafts, statuses, result, onConfirmBatch, onCance
           )
         })}
       </ol>
+      {uncertainRows && uncertainRows.length > 0 && (
+        <div className="chat-batch-card-section chat-batch-card-uncertain">
+          <strong>需要确认</strong>
+          <small>这几样我不太确定归到哪个物品，怕记错。</small>
+          <ul>
+            {uncertainRows.map((row, i) => (
+              <li key={`uncertain-${i}`} className="chat-batch-row is-uncertain">
+                <div className="chat-batch-row-main">
+                  <span className="chat-batch-row-text">
+                    <span className="chat-batch-row-name">{rowLabel(row)}</span>
+                    {rowDetail(row) && <span className="chat-batch-row-detail">{rowDetail(row)}</span>}
+                    {row.reason && <span className="chat-batch-row-hint">{row.reason}</span>}
+                  </span>
+                </div>
+                <span className="chat-batch-row-status">需要确认</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {skippedRows && skippedRows.length > 0 && (
+        <div className="chat-batch-card-section chat-batch-card-skipped">
+          <strong>跳过的</strong>
+          <small>不像日常消耗品，我先不管。</small>
+          <ul>
+            {skippedRows.map((row, i) => (
+              <li key={`skipped-${i}`} className="chat-batch-row is-skipped">
+                <div className="chat-batch-row-main">
+                  <span className="chat-batch-row-text">
+                    <span className="chat-batch-row-name">{rowLabel(row)}</span>
+                    {rowDetail(row) && <span className="chat-batch-row-detail">{rowDetail(row)}</span>}
+                  </span>
+                </div>
+                <span className="chat-batch-row-status">跳过</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {hasPending && (
         <div className="chat-batch-card-actions">
-          <button type="button" className="quiet-button compact" onClick={onCancelBatch}>全部取消</button>
+          <button type="button" className="quiet-button compact" onClick={onCancelBatch}>先不记</button>
           <button type="button" className="primary-button compact green" onClick={onConfirmBatch}>
-            确认全部（{pendingCount} 条）
+            就这么记（{pendingCount} 样）
           </button>
         </div>
       )}
       {!hasPending && result && (
         <small className="chat-action-hint">
-          {cancelledCount > 0 ? `已写入 ${drafts.length - cancelledCount} 条，跳过 ${cancelledCount} 条。` : `已写入 ${drafts.length} 条。`}
+          {cancelledCount > 0 ? `已记下 ${drafts.length - cancelledCount} 样，跳过 ${cancelledCount} 样。` : `已记下 ${drafts.length} 样。`}
         </small>
       )}
     </div>
   )
 }
 
-function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing }: {
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode }: {
   state: AppState
   itemViews: ItemView[]
   messages: HouseholdChatMessage[]
@@ -1497,12 +1581,18 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   onClose: () => void
   onOpenSettings: () => void
   isClosing?: boolean
+  orderImageApiKey?: string
+  orderImageModel?: string
+  orderRecognitionMode?: OrderRecognitionMode
 }) {
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
+  const imageInputRef = useRef<HTMLInputElement>(null)
+  // 管家决策层单例：所有对话路径统一经过 orchestrator.decide / normalizeLlmResponse
+  const orchestrator = useMemo(() => createHouseholdOrchestrator(), [])
   const starter = buildHouseholdChatStarter(itemViews)
 	  const quickQuestions = [
 	    "今天优先补什么？",
@@ -1517,37 +1607,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	    return -1
 	  }
 
-	  function draftIntro(agentDraft: AgentDraft): string {
-	    if (agentDraft.kind === "createItem") {
-	      const cycle = agentDraft.cycleDays
-	      return `我先把「${agentDraft.itemName}」加进来，按 ${cycle} 天一轮帮你盯着。你要是没问题，我就先这么记下。`
-	    }
-	    if (agentDraft.kind === "restock") {
-	      return `「${agentDraft.itemName}」我先按这次补货记上，价格和平台没说也不影响。你要是没问题，我就这么保存。`
-	    }
-	    if (agentDraft.kind === "createItemWithRestock") {
-	      const qty = agentDraft.restock.qty
-	      const unit = agentDraft.restock.unit || agentDraft.item.unit || "件"
-	      const qtyText = qty ? `${qty}${unit}` : "这一笔"
-	      return `我先把「${agentDraft.item.itemName}」加进来，这次 ${qtyText} 也一起算作起始记录。你要是没问题，我就先这么记下。`
-	    }
-	    return `我先把「${agentDraft.productName}」放到「${agentDraft.itemName}」下面，之后你补货就能直接沿用。没问题我就保存。`
-	  }
-
-	  function buildPendingDraftReminder(agentDraft: AgentDraft): string {
-	    return [
-	      "还没真正写入，需要你确认一下。",
-	      `当前准备处理：${describeAgentDraft(agentDraft)}。`,
-	      "你可以点卡片里的「就这么记」，或直接输入「确认吧」。"
-	    ].join("\n")
-	  }
-
-	  function safeQueryFallback(content: string): string {
-	    const text = content.trim()
-	    if (!text) return "我没能整理出可靠回答，你换一句问法试试。"
-	    if (/已创建|已记录|已更新|已登记|已为您|已帮/.test(text)) return "我没能整理成可确认草稿，你换一句描述试试。"
-	    return text
-	  }
+	  // 文案统一由 responseComposer 生成；draftIntro / buildPendingDraftReminder / safeQueryFallback
+	  // 已下线，全部收敛到 composeProposalMessage / composePendingReminder / composeFallbackMessage。
 
 	  function confirmAgentDraft(messageIndex: number, baseMessages = messages) {
 	    const message = baseMessages[messageIndex]
@@ -1643,6 +1704,52 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       { role: "assistant", content: `已跳过第 ${index + 1} 条「${label}」。` }])
   }
 
+  // ---------- 订单截图导入（对话模式：复用 buildAgentDraftsFromOrderRows + commitAgentDraftBatch） ----------
+
+  function patchOrderImport(messageIndex: number, baseMessages: HouseholdChatMessage[], patch: {
+    rows?: SharedOrderImportRow[]
+    status?: "pending" | "confirmed" | "cancelled"
+    result?: { summary: string; links: ChatMessageLink[] }
+  }): HouseholdChatMessage[] {
+    return baseMessages.map((message, index) => index === messageIndex
+      ? {
+          ...message,
+          orderImportRows: patch.rows ?? message.orderImportRows,
+          orderImportStatus: patch.status ?? message.orderImportStatus,
+          orderImportResult: patch.result ?? message.orderImportResult
+        }
+      : message)
+  }
+
+  function confirmOrderImport(messageIndex: number, baseMessages: HouseholdChatMessage[]) {
+    const message = baseMessages[messageIndex]
+    if (!message?.orderImportRows) return
+    const confirmedRows = orderImportRowsToConfirmed(message.orderImportRows)
+    if (confirmedRows.length === 0) {
+      onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
+        { role: "assistant", content: "没有要记的内容，我先不动。" }])
+      return
+    }
+    // 复用 buildAgentDraftsFromOrderRows：与弹窗同一转换路径
+    const drafts = buildAgentDraftsFromOrderRows(confirmedRows, state, Date.now())
+    if (drafts.length === 0) {
+      onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
+        { role: "assistant", content: "没有要记的内容，我先不动。" }])
+      return
+    }
+    // 复用 commitAgentDraftBatch：与弹窗同一写入路径
+    const result = onConfirmBatch(drafts)
+    onMessagesChange([
+      ...patchOrderImport(messageIndex, baseMessages, { status: "confirmed", result: { summary: result.summary, links: result.links } }),
+      { role: "assistant", content: result.summary, links: result.links }
+    ])
+  }
+
+  function cancelOrderImport(messageIndex: number, baseMessages: HouseholdChatMessage[]) {
+    onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
+      { role: "assistant", content: "好，先不记。需要的时候再告诉我。" }])
+  }
+
   function reviseBatchIndex(messageIndex: number, index: number, text: string, baseMessages: HouseholdChatMessage[]) {
     const message = baseMessages[messageIndex]
     if (!message?.agentDraftBatch || !message.batchDraftStatuses) return
@@ -1676,6 +1783,90 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       { role: "assistant", content: "已更新全部待确认草稿。" }])
   }
 
+  // ---------- 订单截图上传（对话内复用 orderImport + mapOrderLinesToDrafts） ----------
+
+  /**
+   * 处理用户在对话输入区上传的订单截图。
+   * 流程：
+   *   1. 读取图片 → 压缩 dataUrl
+   *   2. 推一条用户消息（含 imageAttachments 缩略图）+ 一条「我看一下这张订单。」管家消息
+   *   3. 调 extractOrderFromImage 识别
+   *   4. 调 buildOrderImportRowsFromExtract 生成 OrderImportRow[]（与弹窗同一结构）
+   *   5. 推一条带 orderImportRows 的管家消息，由 OrderImportReviewList mode="chat" 渲染
+   *
+   * 不直接写 state；用户在卡片点「就这么记」后才走 buildAgentDraftsFromOrderRows + commitAgentDraftBatch。
+   */
+  async function handleOrderImageUpload(file: File, caption: string) {
+    if (!orderImageApiKey?.trim()) {
+      setError("还没有配置识别服务，请先在设置中填写订单识别 API Key。")
+      return
+    }
+    const text = caption.trim()
+    const userContent = text || "帮我把这张订单记一下"
+    let dataUrl: string
+    try {
+      dataUrl = await fileToCompressedDataUrl(file)
+    } catch {
+      setError("图片读取失败，换一张试试。")
+      return
+    }
+    setError(null)
+    // 用户消息（含缩略图）+ 管家「看一眼」提示
+    const baseMessages: HouseholdChatMessage[] = [
+      ...messages,
+      {
+        role: "user",
+        content: userContent,
+        imageAttachments: [{ name: file.name, dataUrl }]
+      },
+      { role: "assistant", content: composeOrderRecognizingMessage() }
+    ]
+    onMessagesChange(baseMessages)
+    setLoading(true)
+    // 构造 catalog：与 OrderImportModal 一致，按最近活跃度排序
+    const catalog = [...state.items]
+      .sort((a, b) => {
+        const latestA = Math.max(a.updatedAt || 0, ...a.history.map((event) => event.at || 0))
+        const latestB = Math.max(b.updatedAt || 0, ...b.history.map((event) => event.at || 0))
+        return latestB - latestA
+      })
+      .map((item) => ({
+        name: item.name,
+        options: (item.purchaseOptions || []).map((option) => option.productName)
+      }))
+    const result = await extractOrderFromImage(orderImageApiKey, dataUrl, catalog, orderImageModel, orderRecognitionMode || "accurate")
+    setLoading(false)
+    if (!result.ok) {
+      onMessagesChange([...baseMessages, { role: "assistant", content: result.error }])
+      return
+    }
+    const rows = buildOrderImportRowsFromExtract(result.order, state.items, state.categories, 0)
+    if (rows.length === 0) {
+      onMessagesChange([...baseMessages, { role: "assistant", content: "我看了下这张订单，暂时没识别到需要管理的消耗品。" }])
+      return
+    }
+    // 管家口吻总结：识别到几样，命中已有的有哪些，准备新建的有哪些
+    const includedRows = rows.filter((row) => row.targetItem !== "__skip__")
+    const skippedRows = rows.filter((row) => row.targetItem === "__skip__")
+    const message = composeOrderImportSummary(rows, result.order.platform)
+    onMessagesChange([
+      ...baseMessages,
+      {
+        role: "assistant",
+        content: message,
+        orderImportRows: rows,
+        orderImportStatus: "pending"
+      }
+    ])
+  }
+
+  function onImageInputChange(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = Array.from(event.target.files || [])[0]
+    if (file) void handleOrderImageUpload(file, draft)
+    setDraft("")
+    event.target.value = ""
+  }
+
   useEffect(() => {
     inputRef.current?.focus()
   }, [])
@@ -1696,62 +1887,59 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     onQuestionSent(text)
     setDraft("")
     setError(null)
-    // 批量草稿（订单导入）优先于单草稿：有 pending batch 时，「确认/跳过/第N个改XX」都作用于批量
+    // 批量草稿（订单导入）仍由外层处理，因为涉及 batchDraftStatuses 数组操作
     const pendingBatchMessageIndex = latestPendingBatchMessageIndex(messages)
     const pendingBatchMessage = pendingBatchMessageIndex >= 0 ? messages[pendingBatchMessageIndex] : undefined
-    const batchIntent = pendingBatchMessage ? classifyBatchIntent(text) : null
-    if (pendingBatchMessage && batchIntent) {
-      if (batchIntent.intent === "batchConfirm") { confirmBatch(pendingBatchMessageIndex, nextMessages); return }
-      if (batchIntent.intent === "batchCancel") { cancelBatch(pendingBatchMessageIndex, nextMessages); return }
-      if (batchIntent.intent === "batchCancelIndex") { cancelBatchIndex(pendingBatchMessageIndex, batchIntent.index, nextMessages); return }
-      if (batchIntent.intent === "batchReviseIndex") { reviseBatchIndex(pendingBatchMessageIndex, batchIntent.index, text, nextMessages); return }
-      if (batchIntent.intent === "batchReviseAll") { reviseBatchAll(pendingBatchMessageIndex, text, nextMessages); return }
+    if (pendingBatchMessage) {
+      const batchIntent = classifyBatchIntent(text)
+      if (batchIntent) {
+        if (batchIntent.intent === "batchConfirm") { confirmBatch(pendingBatchMessageIndex, nextMessages); return }
+        if (batchIntent.intent === "batchCancel") { cancelBatch(pendingBatchMessageIndex, nextMessages); return }
+        if (batchIntent.intent === "batchCancelIndex") { cancelBatchIndex(pendingBatchMessageIndex, batchIntent.index, nextMessages); return }
+        if (batchIntent.intent === "batchReviseIndex") { reviseBatchIndex(pendingBatchMessageIndex, batchIntent.index, text, nextMessages); return }
+        if (batchIntent.intent === "batchReviseAll") { reviseBatchAll(pendingBatchMessageIndex, text, nextMessages); return }
+      }
     }
     const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
     const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
-    const intent = classifyAgentIntent(text, Boolean(pendingDraft))
-	    if (pendingDraft && intent === "confirmDraft") {
-	      confirmAgentDraft(pendingMessageIndex, nextMessages)
-	      return
-	    }
-	    if (pendingDraft && intent === "cancelDraft") {
-	      cancelAgentDraft(pendingMessageIndex, nextMessages)
-	      return
-	    }
-	    if (pendingDraft && intent === "pendingStatus") {
-	      onMessagesChange([...nextMessages, { role: "assistant", content: buildPendingDraftReminder(pendingDraft) }])
-	      return
-	    }
-	    if (pendingDraft && intent === "reviseDraft") {
-	      const revised = reviseAgentDraft(pendingDraft, text)
-	      if (revised) {
-	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
-	          ? { ...message, draftStatus: "superseded" as const }
-	          : message)
-	        onMessagesChange([...base, { role: "assistant", content: "好的，我按你说的改了一下。要是不对再告诉我。", agentDraft: revised, draftStatus: "pending" as const }])
-	      } else {
-	        onMessagesChange([...nextMessages, { role: "assistant", content: buildPendingDraftReminder(pendingDraft) }])
-	      }
-	      return
-	    }
-	    if (intent === "writeDraft") {
-	      // 写入对象不确定时先澄清，避免误创建或误补货到错误物品
-	      const clarification = buildLocalClarification(text, state)
-	      if (clarification) {
-	        onMessagesChange([...nextMessages, { role: "assistant", content: clarification.question, clarification }])
-	        return
-	      }
-	      const localDraft = buildLocalDraftFromText(text, state)
-	      if (localDraft) {
-	        onMessagesChange([...nextMessages, { role: "assistant", content: draftIntro(localDraft), agentDraft: localDraft, draftStatus: "pending" as const }])
-	        return
-	      }
-	    }
-	    const dateContext = buildChatDateContext()
-	    const quickAnswer = pendingDraft || shouldSkipQuickAnswerForAgent(text) ? null : answerHouseholdQuickly(text, state, itemViews, dateContext)
-	    if (quickAnswer) {
-	      onMessagesChange([...nextMessages, { role: "assistant", content: quickAnswer }])
-	      return
+    const dateContext = buildChatDateContext()
+
+    // 统一管家决策层：所有路径都先经过 orchestrator.decide
+    const decision = orchestrator.decide({
+      text,
+      state,
+      itemViews,
+      pendingDraft,
+      dateContext
+    })
+
+    if (decision.kind === "sync") {
+      const turn = decision.turn
+      // 批量意图标记：交回外层 batch 处理函数（应该在上面已处理，走到这里说明 batch 已失效）
+      if (isBatchIntentMarker(turn)) {
+        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
+        return
+      }
+      if (turn.kind === "proposal" && pendingDraft && turn.executableDraft === pendingDraft) {
+        // confirmDraft：orchestrator 标记 proposal(原 draft)，实际执行 commit
+        confirmAgentDraft(pendingMessageIndex, nextMessages)
+        return
+      }
+      if (turn.kind === "cancelled") {
+        cancelAgentDraft(pendingMessageIndex, nextMessages)
+        return
+      }
+      if (turn.kind === "proposal" && pendingDraft && turn.executableDraft !== pendingDraft) {
+        // 修订：旧 pending 标 superseded，新 draft 标 pending
+        const base = nextMessages.map((message, index) => index === pendingMessageIndex
+          ? { ...message, draftStatus: "superseded" as const }
+          : message)
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }])
+        return
+      }
+      // answer / clarification / 普通 proposal：直接转消息
+      onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
+      return
     }
     if (!state.settings.aiApiKey?.trim()) {
       setError("还没有设置 AI API Key。这个问题需要模型分析，设置后就可以继续问。")
@@ -1762,45 +1950,55 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const result = await askHouseholdAssistant({
       apiKey: state.settings.aiApiKey,
       model: state.settings.aiChatModel ?? state.settings.aiModel,
-	      state,
-	      itemViews,
-	      messages: nextMessages,
-	      pendingDraft,
-	      dateContext
-	    })
+      state,
+      itemViews,
+      messages: nextMessages,
+      pendingDraft,
+      dateContext
+    })
 	    if (result.ok) {
 	      setLoading(false)
-		      const parsed = parseAgentResponse(result.content.trim(), state)
-		      if (!parsed) {
-		        onMessagesChange([...nextMessages, {
-		          role: "assistant",
-		          content: intent === "writeDraft" || pendingDraft
-		            ? (pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，请换一句描述。")
-		            : safeQueryFallback(result.content)
-		        }])
-		        return
-		      }
-	      if (parsed.kind === "draft") {
+	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
+	        text, state, itemViews, pendingDraft, dateContext
+	      })
+	      if (!turn) {
+	        const fallback = composeFallbackMessage(pendingDraft ? "no-draft" : "no-answer")
+	        onMessagesChange([...nextMessages, { role: "assistant", content: fallback }])
+	        return
+	      }
+	      if (turn.kind === "proposal" && pendingDraft) {
+	        // LLM 返回新 draft：旧 pending 标 superseded
 	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
-	        const intro = parsed.message?.trim() || draftIntro(parsed.draft)
-	        onMessagesChange([...base, { role: "assistant", content: intro, agentDraft: parsed.draft, draftStatus: "pending" as const }])
-	      } else if (parsed.kind === "clarification") {
-	        onMessagesChange([...nextMessages, { role: "assistant", content: parsed.clarification.question, clarification: parsed.clarification }])
-	      } else {
-	        if (intent === "writeDraft" || pendingDraft) {
-	          onMessagesChange([...nextMessages, { role: "assistant", content: pendingDraft ? buildPendingDraftReminder(pendingDraft) : "我没能整理成可确认草稿，你换一句描述试试。" }])
-	        } else {
-	          onMessagesChange([...nextMessages, { role: "assistant", content: parsed.answer }])
-	        }
+	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }])
+	        return
 	      }
+	      onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
 	    } else {
 	      setLoading(false)
 	      onMessagesChange(nextMessages)
       setError(result.error)
       inputRef.current?.focus()
     }
+  }
+
+  /** 把 AgentTurn 映射成 HouseholdChatMessage。UI 只读 message + 附带字段，不直接读 executableDraft 字段表。 */
+  function agentTurnToMessage(turn: AgentTurn): HouseholdChatMessage {
+    if (turn.kind === "answer") {
+      return { role: "assistant", content: turn.message }
+    }
+    if (turn.kind === "proposal") {
+      return { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }
+    }
+    if (turn.kind === "clarification") {
+      return {
+        role: "assistant",
+        content: turn.message,
+        clarification: { question: turn.message, options: turn.options, provisional: turn.provisional }
+      }
+    }
+    return { role: "assistant", content: turn.message }
   }
 
 	  function submit(event: FormEvent) {
@@ -1835,7 +2033,21 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                   {message.role === "assistant" ? (
                     <div className="chat-message-content">{renderChatAnswer(message.content)}</div>
                   ) : (
-                    <p>{message.content}</p>
+                    <>
+                      <p>{message.content}</p>
+                      {message.imageAttachments && message.imageAttachments.length > 0 && (
+                        <div className="chat-image-attachments">
+                          {message.imageAttachments.map((attachment, attachIndex) => (
+                            <img
+                              key={attachIndex}
+                              src={attachment.dataUrl}
+                              alt={attachment.name}
+                              className="chat-image-thumbnail"
+                            />
+                          ))}
+                        </div>
+                      )}
+                    </>
                   )}
 	                  {message.role === "assistant" && message.agentDraft && (
 	                    <AgentDraftCard
@@ -1864,14 +2076,28 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                       <small className="chat-action-hint">点上面选项，或者直接打字告诉我。</small>
                     </div>
                   )}
-                  {message.role === "assistant" && message.agentDraftBatch && message.batchDraftStatuses && (
-                    <AgentDraftBatchCard
-                      drafts={message.agentDraftBatch}
-                      statuses={message.batchDraftStatuses}
-                      result={message.batchResult}
-                      onConfirmBatch={() => confirmBatch(index, messages)}
-                      onCancelBatch={() => cancelBatch(index, messages)}
-                      onSkipIndex={(batchIndex) => cancelBatchIndex(index, batchIndex, messages)}
+                  {message.role === "assistant" && message.orderImportRows && (
+                    <OrderImportReviewList
+                      rows={message.orderImportRows}
+                      items={state.items}
+                      categories={state.categories}
+                      mode="chat"
+                      onRowsChange={(nextRows) => {
+                        onMessagesChange(messages.map((msg, msgIndex) =>
+                          msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
+                        ))
+                      }}
+                      onSkipIndex={(rowIndex) => {
+                        const nextRows = (message.orderImportRows || []).map((row, rowIdx) =>
+                          rowIdx === rowIndex ? { ...row, targetItem: "__skip__" as const } : row
+                        )
+                        onMessagesChange(messages.map((msg, msgIndex) =>
+                          msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
+                        ))
+                      }}
+                      onConfirmBatch={() => confirmOrderImport(index, messages)}
+                      onCancelBatch={() => cancelOrderImport(index, messages)}
+                      result={message.orderImportResult}
                       onOpenItem={onOpenItem}
                     />
                   )}
@@ -1908,6 +2134,29 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
             </div>
           )}
           <div className="chat-input-row">
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/png,image/jpeg,image/jpg,image/webp"
+              onChange={onImageInputChange}
+              style={{ display: "none" }}
+              aria-hidden="true"
+            />
+            <button
+              type="button"
+              className="quiet-button chat-attach-button"
+              aria-label="上传订单截图"
+              title="上传订单截图"
+              disabled={loading}
+              onClick={() => imageInputRef.current?.click()}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                <polyline points="17 8 12 3 7 8" />
+                <line x1="12" y1="3" x2="12" y2="15" />
+              </svg>
+              <span>上传订单截图</span>
+            </button>
             <textarea
               id="household-chat-input"
               ref={inputRef}
@@ -1933,57 +2182,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   )
 }
 
-const measureUnitDefinitions = [
-  { value: "kg", label: "公斤", shortLabel: "kg", dimension: "mass", factor: 1000, defaultBaseAmount: 1, aliases: ["kg", "公斤", "千克"] },
-  { value: "g", label: "克", shortLabel: "g", dimension: "mass", factor: 1, defaultBaseAmount: 100, aliases: ["g", "克"] },
-  { value: "L", label: "升", shortLabel: "L", dimension: "volume", factor: 1000, defaultBaseAmount: 1, aliases: ["l", "L", "升"] },
-  { value: "ml", label: "毫升", shortLabel: "ml", dimension: "volume", factor: 1, defaultBaseAmount: 100, aliases: ["ml", "毫升"] },
-  { value: "个", label: "个", shortLabel: "个", dimension: "count", factor: 1, defaultBaseAmount: 1, aliases: ["个", "件"] },
-  { value: "只", label: "只", shortLabel: "只", dimension: "count", factor: 1, defaultBaseAmount: 100, aliases: ["只"] },
-  { value: "包", label: "包", shortLabel: "包", dimension: "count", factor: 1, defaultBaseAmount: 1, aliases: ["包"] },
-  { value: "抽", label: "抽", shortLabel: "抽", dimension: "count", factor: 1, defaultBaseAmount: 100, aliases: ["抽"] },
-  { value: "片", label: "片", shortLabel: "片", dimension: "count", factor: 1, defaultBaseAmount: 100, aliases: ["片"] },
-  { value: "颗", label: "颗", shortLabel: "颗", dimension: "count", factor: 1, defaultBaseAmount: 1, aliases: ["颗", "粒"] },
-  { value: "节", label: "节", shortLabel: "节", dimension: "count", factor: 1, defaultBaseAmount: 1, aliases: ["节"] },
-  { value: "卷", label: "卷", shortLabel: "卷", dimension: "count", factor: 1, defaultBaseAmount: 1, aliases: ["卷"] }
-] as const
-
 const pricingModeLabels = {
   spec: "按规格计价",
   measure: "按含量计价"
 } as const
 
 const purchaseSpecUnitOptions = ["袋", "瓶", "包", "盒", "支", "卷", "桶", "罐", "个", "只", "片", "板", "箱", "提", "件"] as const
-
-function encodeCustomMeasureUnit(name: string, dimension: string, factor: number): string {
-  return `custom:${name.trim()}:${dimension}:${factor}`
-}
-
-function parseCustomMeasureUnit(value?: string) {
-  if (!value?.startsWith("custom:")) return null
-  const [, name, dimension, factorText] = value.split(":")
-  const factor = Number(factorText)
-  if (!name || !dimension || !Number.isFinite(factor) || factor <= 0) return null
-  return {
-    value,
-    label: name,
-    shortLabel: name,
-    dimension,
-    factor,
-    defaultBaseAmount: 1,
-    aliases: [name]
-  }
-}
-
-function getMeasureUnitDefinition(value?: string) {
-  if (!value) return undefined
-  const customUnit = parseCustomMeasureUnit(value)
-  if (customUnit) return customUnit
-  const normalized = value.trim()
-  return measureUnitDefinitions.find((definition) =>
-    definition.value === normalized || definition.aliases.some((alias) => alias.toLowerCase() === normalized.toLowerCase())
-  )
-}
 
 function getMeasureDimensionBaseUnit(dimension: string): string {
   if (dimension === "mass") return "克"
@@ -1992,11 +2196,7 @@ function getMeasureDimensionBaseUnit(dimension: string): string {
 }
 
 function getMeasureUnitDisplay(value?: string): string {
-  return getMeasureUnitDefinition(value)?.label || value || "计量单位"
-}
-
-function getMeasureUnitShortLabel(value?: string): string {
-  return getMeasureUnitDefinition(value)?.shortLabel || value || "单位"
+  return getMeasureUnitLabel(value)
 }
 
 function formatMeasureQuantity(value: number): string {
@@ -2023,23 +2223,6 @@ function getPurchaseOptionPricingLabel(option: PurchaseOption | undefined, item?
   const mode = getPurchaseOptionPricingMode(option)
   if (mode === "measure") return `${unit} · 按${formatPricingUnit(getMeasureBaseAmount(option), option?.measureUnit)}计价`
   return `${unit} · 按规格计价`
-}
-
-function getCompatibleMeasureUnits(commonUnit?: string) {
-  const definition = getMeasureUnitDefinition(commonUnit)
-  if (!definition) return measureUnitDefinitions
-  const units = definition.dimension === "count"
-    ? measureUnitDefinitions.filter((unit) => unit.dimension === "count")
-    : measureUnitDefinitions.filter((unit) => unit.dimension === definition.dimension)
-  return units.some((unit) => unit.value === definition.value) ? units : [...units, definition]
-}
-
-function convertMeasureAmount(amount: number | undefined, fromUnit: string | undefined, toUnit: string | undefined): number | undefined {
-  if (!Number.isFinite(amount) || amount! <= 0) return undefined
-  const from = getMeasureUnitDefinition(fromUnit)
-  const to = getMeasureUnitDefinition(toUnit)
-  if (!from || !to || from.dimension !== to.dimension) return undefined
-  return amount! * from.factor / to.factor
 }
 
 function findRecordOption(item: ReplenishmentItem, record: RestockEvent): PurchaseOption | undefined {
@@ -3875,57 +4058,12 @@ function RestockRecordEditModal({ isOpen, item, record, onClose, onSave }: Resto
 
 // ---------- 订单截图批量导入 ----------
 
-/** 同一天且价格一致的记录视为疑似重复导入 */
-function hasSimilarRestockRecord(item: ReplenishmentItem, orderDate?: number, price?: number): boolean {
-  if (!orderDate) return false
-  return item.history.some((event) =>
-    startOfDay(event.at) === orderDate && (price === undefined || event.price === price)
-  )
-}
+/** 单次批量导入的截图数量上限，沿用共享常量 */
+const MAX_ORDER_IMAGES = ORDER_IMPORT_MAX_IMAGES
 
-/** 单次批量导入的截图数量上限，控制识别成本与确认列表长度 */
-const MAX_ORDER_IMAGES = 5
+type OrderImportRow = SharedOrderImportRow
 
-type OrderImportRow = {
-  key: string
-  productName: string
-  brandName?: string
-  coreName?: string
-  qty: number | ''
-  price: number | ''
-  measureAmount: number | ''
-  measureUnit: string
-  review: string
-  date: string
-  platform: string
-  genericName?: string
-  /** itemId | "__create__" | "__skip__" */
-  targetItem: string
-  /** "" (不指定) | optionId | "__newopt__" (新建常购商品) */
-  targetOption: string
-  /** 目标分类；"__newcat__" 表示使用 customCategory */
-  category: string
-  customCategory: string
-  duplicate: boolean
-}
-
-export type OrderImportConfirmedRow = {
-  productName: string
-  brandName?: string
-  coreName?: string
-  qty: number
-  price?: number
-  measureAmount?: number
-  measureUnit?: string
-  review?: string
-  restockDate?: number
-  platform?: string
-  genericName?: string
-  targetItem: string
-  targetOption: string
-  /** 已解析的目标分类 */
-  category: string
-}
+export type OrderImportConfirmedRow = SharedOrderImportConfirmedRow
 
 interface OrderImportModalProps {
   isOpen: boolean
@@ -3937,18 +4075,6 @@ interface OrderImportModalProps {
   recognitionMode: OrderRecognitionMode
   onOpenSettings: () => void
   onConfirm: (payload: { rows: OrderImportConfirmedRow[] }) => void
-}
-
-/** 该常购商品最近一次补货记录里的含量快照，用于预填（如皇家猫粮 L40 每袋 2kg） */
-function latestMeasureForOption(item: ReplenishmentItem, optionId: string | undefined): { amount?: number; unit?: string } {
-  if (!optionId) return {}
-  for (let i = item.history.length - 1; i >= 0; i--) {
-    const event = item.history[i]
-    if (event.purchaseOptionId === optionId && event.purchaseMeasureAmount && event.purchaseMeasureUnit) {
-      return { amount: event.purchaseMeasureAmount, unit: event.purchaseMeasureUnit }
-    }
-  }
-  return {}
 }
 
 function OrderImportModal({ isOpen, onClose, items, categories, apiKey, model, recognitionMode, onOpenSettings, onConfirm }: OrderImportModalProps) {
@@ -3971,40 +4097,7 @@ function OrderImportModal({ isOpen, onClose, items, categories, apiKey, model, r
   }, [isOpen])
 
   function buildRowsFromOrder(order: ExtractedOrder, imageIndex: number): OrderImportRow[] {
-    const defaultDate = toDateInputValue(order.orderDate ?? Date.now())
-    const defaultCategory = categories.includes("其他") ? "其他" : (categories[0] || "其他")
-    return order.lines.map((line, index) => {
-      const matchedItem = (line.matchedItemName ? items.find((item) => item.name === line.matchedItemName) : undefined)
-        || fuzzyMatchItem([line.coreName, line.productName, line.brandName, line.genericName], items)
-      const matchedOption = matchedItem
-        ? ((line.matchedOptionName ? (matchedItem.purchaseOptions || []).find((option) => option.productName === line.matchedOptionName) : undefined)
-          || fuzzyMatchOption(matchedItem, [line.coreName, line.productName, line.brandName]))
-        : undefined
-      // 含量预填优先级：标题里识别出的规格 > 该常购商品最近一次记录的含量快照
-      const historyMeasure = matchedItem && matchedOption ? latestMeasureForOption(matchedItem, matchedOption.id) : {}
-      return {
-        key: `img${imageIndex}_line${index}`,
-        productName: line.productName,
-        brandName: line.brandName,
-        coreName: line.coreName,
-        qty: line.qty,
-        price: line.price ?? '',
-        measureAmount: line.measureAmount ?? historyMeasure.amount ?? '',
-        measureUnit: line.measureUnit ?? historyMeasure.unit ?? '',
-        review: '',
-        date: defaultDate,
-        platform: order.platform || '',
-        genericName: line.genericName,
-        targetItem: matchedItem ? matchedItem.id : "__create__",
-        // 匹配到物品但没有对应常购商品时，默认顺带新建常购商品（可在下拉改为不指定）
-        targetOption: matchedItem
-          ? (matchedOption ? matchedOption.id : ((line.coreName || line.brandName || line.productName) ? "__newopt__" : ""))
-          : "",
-        category: matchedItem?.category || defaultCategory,
-        customCategory: "",
-        duplicate: matchedItem ? hasSimilarRestockRecord(matchedItem, order.orderDate, line.price) : false
-      }
-    })
+    return buildOrderImportRowsFromExtract(order, items, categories, imageIndex)
   }
 
   async function recognize(files: File[]) {
@@ -4096,29 +4189,7 @@ function OrderImportModal({ isOpen, onClose, items, categories, apiKey, model, r
   const includedCount = rows.filter((row) => row.targetItem !== "__skip__" && row.qty !== '' && Number(row.qty) > 0).length
 
   function handleConfirm() {
-    onConfirm({
-      rows: rows
-        .filter((row) => row.targetItem !== "__skip__" && row.qty !== '' && Number(row.qty) > 0)
-        .map((row) => {
-          const measureAmount = row.measureAmount === '' ? undefined : Math.max(0, Number(row.measureAmount)) || undefined
-          return {
-            productName: row.productName,
-            brandName: row.brandName,
-            coreName: row.coreName,
-            qty: Math.max(1, Math.round(Number(row.qty))),
-            price: row.price === '' ? undefined : Math.max(0, Number(row.price)),
-            measureAmount,
-            measureUnit: measureAmount && row.measureUnit ? row.measureUnit : undefined,
-            review: row.review.trim() || undefined,
-            restockDate: parseDateInputValue(row.date),
-            platform: row.platform || undefined,
-            genericName: row.genericName,
-            targetItem: row.targetItem,
-            targetOption: row.targetOption,
-            category: row.category === "__newcat__" ? row.customCategory.trim() || "其他" : row.category
-          }
-        })
-    })
+    onConfirm({ rows: orderImportRowsToConfirmed(rows) })
   }
 
   return (
@@ -4167,219 +4238,13 @@ function OrderImportModal({ isOpen, onClose, items, categories, apiKey, model, r
 
           {step === "review" && (
             <div className="order-import-review">
-              <div className="order-import-rows">
-                {rows.map((row) => {
-                  const resolvedCategory = row.category === "__newcat__" ? (row.customCategory.trim() || "其他") : row.category
-                  const targetItemObj = items.find((item) => item.id === row.targetItem)
-                  const categoryItems = items.filter((item) => item.category === resolvedCategory || item.id === row.targetItem)
-                  const selectedOption = targetItemObj?.purchaseOptions?.find((option) => option.id === row.targetOption)
-                  const unitLabel = selectedOption?.unit || targetItemObj?.unit || "件"
-                  const editableName = row.coreName ?? row.brandName ?? row.productName
-                  const coreLabel = editableName.trim() || row.brandName || row.productName
-                  const matchStatus = row.targetItem === "__skip__"
-                    ? "已跳过"
-                    : row.targetItem === "__create__"
-                      ? "将新建消耗品"
-                      : selectedOption
-                        ? "已匹配常购商品"
-                        : row.targetOption === "__newopt__"
-                          ? "将新建常购商品"
-                          : "可能需要手动确认"
-                  const measureUnitChoices = selectedOption?.measureUnit
-                    ? getCompatibleMeasureUnits(selectedOption.measureUnit)
-                    : measureUnitDefinitions
-                  return (
-                    <div key={row.key} className={`order-import-row${row.targetItem === "__skip__" ? " is-skipped" : ""}`}>
-                      <div className="order-import-card-title">
-                        <label className="order-import-name-field">
-                          <span>商品名</span>
-                          <input
-                            type="text"
-                            value={editableName}
-                            aria-label="商品名"
-                            title={row.productName}
-                            onChange={(event) => updateRow(row.key, { coreName: event.target.value })}
-                          />
-                        </label>
-                        <span className="order-import-match-status">{matchStatus}</span>
-                      </div>
-
-                      <div className="order-import-card-section order-import-target-section" aria-label={`${coreLabel}归类方式`}>
-                        <div className="order-import-target-selects">
-                          <label className="order-import-select-field">
-                            <span>分类</span>
-                            <select
-                              value={row.category}
-                              aria-label={`${coreLabel}分类`}
-                              onChange={(event) => {
-                                const nextCategory = event.target.value
-                                const nextResolvedCategory = nextCategory === "__newcat__" ? (row.customCategory.trim() || "其他") : nextCategory
-                                const firstItem = items.find((item) => item.category === nextResolvedCategory)
-                                const nextOption = firstItem
-                                  ? fuzzyMatchOption(firstItem, [row.coreName, row.productName, row.brandName])
-                                  : undefined
-                                updateRow(row.key, {
-                                  category: nextCategory,
-                                  targetItem: firstItem ? firstItem.id : "__create__",
-                                  targetOption: firstItem
-                                    ? (nextOption ? nextOption.id : ((row.coreName || row.brandName || row.productName) ? "__newopt__" : ""))
-                                    : ""
-                                })
-                              }}
-                            >
-                              {categories.map((name) => <option key={name} value={name}>{name}</option>)}
-                              {!categories.includes("其他") && <option value="其他">其他</option>}
-                              <option value="__newcat__">新建分类</option>
-                            </select>
-                          </label>
-                          {row.category === "__newcat__" && (
-                            <label className="order-import-select-field">
-                              <span>新分类</span>
-                              <input
-                                type="text"
-                                className="order-import-newcat-input"
-                                aria-label={`${coreLabel}新分类名称`}
-                                value={row.customCategory}
-                                onChange={(event) => updateRow(row.key, { customCategory: event.target.value })}
-                                placeholder="如：宝宝用品"
-                              />
-                            </label>
-                          )}
-                          <label className="order-import-select-field">
-                            <span>消耗品</span>
-                            <select
-                              value={row.targetItem}
-                              aria-label={`${coreLabel}消耗品`}
-                              onChange={(event) => {
-                                const nextItemId = event.target.value
-                                const nextItem = items.find((item) => item.id === nextItemId)
-                                // 切换目标物品后重新做常购商品匹配；没有命中且有品牌名时默认顺带新建
-                                const nextOption = nextItem
-                                  ? fuzzyMatchOption(nextItem, [row.coreName, row.productName, row.brandName])
-                                  : undefined
-                                updateRow(row.key, {
-                                  targetItem: nextItemId,
-                                  category: nextItem?.category || row.category,
-                                  targetOption: nextItem
-                                    ? (nextOption ? nextOption.id : ((row.coreName || row.brandName || row.productName) ? "__newopt__" : ""))
-                                    : ""
-                                })
-                              }}
-                            >
-                              {categoryItems.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-                              <option value="__create__">新建消耗品「{row.genericName || coreLabel}」</option>
-                              <option value="__skip__">跳过，不导入</option>
-                            </select>
-                          </label>
-                          {targetItemObj && (
-                            <label className="order-import-select-field">
-                              <span>常购商品</span>
-                              <select
-                                value={row.targetOption}
-                                aria-label={`${coreLabel}常购商品`}
-                                onChange={(event) => updateRow(row.key, { targetOption: event.target.value })}
-                              >
-                                <option value="">不指定常购商品</option>
-                                {(targetItemObj.purchaseOptions || []).map((option) => (
-                                  <option key={option.id} value={option.id}>{option.productName}</option>
-                                ))}
-                                <option value="__newopt__">新建「{coreLabel}」</option>
-                              </select>
-                            </label>
-                          )}
-                        </div>
-                      </div>
-
-                      <div className="order-import-card-section order-import-row-specs">
-                        <label className="order-import-inline-field">
-                          <span>数量</span>
-                          <input
-                            type="number"
-                            min="1"
-                            aria-label={`${coreLabel}数量`}
-                            value={row.qty}
-                            onChange={(event) => updateRow(row.key, { qty: event.target.value === '' ? '' : Number(event.target.value) })}
-                          />
-                          <b>{unitLabel}</b>
-                        </label>
-                        <label className="order-import-inline-field">
-                          <span>含量</span>
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            aria-label={`${coreLabel}单件含量`}
-                            value={row.measureAmount}
-                            onChange={(event) => updateRow(row.key, { measureAmount: event.target.value === '' ? '' : Number(event.target.value) })}
-                            placeholder="选填"
-                          />
-                          <select
-                            value={row.measureUnit}
-                            aria-label={`${coreLabel}含量单位`}
-                            onChange={(event) => updateRow(row.key, { measureUnit: event.target.value })}
-                          >
-                            <option value="">单位</option>
-                            {measureUnitChoices.map((unit) => <option key={unit.value} value={unit.value}>{unit.label}</option>)}
-                            {row.measureUnit && !measureUnitChoices.some((unit) => unit.value === row.measureUnit) && (
-                              <option value={row.measureUnit}>{row.measureUnit}</option>
-                            )}
-                          </select>
-                        </label>
-                        <label className="order-import-inline-field">
-                          <span>价格</span>
-                          <input
-                            type="number"
-                            min="0"
-                            step="0.01"
-                            aria-label={`${coreLabel}总价`}
-                            value={row.price}
-                            onChange={(event) => updateRow(row.key, { price: event.target.value === '' ? '' : Number(event.target.value) })}
-                            placeholder="总价"
-                          />
-                          <b>元</b>
-                        </label>
-                      </div>
-
-                      <div className="order-import-card-section order-import-row-meta">
-                        <label className="order-import-inline-field">
-                          <span>日期</span>
-                          <input
-                            type="date"
-                            aria-label={`${coreLabel}购买日期`}
-                            value={row.date}
-                            onChange={(event) => updateRow(row.key, { date: event.target.value })}
-                          />
-                        </label>
-                        <label className="order-import-inline-field">
-                          <span>平台</span>
-                          <select
-                            value={row.platform}
-                            aria-label={`${coreLabel}购买平台`}
-                            onChange={(event) => updateRow(row.key, { platform: event.target.value })}
-                          >
-                            <option value="">选填</option>
-                            {platforms.map((name) => <option key={name} value={name}>{name}</option>)}
-                          </select>
-                        </label>
-                        <label className="order-import-inline-field order-import-review-field">
-                          <span>评价</span>
-                          <input
-                            type="text"
-                            aria-label={`${coreLabel}商品评价`}
-                            value={row.review}
-                            onChange={(event) => updateRow(row.key, { review: event.target.value })}
-                            placeholder="选填"
-                          />
-                        </label>
-                      </div>
-
-                      {row.duplicate && row.targetItem !== "__skip__" && (
-                        <span className="order-import-duplicate-hint">当天已有相同记录，可能重复</span>
-                      )}
-                    </div>
-                  )
-                })}
-              </div>
+              <OrderImportReviewList
+                rows={rows}
+                items={items}
+                categories={categories}
+                mode="modal"
+                onRowsChange={setRows}
+              />
               {error && <p className="form-error" role="alert">{error}</p>}
             </div>
           )}

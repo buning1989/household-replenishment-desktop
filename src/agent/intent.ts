@@ -78,7 +78,8 @@ const REVISE_KEYWORDS = [
 ]
 
 // 评价关键词：既触发 revise，也写入 review 字段（在 drafts.ts 里解析）。
-const REVIEW_KEYWORDS = ["好用", "不好用", "味道大", "猫不爱吃", "质量一般", "下次不买", "下次别买", "回购", "不回购"]
+// 任务一观察引擎的 negativeReviewRepurchase 判定复用此列表的负面子集。
+export const REVIEW_KEYWORDS = ["好用", "不好用", "味道大", "猫不爱吃", "质量一般", "下次不买", "下次别买", "回购", "不回购"]
 
 function includesAny(text: string, phrases: string[]): boolean {
   return phrases.some((phrase) => text.includes(phrase))

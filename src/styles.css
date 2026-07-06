@@ -4564,7 +4564,7 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   min-height: 78px;
   max-height: 118px;
   resize: vertical;
-  padding: 12px 96px 14px 14px;
+  padding: 12px 96px 14px 46px;
   border: 1px solid var(--line);
   border-radius: var(--radius-small);
   color: var(--ink);
@@ -4597,6 +4597,57 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   border-top-color: #fff;
   border-radius: 50%;
   animation: order-import-spin .9s linear infinite;
+}
+.chat-attach-button {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--paper);
+  color: var(--faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  transition: color .18s ease, background .18s ease, border-color .18s ease;
+}
+.chat-attach-button svg {
+  flex-shrink: 0;
+}
+.chat-attach-button:hover {
+  color: var(--ink);
+  background: var(--hover);
+  border-color: var(--ink);
+}
+.chat-attach-button:focus-visible {
+  outline: 3px solid rgba(26, 26, 26, .08);
+  outline-offset: 0;
+  color: var(--ink);
+  border-color: var(--ink);
+}
+.chat-attach-button:disabled {
+  cursor: not-allowed;
+  opacity: .5;
+}
+.chat-image-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.chat-image-thumbnail {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-small);
+  background: var(--paper);
+  display: block;
 }
 .chat-error {
   margin-bottom: 10px;
@@ -5043,6 +5094,70 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   }
 }
 
+/* ---------- 对话模式下的订单识别结果（与弹窗共用 OrderImportReviewList） ---------- */
+
+.order-import-review-list.is-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-medium);
+  background: var(--surface);
+}
+.order-import-review-list.is-chat .order-import-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.order-import-review-list.is-chat .order-import-row-wrapper {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.order-import-review-header {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.order-import-review-header strong {
+  font-size: 13px;
+  color: var(--ink);
+}
+.order-import-review-header small {
+  font-size: 11px;
+  color: var(--faint);
+}
+.order-import-review-list.is-chat .order-import-row.is-chat {
+  padding: 8px 10px;
+}
+.order-import-review-list.is-chat .order-import-row-skip {
+  align-self: flex-end;
+  margin-bottom: 2px;
+}
+.order-import-review-list.is-chat .order-import-row-view {
+  align-self: flex-end;
+  margin-bottom: 2px;
+}
+.order-import-review-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--line);
+}
+.order-import-review-summary {
+  font-size: 12px;
+  color: var(--faint);
+}
+.order-import-match-status.is-skipped {
+  color: var(--faint);
+}
+
 
 /* 对话创建提案的确认清单（只读，修改走对话） */
 .chat-action-card {
@@ -5242,6 +5357,41 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   display: flex;
   justify-content: flex-end;
   gap: 8px;
+}
+.chat-batch-card-section {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  margin-top: 4px;
+}
+.chat-batch-card-section strong {
+  font-size: 12px;
+  color: var(--ink);
+}
+.chat-batch-card-section small {
+  font-size: 11px;
+  color: var(--faint);
+}
+.chat-batch-card-section ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-batch-card-section .chat-batch-row {
+  padding: 4px 8px;
+  background: transparent;
+}
+.chat-batch-row.is-skipped {
+  opacity: 0.6;
+  border-color: transparent;
+}
+.chat-batch-row.is-uncertain {
+  border-color: var(--line);
 }
 
 /* 创建结果消息里的跳转入口 */

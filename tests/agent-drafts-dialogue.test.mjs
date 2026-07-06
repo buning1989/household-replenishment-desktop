@@ -73,10 +73,10 @@ test("对话3：昨天买的 → reviseDraft 修订日期", () => {
   assert.ok(revised)
   const restock = revised.kind === "createItemWithRestock" ? revised.restock : revised
   assert.ok(restock.restockDate, "应写入 restockDate")
-  // 昨天日期：与 now 相差 0~2 天（startOfDay(now-1) 与 now 的差随当前时刻在 0~2 天之间）
+  // 昨天日期：startOfDay(now-1) 与 now 的差随当前时刻在 0~2 天之间
   const now = Date.now()
   const diff = now - restock.restockDate
-  assert.ok(diff >= dayMs(0.9) && diff <= dayMs(1.99), `昨天日期差应在约 1 天，实际 diff=${diff}`)
+  assert.ok(diff >= dayMs(0.9) && diff <= dayMs(2.0), `昨天日期差应在约 1 天，实际 diff=${diff}`)
 })
 
 test("对话4：这个不好用，下次别推荐 → reviseDraft 修订评价", () => {
