@@ -15,6 +15,7 @@ import { calculateMonthlySpend } from "../pure-logic.mjs"
 import { formatPrice } from "../domain"
 import { PROFILE_OPTIONS } from "../model/householdProfile"
 import { REVIEW_KEYWORDS } from "./intent"
+import { composeGroupedObservationText } from "./responseComposer"
 import type { AppState, HouseholdProfile, ReplenishmentItem } from "../types"
 import type { ChatDateContext, HouseholdChatItemView } from "../llm/householdChat"
 
@@ -332,7 +333,8 @@ export function buildManagerBriefing(
 
   const parts = [greeting]
   if (topObservations.length > 0) {
-    parts.push(topObservations.map((obs) => obs.text).join("；"))
+    // 按物品分组合并 + 去除子句末句号（文案逻辑收敛在 responseComposer）
+    parts.push(composeGroupedObservationText(topObservations))
   }
   parts.push(closing)
 

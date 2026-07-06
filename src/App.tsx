@@ -28,7 +28,7 @@ import { buildManagerBriefing, buildManagerObservations } from "./agent/observat
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
-import { composeFallbackMessage, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage } from "./agent/responseComposer"
+import { composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import {
   buildOrderImportRowsFromExtract,
   orderImportRowsToConfirmed,
@@ -1225,6 +1225,21 @@ function renderChatAnswer(content: string) {
 }
 
 // 旧 ChatActionCard（ChatProposedAction 确认清单）已下线，统一由 AgentDraftCard 承担。
+
+/** 管家小头像：内置 SVG 插画，黑白线条猫脸，与 403家庭管家品牌一致。 */
+function ManagerAvatar() {
+  return (
+    <svg className="chat-manager-avatar" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+      <circle cx="16" cy="17" r="12" fill="none" stroke="currentColor" strokeWidth="1.5" />
+      <path d="M7 11 L9 5 L13 9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <path d="M25 11 L23 5 L19 9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
+      <circle cx="12" cy="16" r="1.5" fill="currentColor" />
+      <circle cx="20" cy="16" r="1.5" fill="currentColor" />
+      <path d="M15 20 Q16 21.5 17 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  )
+}
+
 function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
   draft: AgentDraft
   status: AgentDraftStatus
@@ -1232,12 +1247,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
   onCancel: () => void
   onDraftChange?: (next: AgentDraft) => void
 }) {
-  const statusLabel = status === "pending"
-    ? draft.kind === "createItem" ? "准备加入管理"
-      : draft.kind === "restock" ? "准备记一笔补货"
-        : draft.kind === "createItemWithRestock" ? "准备加入并记账"
-          : "准备挂为常购商品"
-    : status === "confirmed" ? "已写入" : status === "cancelled" ? "已取消" : "已更新为新草稿"
+  const statusLabel = composeDraftStatusLabel(status, draft)
   const confirmLabel = draft.kind === "createItem"
     ? "就这么记"
     : draft.kind === "restock" ? "就这么记"
@@ -1258,7 +1268,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
       const parts: string[] = []
       if (draft.price !== undefined) parts.push(`¥${formatPrice(draft.price)}`)
       if (draft.platform) parts.push(draft.platform)
-      if (draft.purchaseProductName) parts.push(draft.purchaseProductName)
+      if (draft.purchaseProductName && !isProductNameRedundant(draft.itemName, draft.purchaseProductName)) parts.push(draft.purchaseProductName)
       if (draft.review) parts.push(draft.review)
       if (draft.cycleDaysPatch) parts.push(`周期调整 ${draft.cycleDaysPatch} 天`)
       if (draft.purchaseMeasureAmount && draft.purchaseMeasureUnit) parts.push(`${draft.purchaseMeasureAmount}${draft.purchaseMeasureUnit}`)
@@ -1273,7 +1283,8 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
       if (draft.restock.price !== undefined) parts.push(`¥${formatPrice(draft.restock.price)}`)
       if (draft.restock.platform) parts.push(draft.restock.platform)
       if (draft.addPurchaseOption?.productName || draft.restock.purchaseProductName) {
-        parts.push(draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || "")
+        const productName = draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || ""
+        if (!isProductNameRedundant(draft.item.itemName, productName)) parts.push(productName)
       }
       if (draft.restock.review) parts.push(draft.restock.review)
       if (draft.restock.purchaseMeasureAmount && draft.restock.purchaseMeasureUnit) {
@@ -1375,8 +1386,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
       {receipt.secondary && <p className="chat-action-receipt-secondary">{receipt.secondary}</p>}
       {matchHint && (
         <p className="chat-action-summary chat-action-hint-warn">
-          <b>疑似匹配</b>
-          {matchHint}
+          {composeMatchHintText(matchHint)}
         </p>
       )}
       {/* B2：展开修改入口，展开后显示完整字段表 + 内联编辑 */}
@@ -2115,7 +2125,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       <aside className={`panel chat-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="household-chat-title">
         <div className="panel-header chat-panel-header">
           <div className="panel-header-info">
-            <h2 id="household-chat-title">问问当前库存和补货</h2>
+            <h2 id="household-chat-title">403管家</h2>
           </div>
           <button className="icon-button close-btn" aria-label="关闭家庭问答" onClick={onClose}><Icon name="close" size={16} /></button>
         </div>
@@ -2135,7 +2145,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
               messages.map((message, index) => (
                 <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
                   {message.role === "assistant" ? (
-                    <div className="chat-message-content">{renderChatAnswer(message.content)}</div>
+                    <>
+                      <ManagerAvatar />
+                      <div className="chat-message-content">{renderChatAnswer(message.content)}</div>
+                    </>
                   ) : (
                     <>
                       <p>{message.content}</p>

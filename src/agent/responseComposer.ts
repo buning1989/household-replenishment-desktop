@@ -13,6 +13,88 @@ import { describeAgentDraft, type AgentDraft, type OrderRow } from "./drafts"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { OrderImportRow } from "../OrderImportReview"
 
+/**
+ * 草稿卡片的状态标签文案。
+ * 统一用第一人称管家陈述句式，不出现「准备加入并记账」等系统化短语。
+ */
+export function composeDraftStatusLabel(
+  status: "pending" | "confirmed" | "cancelled" | "superseded",
+  draft: AgentDraft
+): string {
+  if (status === "confirmed") return "已写入"
+  if (status === "cancelled") return "已取消"
+  if (status === "superseded") return "已更新为新草稿"
+  // pending
+  if (draft.kind === "createItem") return "我准备这么加"
+  if (draft.kind === "restock") return "我准备这么记"
+  if (draft.kind === "createItemWithRestock") return "我准备这么记"
+  return "我准备这么挂"
+}
+
+/**
+ * 物品匹配疑似时的提示文案。
+ * 改写为管家陈述句式，不出现「疑似匹配」「模板」「库里」等实现词汇。
+ * matchHint 来自 drafts.ts，已是管家口吻（如「『纸』可能指：xxx，请确认是哪一个。」），
+ * 这里直接透传，由调用方去掉系统化标签。
+ */
+export function composeMatchHintText(matchHint: string): string {
+  return matchHint
+}
+
+/**
+ * 判断商品名是否与物品名冗余（相同或仅包含关系），用于摘要行去重。
+ * 当商品名等于物品名、或商品名仅是物品名加品牌前缀且无实质区分时，视为冗余。
+ */
+export function isProductNameRedundant(itemName: string, productName: string | undefined): boolean {
+  if (!productName) return false
+  const norm = (s: string) => s.trim().toLocaleLowerCase("zh-CN")
+  const name = norm(itemName)
+  const product = norm(productName)
+  if (!product) return false
+  // 完全相同 → 冗余
+  if (name === product) return true
+  // 商品名仅是物品名前后加修饰但无实质区分（如「猫砂」「某猫砂」「猫砂一袋」）→ 冗余
+  // 仅当商品名长度与物品名差距 ≤ 3 字符时判定
+  if (Math.abs(product.length - name.length) <= 3) {
+    if (product.includes(name) || name.includes(product)) return true
+  }
+  return false
+}
+
+/**
+ * 简报观察拼接：按物品分组合并 + 去除子句末句号防连续标点。
+ *
+ * - 同一物品（itemId 相同）的多条观察用逗号合并为单句
+ * - 无 itemId 的观察（如预算类）各自独立成句
+ * - 拼接前去除每条 text 末尾的句号（保留问号，问号是语义的一部分）
+ * - 句子之间用分号连接
+ */
+export function composeGroupedObservationText(
+  observations: Array<{ text: string; itemId?: string }>
+): string {
+  if (observations.length === 0) return ""
+  // 按 itemId 分组（undefined/null 归为各自独立的组，不合并）
+  const groups: Array<Array<{ text: string; itemId?: string }>> = []
+  const groupIndexByItemId = new Map<string | null, number>()
+  for (const obs of observations) {
+    const key = obs.itemId ?? null
+    if (key === null) {
+      // 无 itemId 的观察不参与合并，独立成组
+      groups.push([obs])
+    } else if (groupIndexByItemId.has(key)) {
+      groups[groupIndexByItemId.get(key)!].push(obs)
+    } else {
+      groupIndexByItemId.set(key, groups.length)
+      groups.push([obs])
+    }
+  }
+  // 每组合并为一句：去除子句末句号，用逗号连接
+  const sentences = groups.map((group) =>
+    group.map((obs) => obs.text.replace(/。$/, "")).join("，")
+  )
+  return sentences.join("；")
+}
+
 /** 禁用词：composer 输出的任何文案都不应包含这些词 */
 export const FORBIDDEN_PHRASES = [
   "我理解为", "我猜", "我估算", "根据模板", "根据常识",

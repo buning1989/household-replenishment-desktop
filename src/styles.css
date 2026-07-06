@@ -4473,6 +4473,11 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-message.assistant {
   align-self: flex-start;
 }
+.chat-manager-avatar {
+  color: var(--ink);
+  flex-shrink: 0;
+  margin-bottom: 2px;
+}
 .chat-message p,
 .chat-message-content {
   margin: 0;
