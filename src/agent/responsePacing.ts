@@ -1,17 +1,22 @@
 /**
  * 响应节奏层：避免本地规则命中时秒回造成机器感。
  *
- * 核心目标：建立「任务复杂度对应响应节奏」的机制。
- *   - confirm / cancel / committed：立即反馈（0-150ms）
- *   - pending draft 字段补充：300-600ms，显示「我记到这张单里。」
- *   - 身份 / 简单闲聊：300-500ms，不显示思考文案
- *   - 本地库存查询：600-900ms，显示「我看一下当前记录。」等
- *   - 价格 / 预算 / 历史分析：900-1500ms，显示「我对一下最近几次记录。」等
+ * 核心目标：建立「任务复杂度对应响应节奏」的机制，并保证用户能看到过程态。
+ *   - confirm / cancel / committed：立即反馈（0ms，showLoading=false）
+ *   - pending draft 字段补充：500-800ms，显示「我记到这张单里。」
+ *   - 身份 / 简单闲聊：500-700ms，显示 typing dots（无文案）
+ *   - 本地库存查询：800-1100ms，显示「我看一下当前记录。」等
+ *   - 价格 / 预算 / 历史分析：1000-1500ms，显示「我对一下最近几次记录。」等
  *   - 订单截图识别：使用真实 loading，不额外假等待
- *   - 实时外部问题：300-500ms 后直接说明边界，不假装查询
+ *   - 实时外部问题：500-700ms，显示 typing dots（不假装查询，但有可见过程）
+ *
+ * 关键语义：
+ *   - minDelayMs > 0 时，默认 showLoading = true（不允许静默等待）
+ *   - loadingText 为空时，UI 显示 typing dots
+ *   - 只有 confirmCancel 才允许 showLoading=false
  *
  * 本模块是纯函数，可被测试直接覆盖。
- * UI 集成（respondWithPacing）由 App.tsx 调用，不在本文件内做副作用。
+ * UI 集成（transient message 替换）由 App.tsx 调用，不在本文件内做副作用。
  */
 
 import type { AgentLocalIntent } from "./intent"
@@ -21,7 +26,7 @@ import { detectQueryFactType } from "../llm/householdChat"
 
 // ---------- 类型 ----------
 
-/** 节奏分类：决定这一轮用多少延迟、是否显示思考文案 */
+/** 节奏分类：决定这一轮用多少延迟、是否显示过程态 */
 export type PacingCategory =
   | "confirmCancel" // 确认/取消/committed：立即反馈
   | "draftRevise" // pending draft 字段补充（数字、平台名、评价）
@@ -35,10 +40,10 @@ export type PacingCategory =
 export type ResponseTiming = {
   /** 最小延迟毫秒数；实际耗时超过此值时不再额外等待 */
   minDelayMs: number
-  /** 临时 loading 文案；为空表示只显示轻微 typing 指示器 */
+  /** 临时 loading 文案；为空时 UI 显示 typing dots */
   loadingText?: string
-  /** 是否显示 typing 思考状态 */
-  showTyping: boolean
+  /** 是否显示 loading 过程态（transient message）。minDelayMs > 0 时必须为 true */
+  showLoading: boolean
 }
 
 /** getResponseTiming 输入参数 */
@@ -108,37 +113,37 @@ function timingForCategory(category: PacingCategory): ResponseTiming {
   switch (category) {
     case "confirmCancel":
       // 立即反馈，不显示思考
-      return { minDelayMs: 0, showTyping: false }
+      return { minDelayMs: 0, showLoading: false }
 
     case "draftRevise":
       // 像在更新当前补货单
       return {
-        minDelayMs: pickInclusive(300, 600),
+        minDelayMs: pickInclusive(500, 800),
         loadingText: "我记到这张单里。",
-        showTyping: true
+        showLoading: true
       }
 
     case "identityCasual":
-      // 不秒回，但也不明显卡顿；不显示思考文案，只显示轻微 typing
+      // 不秒回；显示 typing dots（无文案）
       return {
-        minDelayMs: pickInclusive(300, 500),
-        showTyping: true
+        minDelayMs: pickInclusive(500, 700),
+        showLoading: true
       }
 
     case "stockQuery":
       // 本地库存查询
       return {
-        minDelayMs: pickInclusive(600, 900),
+        minDelayMs: pickInclusive(800, 1100),
         loadingText: pickFrom(STOCK_QUERY_LOADING),
-        showTyping: true
+        showLoading: true
       }
 
     case "priceBudget":
       // 价格/预算/历史分析
       return {
-        minDelayMs: pickInclusive(900, 1500),
+        minDelayMs: pickInclusive(1000, 1500),
         loadingText: pickFrom(PRICE_BUDGET_LOADING),
-        showTyping: true
+        showLoading: true
       }
 
     case "orderImport":
@@ -146,22 +151,22 @@ function timingForCategory(category: PacingCategory): ResponseTiming {
       return {
         minDelayMs: 0,
         loadingText: "我看一下这张订单。",
-        showTyping: true
+        showLoading: true
       }
 
     case "realtimeExternal":
-      // 不假装查询，300-500ms 后直接说明边界
+      // 不假装查询，但要有可见过程（typing dots）
       return {
-        minDelayMs: pickInclusive(300, 500),
-        showTyping: false
+        minDelayMs: pickInclusive(500, 700),
+        showLoading: true
       }
 
     case "default":
     default:
-      // 默认轻微节奏
+      // 默认节奏：typing dots
       return {
-        minDelayMs: pickInclusive(200, 400),
-        showTyping: true
+        minDelayMs: pickInclusive(500, 700),
+        showLoading: true
       }
   }
 }
@@ -197,7 +202,6 @@ function pickFrom(pool: string[]): string {
 
 /**
  * 只暴露 categorizePacing 的纯函数版本，便于单测断言分类正确。
- * 不暴露内部的 timingForCategory（因为含随机数，不易断言具体数值）。
  */
 export function categorizePacingForTest(input: ResponseTimingInput): PacingCategory {
   return categorizePacing(input)
@@ -210,22 +214,22 @@ export function categorizePacingForTest(input: ResponseTimingInput): PacingCateg
 export function timingForCategoryForTest(category: PacingCategory): ResponseTiming {
   switch (category) {
     case "confirmCancel":
-      return { minDelayMs: 0, showTyping: false }
+      return { minDelayMs: 0, showLoading: false }
     case "draftRevise":
-      return { minDelayMs: 300, loadingText: "我记到这张单里。", showTyping: true }
+      return { minDelayMs: 500, loadingText: "我记到这张单里。", showLoading: true }
     case "identityCasual":
-      return { minDelayMs: 300, showTyping: true }
+      return { minDelayMs: 500, showLoading: true }
     case "stockQuery":
-      return { minDelayMs: 600, loadingText: STOCK_QUERY_LOADING[0], showTyping: true }
+      return { minDelayMs: 800, loadingText: STOCK_QUERY_LOADING[0], showLoading: true }
     case "priceBudget":
-      return { minDelayMs: 900, loadingText: PRICE_BUDGET_LOADING[0], showTyping: true }
+      return { minDelayMs: 1000, loadingText: PRICE_BUDGET_LOADING[0], showLoading: true }
     case "orderImport":
-      return { minDelayMs: 0, loadingText: "我看一下这张订单。", showTyping: true }
+      return { minDelayMs: 0, loadingText: "我看一下这张订单。", showLoading: true }
     case "realtimeExternal":
-      return { minDelayMs: 300, showTyping: false }
+      return { minDelayMs: 500, showLoading: true }
     case "default":
     default:
-      return { minDelayMs: 200, showTyping: true }
+      return { minDelayMs: 500, showLoading: true }
   }
 }
 

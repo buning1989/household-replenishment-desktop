@@ -2,15 +2,16 @@
 // 运行方式：node --test tests/response-pacing.test.mjs
 //
 // 覆盖验收点：
-// 1. confirm/cancel/committed：minDelayMs=0，不显示思考
-// 2. pending draft 字段补充：300-600ms，loadingText「我记到这张单里。」
-// 3. 身份/简单闲聊：300-500ms，不显示思考文案
-// 4. 本地库存查询：600-900ms，loadingText 来自库存查询文案池
-// 5. 价格/预算/历史分析：900-1500ms，loadingText 来自价格预算文案池
+// 1. confirm/cancel/committed：minDelayMs=0，showLoading=false
+// 2. pending draft 字段补充：500-800ms，loadingText「我记到这张单里。」
+// 3. 身份/简单闲聊：500-700ms，showLoading=true，无 loadingText（显示 typing dots）
+// 4. 本地库存查询：800-1100ms，loadingText 来自库存查询文案池
+// 5. 价格/预算/历史分析：1000-1500ms，loadingText 来自价格预算文案池
 // 6. 订单截图识别：minDelayMs=0（真实 loading），loadingText「我看一下这张订单。」
-// 7. 实时外部问题：300-500ms，不显示思考（不假装查询）
-// 8. compactRecentMessages 跳过 isTransient 消息
-// 9. computeRemainingDelay：实际耗时超过 minDelayMs 时返回 0
+// 7. 实时外部问题：500-700ms，showLoading=true（不静默等待，显示 typing dots）
+// 8. 关键语义：minDelayMs > 0 时 showLoading 必须为 true（不允许静默等待）
+// 9. compactRecentMessages 跳过 isTransient 消息
+// 10. computeRemainingDelay：实际耗时超过 minDelayMs 时返回 0
 
 import { test } from "node:test"
 import assert from "node:assert/strict"
@@ -80,10 +81,10 @@ test("confirmCancel：turn.kind=cancelled 时归类为 confirmCancel", () => {
   assert.equal(category, "confirmCancel")
 })
 
-test("confirmCancel 节奏：minDelayMs=0，showTyping=false", () => {
+test("confirmCancel 节奏：minDelayMs=0，showLoading=false", () => {
   const timing = timingForCategoryForTest("confirmCancel")
   assert.equal(timing.minDelayMs, 0)
-  assert.equal(timing.showTyping, false)
+  assert.equal(timing.showLoading, false)
   assert.equal(timing.loadingText, undefined)
 })
 
@@ -94,7 +95,7 @@ test("getResponseTiming：confirmDraft 立即反馈", () => {
     hasPendingDraft: true
   }))
   assert.equal(timing.minDelayMs, 0)
-  assert.equal(timing.showTyping, false)
+  assert.equal(timing.showLoading, false)
 })
 
 // ---------- 2. pending draft 字段补充 ----------
@@ -117,10 +118,10 @@ test("draftRevise：无 pendingDraft 时不归类为 draftRevise", () => {
   assert.notEqual(category, "draftRevise")
 })
 
-test("draftRevise 节奏：300ms 起步，showTyping=true，loadingText 是「我记到这张单里。」", () => {
+test("draftRevise 节奏：500ms 起步，showLoading=true，loadingText 是「我记到这张单里。」", () => {
   const timing = timingForCategoryForTest("draftRevise")
-  assert.ok(timing.minDelayMs >= 300, `minDelayMs 应 >= 300，实际 ${timing.minDelayMs}`)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 500, `minDelayMs 应 >= 500，实际 ${timing.minDelayMs}`)
+  assert.equal(timing.showLoading, true)
   assert.equal(timing.loadingText, "我记到这张单里。")
 })
 
@@ -130,8 +131,8 @@ test("getResponseTiming：「拼多多」在 pending draft 下走 draftRevise", 
     intent: "reviseDraft",
     hasPendingDraft: true
   }))
-  assert.ok(timing.minDelayMs >= 300)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 500)
+  assert.equal(timing.showLoading, true)
   assert.ok(timing.loadingText)
 })
 
@@ -141,8 +142,8 @@ test("getResponseTiming：「还挺好，不起灰」在 pending draft 下走 dr
     intent: "reviseDraft",
     hasPendingDraft: true
   }))
-  assert.ok(timing.minDelayMs >= 300)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 500)
+  assert.equal(timing.showLoading, true)
 })
 
 // ---------- 3. 身份/简单闲聊 ----------
@@ -165,21 +166,22 @@ test("identityCasual：短闲聊归类为 identityCasual", () => {
   assert.equal(category, "identityCasual")
 })
 
-test("identityCasual 节奏：300ms 起步，showTyping=true，无 loadingText", () => {
+test("identityCasual 节奏：500ms 起步，showLoading=true，无 loadingText（显示 typing dots）", () => {
   const timing = timingForCategoryForTest("identityCasual")
-  assert.ok(timing.minDelayMs >= 300, `minDelayMs 应 >= 300，实际 ${timing.minDelayMs}`)
-  assert.equal(timing.showTyping, true)
-  assert.equal(timing.loadingText, undefined)
+  assert.ok(timing.minDelayMs >= 500, `minDelayMs 应 >= 500，实际 ${timing.minDelayMs}`)
+  assert.equal(timing.showLoading, true)
+  assert.equal(timing.loadingText, undefined, "identityCasual 不应有 loadingText（显示 typing dots）")
 })
 
-test("getResponseTiming：「你是谁」不秒回但也不卡顿", () => {
+test("getResponseTiming：「你是谁」不再秒回，先出现 typing dots", () => {
   const timing = getResponseTiming(makeInput({
     text: "你是谁",
     intent: null,
     hasPendingDraft: false
   }))
   assert.ok(timing.minDelayMs > 0, "「你是谁」不应秒回")
-  assert.ok(timing.minDelayMs <= 500, "「你是谁」不应明显卡顿")
+  assert.ok(timing.minDelayMs <= 700, "「你是谁」不应明显卡顿")
+  assert.equal(timing.showLoading, true, "「你是谁」应显示 typing dots")
 })
 
 // ---------- 4. 本地库存查询 ----------
@@ -202,10 +204,10 @@ test("stockQuery：「今天优先补什么」归类为 stockQuery", () => {
   assert.equal(category, "stockQuery")
 })
 
-test("stockQuery 节奏：600ms 起步，showTyping=true，loadingText 来自文案池", () => {
+test("stockQuery 节奏：800ms 起步，showLoading=true，loadingText 来自文案池", () => {
   const timing = timingForCategoryForTest("stockQuery")
-  assert.ok(timing.minDelayMs >= 600, `minDelayMs 应 >= 600，实际 ${timing.minDelayMs}`)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 800, `minDelayMs 应 >= 800，实际 ${timing.minDelayMs}`)
+  assert.equal(timing.showLoading, true)
   assert.ok(timing.loadingText, "stockQuery 应有 loadingText")
   // 来自文案池
   const STOCK_QUERY_TEXTS = ["我看一下当前记录。", "我看一下这周的提醒。", "我先排一下优先级。"]
@@ -215,14 +217,14 @@ test("stockQuery 节奏：600ms 起步，showTyping=true，loadingText 来自文
   )
 })
 
-test("getResponseTiming：「这周要补什么」会先显示处理状态", () => {
+test("getResponseTiming：「这周要补什么」会先显示「我看一下当前记录。」", () => {
   const timing = getResponseTiming(makeInput({
     text: "这周要补什么",
     intent: null,
     hasPendingDraft: false
   }))
-  assert.ok(timing.minDelayMs >= 600)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 800)
+  assert.equal(timing.showLoading, true)
   assert.ok(timing.loadingText)
 })
 
@@ -246,10 +248,10 @@ test("priceBudget：「价格异常」归类为 priceBudget", () => {
   assert.equal(category, "priceBudget")
 })
 
-test("priceBudget 节奏：900ms 起步，showTyping=true，loadingText 来自文案池", () => {
+test("priceBudget 节奏：1000ms 起步，showLoading=true，loadingText 来自文案池", () => {
   const timing = timingForCategoryForTest("priceBudget")
-  assert.ok(timing.minDelayMs >= 900, `minDelayMs 应 >= 900，实际 ${timing.minDelayMs}`)
-  assert.equal(timing.showTyping, true)
+  assert.ok(timing.minDelayMs >= 1000, `minDelayMs 应 >= 1000，实际 ${timing.minDelayMs}`)
+  assert.equal(timing.showLoading, true)
   assert.ok(timing.loadingText)
   const PRICE_BUDGET_TEXTS = ["我对一下最近几次记录。", "我看一下本月支出。"]
   assert.ok(
@@ -273,7 +275,7 @@ test("orderImport：isOrderImport=true 时归类为 orderImport", () => {
 test("orderImport 节奏：minDelayMs=0（真实 loading），loadingText「我看一下这张订单。」", () => {
   const timing = timingForCategoryForTest("orderImport")
   assert.equal(timing.minDelayMs, 0, "订单识别不应额外假等待")
-  assert.equal(timing.showTyping, true)
+  assert.equal(timing.showLoading, true)
   assert.equal(timing.loadingText, "我看一下这张订单。")
 })
 
@@ -298,22 +300,22 @@ test("realtimeExternal：天气问题归类为 realtimeExternal", () => {
   assert.equal(category, "realtimeExternal")
 })
 
-test("realtimeExternal 节奏：300ms 起步，showTyping=false（不假装查询）", () => {
+test("realtimeExternal 节奏：500ms 起步，showLoading=true（不静默等待，显示 typing dots）", () => {
   const timing = timingForCategoryForTest("realtimeExternal")
-  assert.ok(timing.minDelayMs >= 300, `minDelayMs 应 >= 300，实际 ${timing.minDelayMs}`)
-  assert.equal(timing.showTyping, false, "实时外部问题不应显示思考文案")
-  assert.equal(timing.loadingText, undefined)
+  assert.ok(timing.minDelayMs >= 500, `minDelayMs 应 >= 500，实际 ${timing.minDelayMs}`)
+  assert.equal(timing.showLoading, true, "实时外部问题应显示 typing dots，不静默等待")
+  assert.equal(timing.loadingText, undefined, "实时外部问题不应有 loadingText（不假装查询）")
 })
 
-test("getResponseTiming：天气问题不假装查询", () => {
+test("getResponseTiming：天气问题不再静默等待", () => {
   const timing = getResponseTiming(makeInput({
     text: "明天天气怎么样",
     intent: null,
     hasPendingDraft: false
   }))
   assert.ok(timing.minDelayMs > 0, "应有短暂延迟")
-  assert.ok(timing.minDelayMs <= 500, "不应明显卡顿")
-  assert.equal(timing.showTyping, false)
+  assert.ok(timing.minDelayMs <= 700, "不应明显卡顿")
+  assert.equal(timing.showLoading, true, "应有可见过程态")
 })
 
 // ---------- 默认节奏 ----------
@@ -325,7 +327,49 @@ test("default：无法归类的输入走 default 节奏", () => {
     hasPendingDraft: false
   }))
   assert.ok(timing.minDelayMs > 0)
-  assert.equal(timing.showTyping, true)
+  assert.equal(timing.showLoading, true)
+})
+
+test("default 节奏：500ms 起步，showLoading=true", () => {
+  const timing = timingForCategoryForTest("default")
+  assert.ok(timing.minDelayMs >= 500)
+  assert.equal(timing.showLoading, true)
+})
+
+// ---------- 关键语义：不允许静默等待 ----------
+
+test("关键语义：minDelayMs > 0 时 showLoading 必须为 true", () => {
+  // 遍历所有 category，验证除了 confirmCancel 外都不允许静默等待
+  const categories = [
+    "confirmCancel", "draftRevise", "identityCasual", "stockQuery",
+    "priceBudget", "orderImport", "realtimeExternal", "default"
+  ]
+  for (const category of categories) {
+    const timing = timingForCategoryForTest(category)
+    if (timing.minDelayMs > 0) {
+      assert.ok(
+        timing.showLoading === true,
+        `${category} 的 minDelayMs=${timing.minDelayMs} > 0 时 showLoading 必须为 true，不允许静默等待`
+      )
+    }
+  }
+})
+
+test("关键语义：只有 confirmCancel 允许 showLoading=false", () => {
+  const categories = [
+    "draftRevise", "identityCasual", "stockQuery",
+    "priceBudget", "orderImport", "realtimeExternal", "default"
+  ]
+  for (const category of categories) {
+    const timing = timingForCategoryForTest(category)
+    assert.equal(
+      timing.showLoading, true,
+      `${category} 必须 showLoading=true，只有 confirmCancel 才允许 showLoading=false`
+    )
+  }
+  // confirmCancel 才允许 showLoading=false
+  const confirmCancelTiming = timingForCategoryForTest("confirmCancel")
+  assert.equal(confirmCancelTiming.showLoading, false)
 })
 
 // ---------- 优先级 ----------
@@ -409,4 +453,16 @@ test("compactRecentMessages：多条 isTransient 消息全部跳过", () => {
   assert.equal(compacted.length, 2)
   assert.equal(compacted[0].content, "用户消息")
   assert.equal(compacted[1].content, "正式回复")
+})
+
+test("compactRecentMessages：空 content 的 typing dots transient 也会被跳过", () => {
+  const messages = [
+    { role: "user", content: "你是谁" },
+    { role: "assistant", content: "", isTransient: true },
+    { role: "assistant", content: "我是 403 管家" }
+  ]
+  const compacted = compactRecentMessages(messages, 6)
+  const contents = compacted.map((m) => m.content)
+  assert.ok(!contents.includes(""), "空 content 的 typing dots transient 也不应进入 LLM 上下文")
+  assert.equal(compacted.length, 2)
 })

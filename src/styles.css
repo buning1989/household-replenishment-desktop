@@ -4352,6 +4352,50 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   color: var(--muted);
   background: var(--surface);
 }
+/* 响应节奏层：transient 消息（loading 过程态） */
+.chat-message.is-transient .chat-message-content {
+  color: var(--muted);
+  background: var(--surface);
+  border-color: var(--line);
+}
+.chat-message.is-transient .chat-message-content.muted {
+  color: var(--muted);
+}
+/* typing dots：三个小点循环动画 */
+.typing-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-medium);
+  background: var(--surface);
+}
+.typing-dots span {
+  display: block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  opacity: .4;
+  animation: typing-dots-blink 1.2s infinite ease-in-out;
+}
+.typing-dots span:nth-child(2) {
+  animation-delay: .2s;
+}
+.typing-dots span:nth-child(3) {
+  animation-delay: .4s;
+}
+@keyframes typing-dots-blink {
+  0%, 80%, 100% { opacity: .35; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .typing-dots span {
+    animation: none;
+    opacity: .6;
+  }
+}
 .chat-answer {
   display: flex;
   flex-direction: column;

@@ -1941,7 +1941,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     })
 
     // 响应节奏层：根据意图/turn/上下文决定这一轮的最小延迟和 loading 文案。
-    // sync 路径用 loading 状态显示短暂思考；LLM 路径用 loading 同时承担真实等待。
+    // 用 transient assistant message 显示过程态，让用户看到「管家正在处理」。
     const pacingIntent = classifyAgentIntent(text, Boolean(pendingDraft))
     const timing = getResponseTiming({
       text,
@@ -1955,7 +1955,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       // 批量意图标记：交回外层 batch 处理函数（应该在上面已处理，走到这里说明 batch 已失效）
       if (isBatchIntentMarker(turn)) {
         // 仍走节奏，避免秒回
-        await waitWithLoading(timing)
+        await waitWithTransient(nextMessages, timing)
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
         return
       }
@@ -1970,7 +1970,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         return
       }
       // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal）：走节奏
-      await waitWithLoading(timing)
+      await waitWithTransient(nextMessages, timing)
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft !== pendingDraft) {
         // 修订：旧 pending 标 superseded，新 draft 标 pending
         const base = nextMessages.map((message, index) => index === pendingMessageIndex
@@ -1988,11 +1988,22 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       inputRef.current?.focus()
       return
     }
-    // LLM 路径：loading 同时承担真实等待 + 最小延迟
-    setLoading(true)
-    if (timing.showTyping) setLoadingText(timing.loadingText ?? null)
+    // LLM 路径：transient message 承担真实等待 + 最小延迟
+    // 1. 先追加 transient assistant message
+    // 2. 发起 LLM 请求
+    // 3. 实际耗时小于 minDelayMs 时补足
+    // 4. 用最终 assistant message 替换 transient
+    const transient: HouseholdChatMessage | null = timing.showLoading
+      ? { role: "assistant", content: timing.loadingText ?? "", isTransient: true }
+      : null
+    if (transient) {
+      onMessagesChange([...nextMessages, transient])
+      setLoading(true) // 禁用发送按钮，避免重复提交
+    }
     const llmStart = Date.now()
     // 构造上下文包：LLM 只看 contextPack 里的内容，不再接收完整 messages
+    // 注意：transient 消息不能进入 contextPack，否则会污染 LLM 上下文。
+    // compactRecentMessages 已经会跳过 isTransient，这里直接传 nextMessages（不含 transient）。
     const contextPack = buildAgentContextPack({
       messages: nextMessages,
       currentUserText: text,
@@ -2011,6 +2022,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     if (remaining > 0) await sleep(remaining)
     setLoading(false)
     setLoadingText(null)
+    // 用最终消息替换 transient：baseMessages 不含 transient，直接追加最终消息即可
+    const baseWithoutTransient = nextMessages
 	    if (result.ok) {
 	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
 	        text, state, itemViews, pendingDraft, dateContext
@@ -2021,41 +2034,54 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const fallback = pendingDraft
 	          ? composeFallbackMessage("no-draft")
 	          : composeBoundaryAnswer(classifyConversationBoundary(text), text)
-	        onMessagesChange([...nextMessages, { role: "assistant", content: fallback }])
+	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback }])
 	        return
 	      }
 	      if (turn.kind === "proposal" && pendingDraft) {
 	        // LLM 返回新 draft：旧 pending 标 superseded
-	        const base = nextMessages.map((message, index) => index === pendingMessageIndex
+	        const base = baseWithoutTransient.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }])
 	        return
 	      }
-	      onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
+	      onMessagesChange([...baseWithoutTransient, agentTurnToMessage(turn)])
 	    } else {
       // 任务四 A：LLM 失败/超时时用 answerHouseholdQuickly 作为兜底回答
       const fallbackAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext, seenObservationKeys)
       if (fallbackAnswer) {
-        onMessagesChange([...nextMessages, { role: "assistant", content: fallbackAnswer }])
+        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallbackAnswer }])
         return
       }
       // answerHouseholdQuickly 未命中：按对话边界给自然回应，不再统一 setError
       const boundaryFallback = composeBoundaryAnswer(classifyConversationBoundary(text), text)
-      onMessagesChange([...nextMessages, { role: "assistant", content: boundaryFallback }])
+      onMessagesChange([...baseWithoutTransient, { role: "assistant", content: boundaryFallback }])
     }
   }
 
-  /** 响应节奏层辅助：根据 timing 显示 loading 并等待 minDelayMs */
-  async function waitWithLoading(timing: { minDelayMs: number; loadingText?: string; showTyping: boolean }) {
-    if (timing.minDelayMs <= 0) return
-    if (timing.showTyping) {
-      setLoading(true)
-      setLoadingText(timing.loadingText ?? null)
+  /**
+   * 响应节奏层辅助：sync 路径用 transient assistant message 显示过程态，等待 minDelayMs。
+   * - timing.showLoading=false 或 minDelayMs<=0 时直接返回（confirm/cancel 立即反馈）
+   * - 否则追加 transient message，等待后由调用方用最终消息替换（这里只负责等待和清理）
+   */
+  async function waitWithTransient(
+    baseMessages: HouseholdChatMessage[],
+    timing: { minDelayMs: number; loadingText?: string; showLoading: boolean }
+  ) {
+    if (timing.minDelayMs <= 0 || !timing.showLoading) return
+    // 追加 transient message 显示过程态
+    const transient: HouseholdChatMessage = {
+      role: "assistant",
+      content: timing.loadingText ?? "",
+      isTransient: true
     }
+    onMessagesChange([...baseMessages, transient])
+    setLoading(true) // 禁用发送按钮，避免重复提交
     await sleep(timing.minDelayMs)
     setLoading(false)
     setLoadingText(null)
+    // 恢复为不含 transient 的基线，由调用方追加最终消息
+    onMessagesChange(baseMessages)
   }
 
   /** 简单的 sleep 工具 */
@@ -2109,13 +2135,25 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
               </div>
 	            ) : (
 	              visibleMessages.map(({ message, index }) => (
-	                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
-	                  {message.role === "assistant" ? (
-	                    <>
-	                      <ManagerAvatar />
-	                      <div className="chat-message-stack">
-	                        {message.content && <div className="chat-message-content">{renderChatAnswer(message.content)}</div>}
-		                    {message.agentDraft && (
+                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}${message.isTransient ? " is-transient" : ""}`}>
+                  {message.role === "assistant" ? (
+                    <>
+                      <ManagerAvatar />
+                      <div className="chat-message-stack">
+                        {message.isTransient ? (
+                          message.content ? (
+                            <div className="chat-message-content muted">{message.content}</div>
+                          ) : (
+                            <div className="typing-dots" aria-label="管家正在输入">
+                              <span />
+                              <span />
+                              <span />
+                            </div>
+                          )
+                        ) : (
+                          <>
+                        {message.content && <div className="chat-message-content">{renderChatAnswer(message.content)}</div>}
+	                    {message.agentDraft && (
 		                      <AgentDraftCard
 		                        draft={message.agentDraft}
 		                        status={message.draftStatus || "pending"}
@@ -2181,9 +2219,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	                        ))}
 	                      </div>
 	                    )}
-	                      </div>
-	                    </>
-	                  ) : (
+                          </>
+                        )}
+                      </div>
+                    </>
+                  ) : (
                     <>
                       <p>{message.content}</p>
                       {message.imageAttachments && message.imageAttachments.length > 0 && (
