@@ -369,3 +369,66 @@ export function markObservationsSeen(
   }
   return seenKeys
 }
+
+// ---------- 写入后观察（任务四） ----------
+
+/**
+ * 任务四（写入后观察）：commit 成功后针对本次写入的物品运行三类判定。
+ *
+ * 复用内部 build*Observations 函数（priceAnomaly / cycleDrift / negativeReviewRepurchase），
+ * 不重新实现判定规则，不改阈值。
+ *
+ * 接入会话级去重：已在本会话展示过的观察（按 kind+itemId 判等）不重复返回。
+ *
+ * 刚补完货时物品状态为 normal，negativeReviewRepurchase 需要 urgent/warning 才会命中，
+ * 因此实际只会产出 priceAnomaly / cycleDrift。这是预期行为——刚补完货时
+ * 「上次评价不好又要补货」的提醒不适用。
+ *
+ * 返回最重要的一条（attention 优先），命中后标记为 seen。无命中返回 null。
+ */
+export function buildPostCommitObservation(
+  item: ReplenishmentItem,
+  dateContext: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): ManagerObservation | null {
+  // 构造最小 view：刚补完货，displayStatus 为 normal
+  // negativeReviewRepurchase 需要 urgent/warning 才命中，这里不会误触发
+  const view: HouseholdChatItemView = {
+    item,
+    computed: {
+      status: "normal",
+      displayStatus: "normal",
+      statusLabel: "充足",
+      dueAt: dateContext.now + 30 * 24 * 60 * 60 * 1000,
+      depletionAt: dateContext.now + 30 * 24 * 60 * 60 * 1000,
+      daysUntilDue: 30,
+      daysUntilDepletion: 30,
+      isDue: false,
+      isSnoozed: false,
+      remainingText: "刚补完货",
+      statusText: "充足"
+    }
+  }
+
+  // 复用内部判定函数，不重新实现
+  const observations: ManagerObservation[] = [
+    ...buildPriceAnomalyObservations([view]),
+    ...buildCycleDriftObservations([view]),
+    ...buildNegativeReviewRepurchaseObservations([view])
+  ]
+
+  // 会话级去重
+  const unseen = filterUnseenObservations(observations, seenObservationKeys)
+  if (unseen.length === 0) return null
+
+  // 取最重要的一条（attention 优先，同级按 dueAt 升序）
+  const sorted = sortObservations(unseen, [view])
+  const top = sorted[0]
+
+  // 标记为 seen，防止同会话重复
+  if (seenObservationKeys) {
+    seenObservationKeys.add(observationKey(top))
+  }
+
+  return top
+}

@@ -534,18 +534,20 @@ function App() {
 
   // 旧 ChatProposedAction 写入路径已下线：所有写入类意图统一走 AgentDraft → commitAgentDraft。
   // 旧 <action> / pendingActions 仅在 householdChat.ts 中保留兼容解析，不再作为主流程。
-  function handleAgentDraftConfirm(agentDraft: AgentDraft): { summary: string; links: AgentMessageLink[] } {
-    const result = commitAgentDraft(state, agentDraft)
+  function handleAgentDraftConfirm(agentDraft: AgentDraft): { summary: string; links: AgentMessageLink[]; observation?: string } {
+    const dateContext = buildChatDateContext()
+    const result = commitAgentDraft(state, agentDraft, Date.now(), dateContext, seenObservationKeysRef.current)
     if (result.state !== state) commit(result.state)
-    return { summary: result.summary, links: result.links }
+    return { summary: result.summary, links: result.links, observation: result.observation }
   }
 
   // 批量草稿确认：只写入 status !== "cancelled" 的草稿，复用共享 executor，不允许另写一套。
-  function handleAgentDraftBatchConfirm(drafts: AgentDraft[]): { summary: string; links: AgentMessageLink[] } {
+  function handleAgentDraftBatchConfirm(drafts: AgentDraft[]): { summary: string; links: AgentMessageLink[]; observation?: string } {
     if (!drafts.length) return { summary: "没有需要写入的草稿。", links: [] }
-    const result = commitAgentDraftBatch(state, drafts, Date.now())
+    const dateContext = buildChatDateContext()
+    const result = commitAgentDraftBatch(state, drafts, Date.now(), dateContext, seenObservationKeysRef.current)
     if (result.state !== state) commit(result.state)
-    return { summary: result.summary, links: result.links }
+    return { summary: result.summary, links: result.links, observation: result.observation }
   }
 
   function addCategory(name: string): string | undefined {
@@ -1655,8 +1657,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   messages: HouseholdChatMessage[]
   onMessagesChange: (messages: HouseholdChatMessage[]) => void
   onQuestionSent: (question: string) => void
-  onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[] }
-  onConfirmBatch: (drafts: AgentDraft[]) => { summary: string; links: AgentMessageLink[] }
+  onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[]; observation?: string }
+  onConfirmBatch: (drafts: AgentDraft[]) => { summary: string; links: AgentMessageLink[]; observation?: string }
   onOpenItem: (itemId: string) => void
   onOpenCategory: (category: string) => void
   onClose: () => void
@@ -1694,16 +1696,20 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  // 已下线，全部收敛到 composeProposalMessage / composePendingReminder / composeFallbackMessage。
 
 	  function confirmAgentDraft(messageIndex: number, baseMessages = messages) {
-	    const message = baseMessages[messageIndex]
-	    if (!message?.agentDraft) return
-	    const result = onConfirmDraft(message.agentDraft)
-	    onMessagesChange([
-	      ...baseMessages.map((current, index) => index === messageIndex
-	        ? { ...current, draftStatus: "confirmed" as const }
-	        : current),
-	      { role: "assistant" as const, content: result.summary, links: result.links }
-	    ])
-	  }
+    const message = baseMessages[messageIndex]
+    if (!message?.agentDraft) return
+    const result = onConfirmDraft(message.agentDraft)
+    // 任务四：写入后观察命中时，把口语化收尾拼接到结果消息末尾
+    const content = result.observation
+      ? `${result.summary} ${result.observation}`
+      : result.summary
+    onMessagesChange([
+      ...baseMessages.map((current, index) => index === messageIndex
+        ? { ...current, draftStatus: "confirmed" as const }
+        : current),
+      { role: "assistant" as const, content, links: result.links }
+    ])
+  }
 
 	  function cancelAgentDraft(messageIndex: number, baseMessages = messages) {
     onMessagesChange(baseMessages.map((message, index) => index === messageIndex
@@ -1758,9 +1764,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const result = onConfirmBatch(draftsToCommit)
     const finalStatuses: AgentDraftStatus[] = message.agentDraftBatch.map((_, i) =>
       message.batchDraftStatuses?.[i] === "cancelled" ? "cancelled" : "confirmed")
+    // 任务四：写入后观察命中时，把口语化收尾拼接到结果消息末尾
+    const content = result.observation
+      ? `${result.summary} ${result.observation}`
+      : result.summary
     onMessagesChange([
       ...patchBatch(messageIndex, baseMessages, { statuses: finalStatuses, result: { summary: result.summary, links: result.links } }),
-      { role: "assistant", content: result.summary, links: result.links }
+      { role: "assistant", content, links: result.links }
     ])
   }
 
@@ -1822,9 +1832,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     }
     // 复用 commitAgentDraftBatch：与弹窗同一写入路径
     const result = onConfirmBatch(drafts)
+    // 任务四：写入后观察命中时，把口语化收尾拼接到结果消息末尾
+    const content = result.observation
+      ? `${result.summary} ${result.observation}`
+      : result.summary
     onMessagesChange([
       ...patchOrderImport(messageIndex, baseMessages, { status: "confirmed", result: { summary: result.summary, links: result.links } }),
-      { role: "assistant", content: result.summary, links: result.links }
+      { role: "assistant", content, links: result.links }
     ])
   }
 

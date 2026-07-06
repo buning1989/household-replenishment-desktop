@@ -3,6 +3,8 @@ import type { AppState, PurchaseOption, ReplenishmentItem } from "../types"
 import { fuzzyMatchItem, type ExtractedOrder, type ExtractedOrderLine } from "../llm/orderImport"
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import { createItemDraftFromName, findItemMatch, type AgentDraft, type CreateItemDraft, type OrderRow, type RestockDraftDetails } from "./drafts"
+import { buildPostCommitObservation } from "./observations"
+import type { ChatDateContext } from "../llm/householdChat"
 
 export type AgentMessageLink = {
   label: string
@@ -13,6 +15,11 @@ export type AgentCommitResult = {
   state: AppState
   summary: string
   links: AgentMessageLink[]
+  /**
+   * 任务四（写入后观察）：commit 成功后针对本次写入物品运行观察引擎的口语化收尾。
+   * 无命中时为 undefined。调用方拼接到结果消息末尾。
+   */
+  observation?: string
 }
 
 /**
@@ -278,14 +285,26 @@ export function applyAgentDraft(
     : `已创建并记录：消耗品「${restocked.name}」。`
 }
 
-export function commitAgentDraft(state: AppState, draft: AgentDraft, now = Date.now()): AgentCommitResult {
+export function commitAgentDraft(
+  state: AppState,
+  draft: AgentDraft,
+  now: number = Date.now(),
+  dateContext?: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): AgentCommitResult {
   const links: AgentMessageLink[] = []
   const work: AgentWorkState = { categories: [...state.categories], items: [...state.items] }
   const summary = applyAgentDraft(work, draft, now, links)
+  const nextState = { ...state, categories: work.categories, items: work.items, updatedAt: now }
+
+  // 任务四：写入后观察——针对本次写入的物品运行三类判定
+  const observation = runPostCommitObservation(draft, work.items, now, dateContext, seenObservationKeys)
+
   return {
-    state: { ...state, categories: work.categories, items: work.items, updatedAt: now },
+    state: nextState,
     summary,
-    links
+    links,
+    observation
   }
 }
 
@@ -293,7 +312,13 @@ export function commitAgentDraft(state: AppState, draft: AgentDraft, now = Date.
  * 批量确认：订单截图导入等多条草稿一次性写入，共享同一份工作区。
  * 任一条草稿找不到目标物品时只跳过它本身，不阻塞其它草稿。
  */
-export function commitAgentDraftBatch(state: AppState, drafts: AgentDraft[], now = Date.now()): AgentCommitResult {
+export function commitAgentDraftBatch(
+  state: AppState,
+  drafts: AgentDraft[],
+  now: number = Date.now(),
+  dateContext?: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): AgentCommitResult {
   const links: AgentMessageLink[] = []
   const work: AgentWorkState = { categories: [...state.categories], items: [...state.items] }
   const summaries: string[] = []
@@ -301,11 +326,56 @@ export function commitAgentDraftBatch(state: AppState, drafts: AgentDraft[], now
     const summary = applyAgentDraft(work, draft, now, links)
     if (summary) summaries.push(summary)
   }
-  return {
-    state: { ...state, categories: work.categories, items: work.items, updatedAt: now },
-    summary: summaries.join("\n"),
-    links
+  const nextState = { ...state, categories: work.categories, items: work.items, updatedAt: now }
+
+  // 任务四：写入后观察——对每条草稿的写入物品运行判定，取最重要的一条
+  let observation: string | undefined
+  if (dateContext) {
+    for (const draft of drafts) {
+      const obs = runPostCommitObservation(draft, work.items, now, dateContext, seenObservationKeys)
+      if (obs) {
+        observation = obs
+        break // 取第一条命中（已按重要性排序）
+      }
+    }
   }
+
+  return {
+    state: nextState,
+    summary: summaries.join("\n"),
+    links,
+    observation
+  }
+}
+
+/**
+ * 任务四：针对本次写入的物品运行观察引擎的三类判定。
+ * 仅 restock / createItemWithRestock 草稿会产生新 history 记录，需要检查。
+ * 复用 observations.ts 的 buildPostCommitObservation，不重新实现判定规则。
+ */
+function runPostCommitObservation(
+  draft: AgentDraft,
+  items: ReplenishmentItem[],
+  now: number,
+  dateContext?: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): string | undefined {
+  if (!dateContext) return undefined
+
+  // 找到本次写入的物品
+  let targetItem: ReplenishmentItem | undefined
+  if (draft.kind === "restock") {
+    targetItem = items.find((item) =>
+      draft.itemId ? item.id === draft.itemId : item.name === draft.itemName
+    )
+  } else if (draft.kind === "createItemWithRestock") {
+    targetItem = items.find((item) => item.name === draft.item.itemName)
+  }
+
+  if (!targetItem) return undefined
+
+  const observation = buildPostCommitObservation(targetItem, dateContext, seenObservationKeys)
+  return observation?.text
 }
 
 // ---------- 订单截图自动映射（对话上传截图用） ----------
