@@ -99,6 +99,30 @@ function includesAny(text: string, phrases: string[]): boolean {
   return phrases.some((phrase) => text.includes(phrase))
 }
 
+/**
+ * 任务二补丁：共享的确认匹配逻辑，供单草稿 RULES 和 classifyBatchIntent 共用。
+ * 规则：
+ *   1. 含疑问信号（吗/？/怎么/什么/多少）时不判为确认（如"这样记没问题吗？"）
+ *   2. 明确动词不受长度限制
+ *   3. 泛化应答仅当整句去标点后 ≤ CONFIRM_CASUAL_MAX_LENGTH 才命中
+ */
+function isConfirmMatch(text: string, raw: string): boolean {
+  if (REVISE_INTERROGATIVE_PATTERN.test(raw)) return false
+  if (includesAny(text, CONFIRM_EXPLICIT_PHRASES)) return true
+  if (text.length <= CONFIRM_CASUAL_MAX_LENGTH && includesAny(text, CONFIRM_CASUAL_PHRASES)) return true
+  return false
+}
+
+/**
+ * 任务二补丁：批量场景的确认匹配逻辑，比单草稿更严格。
+ * 批量场景下泛化词（可以/好的/对的）不触发 batchConfirm，只有明确动词才触发。
+ * 避免"可以帮我看下预算吗"误触发批量确认。
+ */
+function isBatchConfirmMatch(text: string, raw: string): boolean {
+  if (REVISE_INTERROGATIVE_PATTERN.test(raw)) return false
+  return includesAny(text, CONFIRM_EXPLICIT_PHRASES)
+}
+
 const RULES: IntentRule[] = [
   // CANCEL 必须在 CONFIRM 之前：避免「不要保存」被「保存」误命中
   {
@@ -114,12 +138,7 @@ const RULES: IntentRule[] = [
   },
   {
     needsPending: true,
-    // 任务二：明确动词不受长度限制；泛化应答仅当整句去标点后 ≤ CONFIRM_CASUAL_MAX_LENGTH 才命中。
-    matches: (text) => {
-      if (includesAny(text, CONFIRM_EXPLICIT_PHRASES)) return true
-      if (text.length <= CONFIRM_CASUAL_MAX_LENGTH && includesAny(text, CONFIRM_CASUAL_PHRASES)) return true
-      return false
-    },
+    matches: (text, raw) => isConfirmMatch(text, raw),
     intent: "confirmDraft"
   },
   {
@@ -209,8 +228,8 @@ export function classifyBatchIntent(text: string): BatchLocalIntent | null {
   if (!normalized) return null
 
   if (includesAny(normalized, BATCH_CONFIRM_PHRASES)) return { intent: "batchConfirm" }
-  // 单条确认词在批量场景下也视作确认全部
-  if (includesAny(normalized, CONFIRM_PHRASES)) return { intent: "batchConfirm" }
+  // 任务二补丁：单条确认词在批量场景下也视作确认全部，但需通过 isBatchConfirmMatch 检查（疑问信号防护 + 仅明确动词）
+  if (isBatchConfirmMatch(normalized, text)) return { intent: "batchConfirm" }
 
   if (includesAny(normalized, BATCH_CANCEL_PHRASES)) return { intent: "batchCancel" }
 

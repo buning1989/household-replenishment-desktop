@@ -165,6 +165,39 @@ test("任务二: 无 pending 时泛化词不命中 confirm", () => {
   assert.equal(classifyAgentIntent("好的", false), "query")
 })
 
+// ---------- 任务二补丁：批量场景泛化词长度限制 + 疑问信号防护 ----------
+
+test("任务二补丁: 批量场景泛化词也需要 ≤6 字符长度限制", () => {
+  // 批量场景下泛化词同样受长度限制，避免"可以帮我看下预算吗"误触发 batchConfirm
+  assert.equal(classifyBatchIntent("可以"), null)
+  assert.equal(classifyBatchIntent("好的"), null)
+  assert.equal(classifyBatchIntent("对的"), null)
+  // 批量场景下明确动词不受长度限制
+  assert.equal(classifyBatchIntent("确认")?.intent, "batchConfirm")
+  assert.equal(classifyBatchIntent("保存")?.intent, "batchConfirm")
+  assert.equal(classifyBatchIntent("执行")?.intent, "batchConfirm")
+})
+
+test("任务二补丁: 单草稿 confirm 含疑问信号时不判为确认", () => {
+  // "这样记没问题吗？"含"没问题"（明确动词）但含"吗"（疑问信号），不应判为 confirmDraft
+  assert.notEqual(classifyAgentIntent("这样记没问题吗？", true), "confirmDraft")
+  assert.notEqual(classifyAgentIntent("确认吗？", true), "confirmDraft")
+  assert.notEqual(classifyAgentIntent("保存吗", true), "confirmDraft")
+  // 不含疑问信号时仍正常命中
+  assert.equal(classifyAgentIntent("没问题", true), "confirmDraft")
+  assert.equal(classifyAgentIntent("确认", true), "confirmDraft")
+})
+
+test("任务二补丁: 批量 confirm 含疑问信号时不判为确认", () => {
+  // 批量场景同样需要疑问信号防护
+  assert.equal(classifyBatchIntent("这样记没问题吗？"), null)
+  assert.equal(classifyBatchIntent("确认吗？"), null)
+  assert.equal(classifyBatchIntent("保存吗"), null)
+  // 不含疑问信号时仍正常命中
+  assert.equal(classifyBatchIntent("没问题")?.intent, "batchConfirm")
+  assert.equal(classifyBatchIntent("确认")?.intent, "batchConfirm")
+})
+
 // ---------- 表驱动：批量草稿意图 ----------
 
 const BATCH_CASES = [
