@@ -113,12 +113,16 @@ export type PriceAnomalyResult = {
 }
 
 /**
- * 单价偏离检测：最近一次补货单价 vs 历史均价（含本次）。
- * 与 householdChat.ts 中 answerHouseholdQuickly 的「价格异常」分支保持同口径：
+ * 单价偏离检测：本次单价 vs 此前历史均价（排除最新一条）。
+ * 与 householdChat.ts 中 buildQueryFacts / answerHouseholdQuickly 的「价格异常」分支保持同口径：
  *   - 仅取 price>0 且 qty>0 的记录
- *   - 至少 2 条历史才计算
+ *   - 至少 1 条此前有价记录 + 本次有价记录（合计 ≥ 2 条）才计算
  *   - 偏离 > 10% 才返回结果
- * householdChat.ts 内的同类逻辑未来可改为复用此函数；本次任务不做重构。
+ *
+ * 口径修正（冻结前授权变更）：均价改为排除最新一条记录。
+ * 旧口径把本次购买计入自身基准，导致「高于历史均价 15%」的补货在短历史下
+ * 算出 9.5% 而静默不提示（如 [100,100] + 115 → 旧 avg=105, ratio=1.095）。
+ * 新口径下 [100,100] + 115 → avg=100, ratio=1.15, pct=15%，符合直觉。
  */
 export function detectPriceAnomaly(item: ReplenishmentItem): PriceAnomalyResult | null {
   const priced = item.history.filter(
@@ -126,8 +130,9 @@ export function detectPriceAnomaly(item: ReplenishmentItem): PriceAnomalyResult 
   )
   if (priced.length < 2) return null
   const latest = priced[priced.length - 1]
+  const prior = priced.slice(0, -1)
   const latestUnitPrice = latest.price! / latest.qty!
-  const avgUnitPrice = priced.reduce((total, event) => total + event.price! / event.qty!, 0) / priced.length
+  const avgUnitPrice = prior.reduce((total, event) => total + event.price! / event.qty!, 0) / prior.length
   if (avgUnitPrice <= 0) return null
   const ratio = latestUnitPrice / avgUnitPrice
   if (ratio > 1 + PRICE_ANOMALY_RATIO) {

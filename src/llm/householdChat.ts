@@ -671,8 +671,9 @@ export function buildQueryFacts(
     const priced = item.history.filter((event) => Number.isFinite(event.price) && event.price! > 0 && Number.isFinite(event.qty) && event.qty! > 0)
     if (priced.length < 2) continue
     const latest = priced[priced.length - 1]
+    const prior = priced.slice(0, -1)
     const latestUnit = latest.price! / latest.qty!
-    const avgUnit = priced.reduce((total, event) => total + event.price! / event.qty!, 0) / priced.length
+    const avgUnit = prior.reduce((total, event) => total + event.price! / event.qty!, 0) / prior.length
     if (avgUnit <= 0) continue
     const ratio = latestUnit / avgUnit
     if (ratio > 1.1) {
@@ -843,7 +844,7 @@ export function answerHouseholdQuickly(
     return withObs(`有几处信息还缺，补上之后提醒会更准：${groups.join("；")}。不急的话下次补货时顺手补就行。`, missingPrefs)
   }
 
-  // 哪些价格异常：本次单价 vs 历史均价，超过 10% 标记
+  // 哪些价格异常：本次单价 vs 此前历史均价（排除最新一条），超过 10% 标记
   // 追加 dueSoon / budgetThreshold / negativeReviewRepurchase / cycleDrift（排除 priceAnomaly，同维度）
   if (/价格异常|异常|均价|偏贵|贵了|涨价/.test(text)) {
     const anomalies: string[] = []
@@ -851,8 +852,9 @@ export function answerHouseholdQuickly(
       const priced = item.history.filter((event) => Number.isFinite(event.price) && event.price! > 0 && Number.isFinite(event.qty) && event.qty! > 0)
       if (priced.length < 2) continue
       const latest = priced[priced.length - 1]
+      const prior = priced.slice(0, -1)
       const latestUnit = latest.price! / latest.qty!
-      const avgUnit = priced.reduce((total, event) => total + event.price! / event.qty!, 0) / priced.length
+      const avgUnit = prior.reduce((total, event) => total + event.price! / event.qty!, 0) / prior.length
       if (avgUnit <= 0) continue
       const ratio = latestUnit / avgUnit
       if (ratio > 1.1) {
