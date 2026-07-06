@@ -32,6 +32,10 @@ export function findForbiddenPhrase(text: string): string | null {
 /**
  * 生成 proposal 的口语化处理方案文案。
  * 不暴露 AgentDraft 的字段表，只说「我先把 X 加进来 / 我先按这次补货记上」。
+ *
+ * 注意：本函数只生成基础话术，不含缺失字段追问。
+ * 缺失字段追问由 composeMissingFieldPrompt 单独生成，在 draftToProposal 中追加，
+ * 保证只在草稿首次产出时追问一次，revise/confirm 路径不重复追问。
  */
 export function composeProposalMessage(draft: AgentDraft): string {
   if (draft.kind === "createItem") {
@@ -48,6 +52,39 @@ export function composeProposalMessage(draft: AgentDraft): string {
   }
   // addPurchaseOption
   return `我先把「${draft.productName}」放到「${draft.itemName}」下面，之后你补货就能直接沿用。没问题我就保存。`
+}
+
+/**
+ * 任务四 B3：草稿产出时检测金额/平台缺失，返回对话式追问文案。
+ * 仅在 restock / createItemWithRestock 草稿首次产出时调用。
+ * 不在 revise / confirm / committed 路径调用，避免追问第二次。
+ *
+ * 返回 null 表示无需追问（字段齐全或草稿类型不涉及金额/平台）。
+ */
+export function composeMissingFieldPrompt(draft: AgentDraft): string | null {
+  if (draft.kind === "restock") {
+    const missingPrice = draft.price === undefined || draft.price === null
+    const missingPlatform = !draft.platform
+    return buildMissingFieldPrompt(missingPrice, missingPlatform)
+  }
+  if (draft.kind === "createItemWithRestock") {
+    const missingPrice = draft.restock.price === undefined || draft.restock.price === null
+    const missingPlatform = !draft.restock.platform
+    return buildMissingFieldPrompt(missingPrice, missingPlatform)
+  }
+  // createItem / addPurchaseOption 不涉及金额/平台，不追问
+  return null
+}
+
+function buildMissingFieldPrompt(missingPrice: boolean, missingPlatform: boolean): string | null {
+  if (!missingPrice && !missingPlatform) return null
+  if (missingPrice && missingPlatform) {
+    return "多少钱、在哪家买的？顺口说一声我一起记上，不说也行。"
+  }
+  if (missingPrice) {
+    return "多少钱买的？顺口说一声我一起记上，不说也行。"
+  }
+  return "在哪家买的？说了我顺手记上，不说也行。"
 }
 
 /**

@@ -10,6 +10,7 @@ import { classifyAgentIntent, classifyBatchIntent, type BatchLocalIntent } from 
 import {
   composeClarificationMessage,
   composeFallbackMessage,
+  composeMissingFieldPrompt,
   composePendingReminder,
   composeProposalMessage,
   composeRevisedMessage,
@@ -109,11 +110,17 @@ function clarifyToTurn(clarification: AgentClarification): AgentTurn {
   }
 }
 
-/** 把 AgentDraft 转成 AgentTurnProposal。 */
+/** 把 AgentDraft 转成 AgentTurnProposal。
+ *  任务四 B3：草稿首次产出时，若金额/平台缺失，追加对话式追问文案。
+ *  revise/confirm 路径不走这里，保证不重复追问。
+ */
 function draftToProposal(draft: AgentDraft): AgentTurn {
+  const baseMessage = composeProposalMessage(draft)
+  const prompt = composeMissingFieldPrompt(draft)
+  const message = prompt ? `${baseMessage} ${prompt}` : baseMessage
   return {
     kind: "proposal",
-    message: composeProposalMessage(draft),
+    message,
     executableDraft: draft,
     status: "pending"
   }

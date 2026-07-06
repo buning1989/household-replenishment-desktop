@@ -615,7 +615,15 @@ function applyRestockRevision(restock: RestockDraftDetails, text: string): { res
   const revisionMatch = text.match(/不是.*?是(.+?)(?:，|,|。|$)/)
   const revisionSource = revisionMatch ? revisionMatch[1] : text
   const qty = parseQty(revisionSource)
-  const price = parsePrice(revisionSource)
+  let price = parsePrice(revisionSource)
+  // 任务四 B4：纯数字（如「45」「45.5」）在修订上下文中视为价格补充。
+  // 仅当 parsePrice 未命中时兜底；不影响 buildLocalDraftFromText 的初始解析。
+  if (price === undefined) {
+    const cleanedRevision = cleanText(revisionSource)
+    if (/^[0-9]+(?:\.[0-9]+)?$/.test(cleanedRevision)) {
+      price = Number(cleanedRevision)
+    }
+  }
   const platform = parsePlatform(revisionSource)
   const spec = parseSpec(revisionSource)
   const review = parseReview(text)

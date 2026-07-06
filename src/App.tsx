@@ -1235,6 +1235,49 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
       : draft.kind === "createItemWithRestock" ? "就这么记"
         : "就这么挂"
 
+  // 任务四 B1：默认态收据化摘要。一行主信息 + 一行次要信息，已填字段才展示，"未填写"不出现。
+  function receiptLines(): { primary: string; secondary: string } {
+    if (draft.kind === "createItem") {
+      const primary = `${draft.itemName} · 分类 ${draft.category}`
+      const secondary = `周期 ${draft.cycleDays} 天，提前 ${draft.bufferDays} 天提醒`
+      return { primary, secondary }
+    }
+    if (draft.kind === "restock") {
+      const qtyPart = draft.qty ? ` × ${draft.qty}${draft.unit || ""}` : ""
+      const datePart = draft.restockDate ? ` · ${formatDate(draft.restockDate)}` : ""
+      const primary = `${draft.itemName}${qtyPart}${datePart}`
+      const parts: string[] = []
+      if (draft.price !== undefined) parts.push(`¥${formatPrice(draft.price)}`)
+      if (draft.platform) parts.push(draft.platform)
+      if (draft.purchaseProductName) parts.push(draft.purchaseProductName)
+      if (draft.review) parts.push(draft.review)
+      if (draft.cycleDaysPatch) parts.push(`周期调整 ${draft.cycleDaysPatch} 天`)
+      if (draft.purchaseMeasureAmount && draft.purchaseMeasureUnit) parts.push(`${draft.purchaseMeasureAmount}${draft.purchaseMeasureUnit}`)
+      return { primary, secondary: parts.join(" · ") }
+    }
+    if (draft.kind === "createItemWithRestock") {
+      const unit = draft.restock.unit || draft.item.unit
+      const qtyPart = draft.restock.qty ? ` × ${draft.restock.qty}${unit || ""}` : ""
+      const datePart = draft.restock.restockDate ? ` · ${formatDate(draft.restock.restockDate)}` : ""
+      const primary = `${draft.item.itemName}${qtyPart} · 分类 ${draft.item.category}${datePart}`
+      const parts: string[] = [`周期 ${draft.item.cycleDays} 天，提前 ${draft.item.bufferDays} 天提醒`]
+      if (draft.restock.price !== undefined) parts.push(`¥${formatPrice(draft.restock.price)}`)
+      if (draft.restock.platform) parts.push(draft.restock.platform)
+      if (draft.addPurchaseOption?.productName || draft.restock.purchaseProductName) {
+        parts.push(draft.addPurchaseOption?.productName || draft.restock.purchaseProductName || "")
+      }
+      if (draft.restock.review) parts.push(draft.restock.review)
+      if (draft.restock.purchaseMeasureAmount && draft.restock.purchaseMeasureUnit) {
+        parts.push(`${draft.restock.purchaseMeasureAmount}${draft.restock.purchaseMeasureUnit}`)
+      }
+      return { primary, secondary: parts.join(" · ") }
+    }
+    // addPurchaseOption
+    const primary = `${draft.productName} 挂到 ${draft.itemName}`
+    const secondary = draft.unit || ""
+    return { primary, secondary }
+  }
+
   function rows(): Array<[string, string]> {
     if (draft.kind === "createItem") {
       return [
@@ -1278,26 +1321,6 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
     ]
   }
 
-  function missingFields(): string[] {
-    if (draft.kind === "restock") {
-      const missing: string[] = []
-      if (draft.qty === undefined) missing.push("数量")
-      if (draft.price === undefined) missing.push("金额")
-      if (!draft.platform) missing.push("平台")
-      if (!draft.restockDate) missing.push("日期")
-      return missing
-    }
-    if (draft.kind === "createItemWithRestock") {
-      const missing: string[] = []
-      if (draft.restock.qty === undefined) missing.push("数量")
-      if (draft.restock.price === undefined) missing.push("金额")
-      if (!draft.restock.platform) missing.push("平台")
-      if (!draft.restock.restockDate) missing.push("日期")
-      return missing
-    }
-    return []
-  }
-
   // 内联快速编辑：只对 pending 状态开放，改完通过 onDraftChange 回传
   function patchRestock(patch: Partial<typeof draft & object>) {
     if (!onDraftChange) return
@@ -1326,33 +1349,45 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
     return date.getTime()
   }
 
+  // 任务四 B1/B2：默认收据态 + 展开修改。编辑与确认逻辑不动。
+  const [expanded, setExpanded] = useState(false)
   const editable = status === "pending" && onDraftChange
   const restockFields = draft.kind === "restock" ? draft : draft.kind === "createItemWithRestock" ? draft.restock : null
+  const receipt = receiptLines()
+  const matchHint = draft.kind === "restock" ? draft.matchHint : draft.kind === "createItemWithRestock" ? draft.restock.matchHint : undefined
 
   return (
     <div className={`chat-action-card is-${status}`}>
       <div className="chat-action-card-head">
         <span>{statusLabel}</span>
       </div>
-      {rows().map(([label, value]) => (
+      {/* B1：默认态紧凑摘要，一行主信息 + 一行次要信息，已填字段才展示 */}
+      <p className="chat-action-receipt-primary">{receipt.primary}</p>
+      {receipt.secondary && <p className="chat-action-receipt-secondary">{receipt.secondary}</p>}
+      {matchHint && (
+        <p className="chat-action-summary chat-action-hint-warn">
+          <b>疑似匹配</b>
+          {matchHint}
+        </p>
+      )}
+      {/* B2：展开修改入口，展开后显示完整字段表 + 内联编辑 */}
+      {editable && (
+        <button
+          type="button"
+          className="chat-action-expand-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((v) => !v)}
+        >
+          {expanded ? "收起" : "展开修改"}
+        </button>
+      )}
+      {expanded && rows().map(([label, value]) => (
         <p key={label} className="chat-action-summary">
           <b>{label}</b>
           {value}
         </p>
       ))}
-      {(draft.kind === "restock" || draft.kind === "createItemWithRestock") && (draft.kind === "restock" ? draft.matchHint : draft.restock.matchHint) && (
-        <p className="chat-action-summary chat-action-hint-warn">
-          <b>疑似匹配</b>
-          {(draft.kind === "restock" ? draft.matchHint : draft.restock.matchHint) || ""}
-        </p>
-      )}
-      {missingFields().length > 0 && (
-        <p className="chat-action-summary chat-action-hint-warn">
-          <b>缺失字段</b>
-          {missingFields().join("、")}
-        </p>
-      )}
-      {editable && restockFields && (
+      {expanded && editable && restockFields && (
         <div className="chat-action-quickedit">
           <label className="chat-edit-field">
             <span>数量</span>
@@ -1405,7 +1440,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
           </label>
         </div>
       )}
-      {editable && (draft.kind === "createItem" || draft.kind === "createItemWithRestock") && (
+      {expanded && editable && (draft.kind === "createItem" || draft.kind === "createItemWithRestock") && (
         <div className="chat-action-quickedit">
           <label className="chat-edit-field">
             <span>分类</span>
@@ -1434,7 +1469,7 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
             <button type="button" className="quiet-button compact" onClick={onCancel}>先不记</button>
             <button type="button" className="primary-button compact green" onClick={onConfirm}>{confirmLabel}</button>
           </div>
-          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」，也能在上面直接改。</small>
+          <small className="chat-action-hint">想调整的话直接说，比如「周期改成 90 天」或「平台是京东」，也能展开后直接改。</small>
         </>
       )}
       {status === "confirmed" && (
