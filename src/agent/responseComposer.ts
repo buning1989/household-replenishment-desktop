@@ -12,6 +12,7 @@
 import { describeAgentDraft, type AgentDraft, type OrderRow } from "./drafts"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { OrderImportRow } from "../OrderImportReview"
+import type { ConversationBoundary } from "./conversationBoundary"
 
 /**
  * 草稿卡片的状态标签文案。
@@ -249,10 +250,66 @@ export function composeBatchRevisedMessage(scope: "single" | "all"): string {
 
 /**
  * 生成 LLM fallback 失败时的兜底文案。
+ * 注意：no-answer 仅作为极少数真正异常兜底；非管家问题应优先使用 composeBoundaryAnswer。
  */
 export function composeFallbackMessage(scenario: "no-draft" | "no-answer"): string {
   if (scenario === "no-draft") return "我没能整理成可确认草稿，你换一句描述试试。"
   return "我没能整理出可靠回答，你换一句问法试试。"
+}
+
+/**
+ * 根据对话边界类型生成自然、有边界的回应。
+ * 用于 orchestrator 同步处理 identity/realtime/casual，以及 LLM 解析失败时按边界兜底。
+ *
+ * 设计原则：
+ *   - 不编造实时外部信息
+ *   - 身份/元对话直接回答，不让用户换问法
+ *   - 家庭生活相邻问题给简短建议，并自然带回家务/补货能力
+ *   - 闲聊自然接住，引导用户回到核心事务
+ *   - unsupported 仍给边界说明，但提示可以转成采购/提醒/记录
+ */
+export function composeBoundaryAnswer(boundary: ConversationBoundary, text: string): string {
+  const normalized = text.trim().toLocaleLowerCase("zh-CN")
+
+  if (boundary === "identityOrMeta") {
+    // 用户在纠正管家「你应该回答你是谁」
+    if (normalized.includes("你应该回答") || normalized.includes("你应该") || normalized.includes("你怎么不")) {
+      return "对，这类我应该直接答，不该让你换问法。我是 403 管家，负责帮你管家里的消耗品和补货。"
+    }
+    return "我是 403 管家，主要帮你盯家里的消耗品。你随口说买了什么、快没什么，我就帮你记好。"
+  }
+
+  if (boundary === "realtimeExternal") {
+    // 天气类
+    if (normalized.includes("天气") || normalized.includes("温度") || normalized.includes("气温")) {
+      return "我这边看不了实时天气，别瞎报。你要是为了安排采购或洗衣，我可以帮你看看家里现在有什么要顺手补。"
+    }
+    // 其他实时外部信息（新闻/股票/汇率/限行/快递/外卖）
+    return "这个需要实时信息，我这边不能保证准。家里补货、库存和订单记录我可以直接帮你处理。"
+  }
+
+  if (boundary === "adjacentHomeLife") {
+    // 宠物相关：可以提示帮记常购商品
+    if (normalized.includes("猫") || normalized.includes("狗") || normalized.includes("宠物")) {
+      // 用户在问选哪种商品（如「猫砂买哪种好」）
+      if (normalized.includes("买哪种") || normalized.includes("怎么选") || normalized.includes("选哪个") || normalized.includes("推荐")) {
+        return "这个我可以帮你按家里场景想一下。你要是定了，我也可以顺手帮你记成常购商品，下次补货直接沿用。"
+      }
+      return "这个我可以帮你按家里场景想一下。你是想省事一点，还是想更省钱？"
+    }
+    // 洗衣/清洁/收纳等：可以提示看家里相关物品还够不够
+    if (normalized.includes("洗衣") || normalized.includes("清洁") || normalized.includes("打扫") || normalized.includes("收纳")) {
+      return "这个我可以帮你按家里场景想一下。你要是想顺手看看洗衣液、清洁剂这些还够不够，我可以直接帮你看。"
+    }
+    return "这个我可以帮你按家里场景想一下。你是想省事一点，还是想更省钱？"
+  }
+
+  if (boundary === "casual") {
+    return "行，你直接说要我看哪件事就行。"
+  }
+
+  // unsupported
+  return "这个不太属于我能直接处理的家务范围。不过你要是想把它转成采购、提醒或记录，我可以接着帮你。"
 }
 
 /**

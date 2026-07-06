@@ -141,7 +141,7 @@ function findItem(items: ReplenishmentItem[], itemId: string | undefined, itemNa
     if (byId) return byId
   }
   // 复用 drafts.ts 的匹配逻辑：exact > synonym > substring > template
-  const state: AppState = { categories: [], items, settings: {} as AppState["settings"], householdProfile: null, onboarding: {} as AppState["onboarding"], updatedAt: 0, version: 3 }
+  const state: AppState = { categories: [], items, settings: {} as AppState["settings"], householdProfile: null, updatedAt: 0, version: 3 }
   const match = findItemMatch(state, itemName)
   if (match.item) return match.item
   // 兜底：裸 substring（findItemMatch 已覆盖，这里防御性保留）

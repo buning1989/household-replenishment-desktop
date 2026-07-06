@@ -1,7 +1,7 @@
 export type ItemType = "learning" | "fixed"
 export type ItemUrgency = "normal" | "warning" | "urgent"
 export type Rating = 1 | 2 | 3
-export type ItemSource = "manual" | "onboarding" | "imported"
+export type ItemSource = "manual" | "imported"
 export type ModelConfidence = "low" | "medium" | "high"
 export type PricingMode = "spec" | "measure"
 export type InventoryStatus = "justRestocked" | "plenty" | "half" | "low" | "unknown"
@@ -23,24 +23,6 @@ export type HouseholdProfile = {
   bathroomCount?: number
   createdAt: number
   updatedAt: number
-}
-
-export type OnboardingStep = 1 | 2 | 3 | 4 | 5
-export type TemplateDecision = "manage" | "defer" | "notUsed"
-
-export type OnboardingState = {
-  completed: boolean
-  rerun: boolean
-  currentStep: OnboardingStep
-  skippedProfile: boolean
-  skipped: boolean
-  managedTemplateIds: string[]
-  notUsedTemplateIds: string[]
-  deferredTemplateIds: string[]
-  createdTemplateIds: string[]
-  inventoryStatuses: Record<string, InventoryStatus>
-  startedAt?: number
-  completedAt?: number
 }
 
 export type TemplateActivation = "default" | "conditional" | "recommended"
@@ -120,7 +102,6 @@ export type ReplenishmentItem = {
   suggestedCycleDays?: number
   learningEnabled?: boolean
   source?: ItemSource
-  templateId?: string
   confidence?: ModelConfidence
   inventoryStatus?: InventoryStatus
   modelNote?: string
@@ -161,14 +142,13 @@ export type AppState = {
   items: ReplenishmentItem[]
   settings: ReminderSettings
   householdProfile: HouseholdProfile | null
-  onboarding: OnboardingState
   updatedAt: number
 }
 
 export type ItemComputed = {
   status: ItemUrgency
   displayStatus: ItemUrgency
-  statusLabel: "充足" | "快用完" | "急需补货" | "初始估算中" | "可能快到补货周期了"
+  statusLabel: "充足" | "快用完" | "急需补货"
   dueAt: number
   depletionAt: number
   daysUntilDue: number

@@ -37,7 +37,6 @@ function makeState(overrides = {}) {
       monthlyBudget: undefined
     },
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 1, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {} },
     updatedAt: Date.now(),
     ...overrides
   }

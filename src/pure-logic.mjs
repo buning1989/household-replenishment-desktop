@@ -125,10 +125,6 @@ export function restockItemCore(input) {
   const newCycleDays = hasSuggestion ? item.cycleDays : (candidateCycleDays ?? item.cycleDays)
   const suggestedCycleDays = hasSuggestion ? candidateCycleDays : undefined
 
-  const confidence = item.source === "onboarding"
-    ? history.length >= 2 ? "high" : "medium"
-    : item.confidence
-
   const latestRestock = history[history.length - 1]
 
   return {
@@ -142,11 +138,9 @@ export function restockItemCore(input) {
     platform: platform || item.platform,
     snoozeUntil: undefined,
     suggestedCycleDays,
-    confidence,
+    confidence: item.confidence,
     inventoryStatus: "justRestocked",
-    modelNote: item.source === "onboarding"
-      ? history.length >= 2 ? "已根据多次真实补货记录学习周期" : "已记录首次真实补货，继续观察中"
-      : item.modelNote,
+    modelNote: item.modelNote,
     updatedAt: now
   }
 }

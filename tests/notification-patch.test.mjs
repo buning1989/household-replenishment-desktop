@@ -65,7 +65,6 @@ function makeState(overrides = {}) {
     items: [],
     settings: {},
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 1, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {} },
     updatedAt: 1,
     ...overrides
   }

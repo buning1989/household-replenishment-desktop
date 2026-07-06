@@ -8,7 +8,6 @@ import type {
   InventoryStatus,
   LaundryFrequency,
   ModelConfidence,
-  OnboardingState,
   PetSituation,
   PurchaseOption,
   Rating,
@@ -26,6 +25,7 @@ export type PersistenceIssue = {
 }
 
 let pendingLoadIssue: PersistenceIssue | null = null
+let lastLoadUsedFallback = false
 
 export function takePendingLoadIssue(): PersistenceIssue | null {
   const issue = pendingLoadIssue
@@ -55,10 +55,6 @@ function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : []
 }
 
-function asStringArray(value: unknown): string[] {
-  return asArray(value).map(asString).filter((item): item is string => Boolean(item))
-}
-
 function normalizeMeasureUnit(value: unknown): string | undefined {
   const rawText = asString(value)
   if (rawText?.startsWith("custom:")) return rawText
@@ -86,15 +82,6 @@ function parseMeasureSnapshot(value: unknown): { amount?: number; unit?: string 
         ? "ml"
         : "L"
   return { amount: Number(match[1]), unit }
-}
-
-function migrateInventoryStatuses(value: unknown): Record<string, InventoryStatus> {
-  if (!isObject(value)) return {}
-  return Object.fromEntries(Object.entries(value).flatMap(([templateId, status]) =>
-    ["justRestocked", "plenty", "half", "low", "unknown"].includes(String(status))
-      ? [[templateId, status as InventoryStatus]]
-      : []
-  ))
 }
 
 const DEFAULT_SETTINGS: ReminderSettings = {
@@ -226,49 +213,6 @@ function migrateHouseholdProfile(raw: unknown): HouseholdProfile | null {
   }
 }
 
-function migrateOnboarding(raw: unknown, legacyState: boolean, hasItems: boolean): OnboardingState {
-  const now = Date.now()
-  if (legacyState) {
-    return {
-      completed: true,
-      rerun: false,
-      currentStep: 5,
-      skippedProfile: false,
-      skipped: false,
-      managedTemplateIds: [],
-      notUsedTemplateIds: [],
-      deferredTemplateIds: [],
-      createdTemplateIds: [],
-      inventoryStatuses: {},
-      completedAt: now
-    }
-  }
-  if (!isObject(raw)) {
-    return {
-      ...createInitialState().onboarding,
-      completed: hasItems,
-      currentStep: hasItems ? 5 : 1,
-      completedAt: hasItems ? now : undefined
-    }
-  }
-  const step = asFiniteNumber(raw.currentStep)
-  const currentStep = step !== undefined && step >= 1 && step <= 5 ? Math.round(step) as OnboardingState["currentStep"] : 1
-  return {
-    completed: raw.completed === true,
-    rerun: raw.rerun === true,
-    currentStep,
-    skippedProfile: raw.skippedProfile === true,
-    skipped: raw.skipped === true,
-    managedTemplateIds: asStringArray(raw.managedTemplateIds),
-    notUsedTemplateIds: asStringArray(raw.notUsedTemplateIds),
-    deferredTemplateIds: asStringArray(raw.deferredTemplateIds),
-    createdTemplateIds: asStringArray(raw.createdTemplateIds),
-    inventoryStatuses: migrateInventoryStatuses(raw.inventoryStatuses),
-    startedAt: asFiniteNumber(raw.startedAt),
-    completedAt: asFiniteNumber(raw.completedAt)
-  }
-}
-
 /**
  * 防御脏数据：不假设任何字段一定存在且类型正确。
  * cycleDays 必须是 >=1 的有限数字，否则回退到 1；
@@ -316,10 +260,10 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
   const createdAt = asFiniteNumber(raw.createdAt) ?? now
   const updatedAt = asFiniteNumber(raw.updatedAt) ?? createdAt
   const lastRestockedAt = asFiniteNumber(raw.lastRestockedAt) ?? createdAt
-  const source = raw.source === "onboarding" || raw.source === "imported" ? raw.source : "manual"
+  const source = raw.source === "imported" ? "imported" : "manual"
   const confidence: ModelConfidence = raw.confidence === "low" || raw.confidence === "medium" || raw.confidence === "high"
     ? raw.confidence
-    : source === "onboarding" ? "low" : "high"
+    : "high"
   const inventoryStatus: InventoryStatus | undefined = ["justRestocked", "plenty", "half", "low", "unknown"].includes(String(raw.inventoryStatus))
     ? raw.inventoryStatus as InventoryStatus
     : undefined
@@ -342,7 +286,6 @@ function migrateItem(raw: unknown, fallbackIndex: number): ReplenishmentItem | n
     suggestedCycleDays: asFiniteNumber(raw.suggestedCycleDays),
     learningEnabled: raw.learningEnabled !== false,
     source,
-    templateId: asString(raw.templateId),
     confidence,
     inventoryStatus,
     modelNote: asString(raw.modelNote),
@@ -376,7 +319,6 @@ function migrateState(raw: unknown): AppState {
   const items = asArray(raw.items)
     .map(migrateItem)
     .filter((item): item is ReplenishmentItem => item !== null)
-  const legacyState = asFiniteNumber(raw.version) !== 3
 
   return {
     version: 3,
@@ -384,7 +326,6 @@ function migrateState(raw: unknown): AppState {
     items,
     settings: migrateSettings(raw.settings),
     householdProfile: migrateHouseholdProfile(raw.householdProfile),
-    onboarding: migrateOnboarding(raw.onboarding, legacyState, items.length > 0),
     updatedAt: asFiniteNumber(raw.updatedAt) ?? Date.now()
   }
 }
@@ -408,6 +349,7 @@ export function loadState(): AppState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {
+      lastLoadUsedFallback = false
       let saved: unknown
       try {
         saved = JSON.parse(raw)
@@ -421,6 +363,7 @@ export function loadState(): AppState {
             ? "本地数据读取失败，已保留损坏数据备份并启用安全状态。建议暂缓大量录入，并尽快备份当前数据。"
             : "本地数据读取失败，且无法创建损坏数据备份。请暂缓录入并尽快备份当前数据。"
         }
+        lastLoadUsedFallback = true
         return createInitialState()
       }
       return migrateState(saved)
@@ -433,15 +376,16 @@ export function loadState(): AppState {
       message: "无法读取本地数据，当前显示的是安全初始状态。请重启应用后重试，并尽快备份当前数据。"
     }
   }
+  lastLoadUsedFallback = true
   return createInitialState()
 }
 
 /**
  * 判断状态是否为“有效且非空”的初始状态：用于决定是否可以安全写回主进程。
- * 空状态（无 items 且 onboarding 未完成）不应覆盖主进程已有备份。
+ * 仅当本次 loadState 走了 fallback，才把无 items 状态视为空初始态，避免误伤用户主动清空后的状态。
  */
-function isEmptyInitialCandidate(state: AppState): boolean {
-  return state.items.length === 0 && !state.onboarding.completed
+function isEmptyInitialCandidate(state: AppState, fromFallback = false): boolean {
+  return fromFallback && state.items.length === 0
 }
 
 /**
@@ -469,8 +413,8 @@ export async function reconcileState(localState: AppState): Promise<AppState> {
     return localState
   }
   const remoteState = migrateState(remoteRaw)
-  const localEmpty = isEmptyInitialCandidate(localState)
-  const remoteEmpty = isEmptyInitialCandidate(remoteState)
+  const localEmpty = isEmptyInitialCandidate(localState, lastLoadUsedFallback)
+  const remoteEmpty = isEmptyInitialCandidate(remoteState, true)
 
   // localStorage 异常/为空、主进程有效：优先恢复主进程数据
   if (localEmpty && !remoteEmpty) {

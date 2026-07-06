@@ -305,7 +305,6 @@ test("P1-1: reconcileState 逻辑 - localStorage 为空、主进程有效：恢�
     items: [],
     settings: { reminderIntervalMinutes: 60, quietStart: "22:00", quietEnd: "08:00", snoozeUntilHour: 8 },
     householdProfile: null,
-    onboarding: { completed: false, rerun: false, currentStep: 1, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {} },
     updatedAt: now - 100000
   }
 
@@ -317,7 +316,6 @@ test("P1-1: reconcileState 逻辑 - localStorage 为空、主进程有效：恢�
     ],
     settings: { reminderIntervalMinutes: 60, quietStart: "22:00", quietEnd: "08:00", snoozeUntilHour: 8 },
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 5, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {}, completedAt: now - DAY_MS },
     updatedAt: now
   }
 
@@ -335,7 +333,6 @@ test("P1-1: reconcileState 逻辑 - 两份数据都有效：选择 updatedAt 较
     items: [{ id: "local-1", name: "本地物品", category: "卫生间", type: "learning", cycleDays: 30, bufferDays: 5, lastRestockedAt: now, anchorEstimated: true, purchaseOptions: [], history: [], createdAt: now, updatedAt: now, learningEnabled: true }],
     settings: { reminderIntervalMinutes: 60, quietStart: "22:00", quietEnd: "08:00", snoozeUntilHour: 8 },
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 5, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {}, completedAt: now },
     updatedAt: now
   }
 
@@ -357,7 +354,6 @@ test("P1-1: reconcileState 逻辑 - 主进程无数据：继续使用 localStora
     items: [{ id: "local-1", name: "本地物品", category: "卫生间", type: "learning", cycleDays: 30, bufferDays: 5, lastRestockedAt: now, anchorEstimated: true, purchaseOptions: [], history: [], createdAt: now, updatedAt: now, learningEnabled: true }],
     settings: { reminderIntervalMinutes: 60, quietStart: "22:00", quietEnd: "08:00", snoozeUntilHour: 8 },
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 5, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {}, completedAt: now },
     updatedAt: now
   }
 
@@ -373,7 +369,6 @@ test("P1-1: reconcileState 逻辑 - 两边都为空初始状态：选择较新�
     items: [],
     settings: { reminderIntervalMinutes: 60, quietStart: "22:00", quietEnd: "08:00", snoozeUntilHour: 8 },
     householdProfile: null,
-    onboarding: { completed: false, rerun: false, currentStep: 1, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {} },
     updatedAt: now - 100000
   }
 
@@ -574,7 +569,6 @@ function makeStateWithCategories(categories, items = []) {
     items,
     settings: { reminderIntervalHours: 1, quietStart: "22:00", quietEnd: "08:00", notificationEnabled: true },
     householdProfile: null,
-    onboarding: { completed: true, rerun: false, currentStep: 5, skippedProfile: false, skipped: false, managedTemplateIds: [], notUsedTemplateIds: [], deferredTemplateIds: [], createdTemplateIds: [], inventoryStatuses: {} },
     updatedAt: Date.now()
   }
 }

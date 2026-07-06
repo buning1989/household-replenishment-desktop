@@ -1,5 +1,4 @@
 import type { AppState, ConsumptionInfo, ItemComputed, ItemDraft, ItemUrgency, PriceAnchor, PricingMode, ReplenishmentItem, RestockEvent } from "./types"
-import { createInitialOnboardingState } from "./model/onboarding"
 // calculateMonthlySpend 的实现放在 pure-logic.mjs，供 .mjs 测试直接 import；
 // 这里仅按类型重新导出，保持 domain.ts 对外 API 不变。
 export { calculateMonthlySpend } from "./pure-logic.mjs"
@@ -57,19 +56,14 @@ export function computeItem(item: ReplenishmentItem, now = Date.now()): ItemComp
     : daysUntilDue <= 0
       ? "warning"
       : "normal"
-  const isLowConfidence = item.source === "onboarding" && item.confidence === "low"
-  const statusLabel: ItemComputed["statusLabel"] = isLowConfidence
-    ? status === "normal" ? "初始估算中" : "可能快到补货周期了"
-    : status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
+  const statusLabel: ItemComputed["statusLabel"] = status === "urgent" ? "急需补货" : status === "warning" ? "快用完" : "充足"
   const displayStatus = status
   const isDue = !isSnoozed && status !== "normal"
 
-  let remainingText = isLowConfidence
-    ? status === "normal" ? `约 ${Math.max(0, daysUntilDepletion)} 天后再看看` : "现在还够用吗？"
-    : `还剩约 ${Math.max(0, daysUntilDepletion)} 天`
+  let remainingText = `还剩约 ${Math.max(0, daysUntilDepletion)} 天`
   let statusText: string = statusLabel
-  if (!isLowConfidence && daysUntilDepletion < 0) remainingText = `预计已用完 ${Math.abs(daysUntilDepletion)} 天`
-  if (!isLowConfidence && daysUntilDepletion === 0) remainingText = "预计今天用完"
+  if (daysUntilDepletion < 0) remainingText = `预计已用完 ${Math.abs(daysUntilDepletion)} 天`
+  if (daysUntilDepletion === 0) remainingText = "预计今天用完"
   if (isSnoozed && status !== "normal") statusText = `${statusLabel} · 已推迟至 ${formatDateTime(item.snoozeUntil!)}`
 
   return {
@@ -311,7 +305,6 @@ export function createInitialState(): AppState {
       aiOrderMode: "accurate"
     },
     householdProfile: null,
-    onboarding: createInitialOnboardingState(now),
     updatedAt: now
   }
 }

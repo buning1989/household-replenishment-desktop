@@ -327,12 +327,9 @@ function sendNotification(items) {
   if (!Notification.isSupported()) return
   const item = items[0]
   const urgent = item && calendarDayNumber(Date.now()) >= calendarDayNumber(depletionAt(item))
-  const lowConfidence = item?.source === "onboarding" && item?.confidence === "low"
-  const title = lowConfidence
-    ? `${item?.name || "物品"}可能快到补货周期了`
-    : urgent
-      ? `${item?.name || "物品"}预计已用完了`
-      : `${item?.name || "物品"}快用完了`
+  const title = urgent
+    ? `${item?.name || "物品"}预计已用完了`
+    : `${item?.name || "物品"}快用完了`
   const body = String(item?.category || "家庭用品")
   const actions = process.platform === "darwin"
     ? [

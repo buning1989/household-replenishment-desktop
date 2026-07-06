@@ -16,8 +16,10 @@ import {
   composeRevisedMessage,
   composeBatchIntro,
   composeBatchRevisedMessage,
-  composeCancelledMessage
+  composeCancelledMessage,
+  composeBoundaryAnswer
 } from "./responseComposer"
+import { classifyConversationBoundary } from "./conversationBoundary"
 import type {
   AgentOrchestrator,
   AgentTurn,
@@ -92,9 +94,20 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     return { kind: "needLlm", reason: "writeDraft but local parser failed" }
   }
 
-  // 4. 查询意图与其他无法本地处理的输入：交给 LLM（任务四 A）
-  //    answerHouseholdQuickly 降级为 LLM 失败兜底，由外层 App.tsx 在 LLM 调用失败时调用。
-  //    buildQueryFacts 作为事实供料，由外层 askHouseholdAssistant 注入系统提示。
+  // 4. 查询意图与其他无法本地处理的输入：
+  //    先用对话边界分类判定 identity/realtime/casual，命中则直接返回 sync answer，不必调 LLM。
+  //    adjacentHomeLife 仍交 LLM（LLM 失败时由 App.tsx 用 composeBoundaryAnswer 兜底）。
+  //    其他无法归类的交 LLM 尝试回答。
+  const boundary = classifyConversationBoundary(text)
+  if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+    return {
+      kind: "sync",
+      turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
+    }
+  }
+  if (boundary === "adjacentHomeLife") {
+    return { kind: "needLlm", reason: "adjacent home life question" }
+  }
   return { kind: "needLlm", reason: "query intent or unmatched input" }
 }
 

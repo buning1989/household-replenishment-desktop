@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react"
 import { AnimatedIcon as Icon } from "./AnimatedIcon"
-import { OnboardingWizard, type OnboardingCompletion } from "./OnboardingWizard"
 import catIcon from "./assets/cat-icon.png?inline"
+import managerAvatar from "./assets/manager-avatar.png"
 import {
   calibrateRemainingDays,
   calculateConsumption,
@@ -21,14 +21,14 @@ import {
   updateRestockRecord,
   updateItemFromDraft
 } from "./domain"
-import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
 import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
 import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
-import { composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
+import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
+import { classifyConversationBoundary } from "./agent/conversationBoundary"
 import {
   buildOrderImportRowsFromExtract,
   orderImportRowsToConfirmed,
@@ -53,7 +53,7 @@ import { createHouseholdOrchestrator, isBatchIntentMarker } from "./agent/househ
 import type { AgentTurn } from "./agent/orchestrator"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
-import type { AppState, DeleteCategoryOptions, HouseholdProfile, ItemComputed, ItemDraft, OnboardingState, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
+import type { AppState, DeleteCategoryOptions, ItemComputed, ItemDraft, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 
 const EMPTY_DRAFT: ItemDraft = {
@@ -491,11 +491,6 @@ function App() {
     deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
   }
 
-  function handleColdStartFeedback(item: ReplenishmentItem, feedback: ColdStartFeedback) {
-    const snoozeUntil = feedback === "later" ? nextSnoozeTimeAfterHours(state.settings.reminderIntervalHours) : undefined
-    updateItems([item.id], (current) => applyColdStartFeedback(current, feedback, Date.now(), snoozeUntil))
-  }
-
   function calibrateItem(item: ReplenishmentItem, remainingDays: number) {
     updateItems([item.id], (current) => calibrateRemainingDays(current, remainingDays))
   }
@@ -756,98 +751,6 @@ function App() {
     setEditingItem(null)
   }
 
-  function handleOnboardingProgress(profile: HouseholdProfile, patch: Partial<OnboardingState>) {
-    setState((current) => ({
-      ...current,
-      householdProfile: profile,
-      onboarding: { ...current.onboarding, ...patch },
-      updatedAt: Date.now()
-    }))
-  }
-
-  function handleOnboardingSkip() {
-    const completedAt = Date.now()
-    const isRerun = state.onboarding.rerun
-    setState((current) => ({
-      ...current,
-      onboarding: {
-        ...current.onboarding,
-        completed: true,
-        rerun: false,
-        currentStep: 5,
-        skipped: isRerun ? current.onboarding.skipped : true,
-        completedAt
-      },
-      updatedAt: completedAt
-    }))
-    if (!isRerun) {
-      setCreatingCategory(state.categories[0] || null)
-      setIsItemCreatorOpen(true)
-    }
-  }
-
-  function startOnboardingRerun() {
-    const startedAt = Date.now()
-    setSettingsOpen(false)
-    setSettingsClosing(false)
-    setState((current) => ({
-      ...current,
-      onboarding: {
-        ...current.onboarding,
-        completed: false,
-        rerun: true,
-        currentStep: 1,
-        skipped: false,
-        startedAt,
-        completedAt: undefined
-      },
-      updatedAt: startedAt
-    }))
-  }
-
-  function handleOnboardingComplete(result: OnboardingCompletion) {
-    const now = Date.now()
-    const createdItems = createColdStartItems(
-      result.profile,
-      result.selections.map(({ template, inventoryStatus }) => ({ template, inventoryStatus })),
-      now
-    )
-    const selectedTemplateIds = createdItems.flatMap((item) => item.templateId ? [item.templateId] : [])
-    const notUsedTemplateIds = Object.entries(result.decisions).filter(([, decision]) => decision === "notUsed").map(([id]) => id)
-    const deferredTemplateIds = Object.entries(result.decisions).filter(([, decision]) => decision === "defer").map(([id]) => id)
-    setState((current) => {
-      const existingTemplateIds = new Set(current.items.flatMap((item) => item.templateId ? [item.templateId] : []))
-      const existingNames = new Set(current.items.map((item) => item.name.trim().toLocaleLowerCase("zh-CN")))
-      const uniqueItems = createdItems.filter((item) =>
-        (!item.templateId || !existingTemplateIds.has(item.templateId)) &&
-        !existingNames.has(item.name.trim().toLocaleLowerCase("zh-CN"))
-      )
-      const newlyCreatedTemplateIds = uniqueItems.flatMap((item) => item.templateId ? [item.templateId] : [])
-      const categories = [...new Set([...current.categories, ...uniqueItems.map((item) => item.category)])]
-      return {
-        ...current,
-        categories,
-        items: [...current.items, ...uniqueItems],
-        householdProfile: { ...result.profile, updatedAt: now },
-        onboarding: {
-          ...current.onboarding,
-          completed: true,
-          rerun: false,
-          currentStep: 5,
-          skipped: false,
-          skippedProfile: result.skippedProfile,
-          managedTemplateIds: selectedTemplateIds,
-          notUsedTemplateIds,
-          deferredTemplateIds,
-          createdTemplateIds: [...new Set([...(current.onboarding.createdTemplateIds ?? []), ...newlyCreatedTemplateIds])],
-          inventoryStatuses: Object.fromEntries(result.selections.map(({ template, inventoryStatus }) => [template.id, inventoryStatus])),
-          completedAt: now
-        },
-        updatedAt: now
-      }
-    })
-  }
-
   function retryPersistence() {
     const sequence = ++persistenceSequence.current
     void persistState(state).then((issue) => {
@@ -881,23 +784,6 @@ function App() {
       }}
     />
   ) : null
-
-  if (!state.onboarding.completed) {
-    return (
-      <>
-        {persistenceAlert}
-        <OnboardingWizard
-          initialProfile={state.householdProfile}
-          onboarding={state.onboarding}
-          isRerun={state.onboarding.rerun}
-          existingTemplateIds={state.items.flatMap((item) => item.templateId ? [item.templateId] : [])}
-          onProgress={handleOnboardingProgress}
-          onSkip={handleOnboardingSkip}
-          onComplete={handleOnboardingComplete}
-        />
-      </>
-    )
-  }
 
   return (
     <div className="app-shell">
@@ -966,7 +852,6 @@ function App() {
               allItems={itemViews}
               onRestock={handleRestock}
               onSnooze={handleSnooze}
-              onColdStartFeedback={handleColdStartFeedback}
               onApplySuggestion={applyCycleSuggestion}
               onDismissSuggestion={dismissSuggestion}
               onOpenItem={openItem}
@@ -1005,7 +890,7 @@ function App() {
           setNewItemCategory(undefined)
         })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
-      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} onRestartOnboarding={startOnboardingRerun} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
+      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
       {(householdChatOpen || householdChatClosing) && (
         <HouseholdChatPanel
           state={state}
@@ -1226,18 +1111,26 @@ function renderChatAnswer(content: string) {
 
 // 旧 ChatActionCard（ChatProposedAction 确认清单）已下线，统一由 AgentDraftCard 承担。
 
-/** 管家小头像：内置 SVG 插画，黑白线条猫脸，与 403家庭管家品牌一致。 */
+/** 管家小头像：透明 PNG 猫咪头像，与 403家庭管家品牌一致。 */
 function ManagerAvatar() {
-  return (
-    <svg className="chat-manager-avatar" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
-      <circle cx="16" cy="17" r="12" fill="none" stroke="currentColor" strokeWidth="1.5" />
-      <path d="M7 11 L9 5 L13 9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-      <path d="M25 11 L23 5 L19 9" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinejoin="round" />
-      <circle cx="12" cy="16" r="1.5" fill="currentColor" />
-      <circle cx="20" cy="16" r="1.5" fill="currentColor" />
-      <path d="M15 20 Q16 21.5 17 20" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-    </svg>
-  )
+  return <img className="chat-manager-avatar" src={managerAvatar} alt="" aria-hidden="true" />
+}
+
+function isPlainAssistantMessage(message: HouseholdChatMessage) {
+  return message.role === "assistant" &&
+    !message.agentDraft &&
+    !message.agentDraftBatch &&
+    !message.orderImportRows &&
+    !message.clarification &&
+    !message.links?.length &&
+    !message.imageAttachments?.length
+}
+
+function isDuplicatePlainAssistantMessage(previous: HouseholdChatMessage | undefined, current: HouseholdChatMessage) {
+  return !!previous &&
+    isPlainAssistantMessage(previous) &&
+    isPlainAssistantMessage(current) &&
+    previous.content.trim() === current.content.trim()
 }
 
 function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
@@ -1687,9 +1580,19 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   const logRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
   // 管家决策层单例：所有对话路径统一经过 orchestrator.decide / normalizeLlmResponse
-  const orchestrator = useMemo(() => createHouseholdOrchestrator(), [])
-  const starter = buildHouseholdChatStarter(itemViews)
-	  const quickQuestions = [
+	  const orchestrator = useMemo(() => createHouseholdOrchestrator(), [])
+	  const starter = buildHouseholdChatStarter(itemViews)
+  const visibleMessages = useMemo(() => {
+    const result: Array<{ message: HouseholdChatMessage; index: number }> = []
+    for (let index = 0; index < messages.length; index += 1) {
+      const message = messages[index]
+      const previous = result[result.length - 1]?.message
+      if (isDuplicatePlainAssistantMessage(previous, message)) continue
+      result.push({ message, index })
+    }
+    return result
+  }, [messages])
+		  const quickQuestions = [
 	    "今天优先补什么？",
 	    "这周可能要补什么？",
 	    "哪些信息还缺？",
@@ -1979,6 +1882,17 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   }, [])
 
   useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    const lineHeight = 20
+    const verticalPadding = 16
+    const maxHeight = lineHeight * 3 + verticalPadding
+    el.style.height = "auto"
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden"
+  }, [draft])
+
+  useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
   }, [messages, loading])
 
@@ -2070,7 +1984,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        text, state, itemViews, pendingDraft, dateContext
 	      })
 	      if (!turn) {
-	        const fallback = composeFallbackMessage(pendingDraft ? "no-draft" : "no-answer")
+	        // 非管家问题不再统一机械拒绝：按对话边界给自然回应。
+	        // pendingDraft 存在时是写入意图失败，仍用 no-draft 文案。
+	        const fallback = pendingDraft
+	          ? composeFallbackMessage("no-draft")
+	          : composeBoundaryAnswer(classifyConversationBoundary(text), text)
 	        onMessagesChange([...nextMessages, { role: "assistant", content: fallback }])
 	        return
 	      }
@@ -2091,9 +2009,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         onMessagesChange([...nextMessages, { role: "assistant", content: fallbackAnswer }])
         return
       }
-      onMessagesChange(nextMessages)
-      setError(result.error)
-      inputRef.current?.focus()
+      // answerHouseholdQuickly 未命中：按对话边界给自然回应，不再统一 setError
+      const boundaryFallback = composeBoundaryAnswer(classifyConversationBoundary(text), text)
+      onMessagesChange([...nextMessages, { role: "assistant", content: boundaryFallback }])
     }
   }
 
@@ -2141,15 +2059,83 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                   ))}
                 </div>
               </div>
-            ) : (
-              messages.map((message, index) => (
-                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
-                  {message.role === "assistant" ? (
-                    <>
-                      <ManagerAvatar />
-                      <div className="chat-message-content">{renderChatAnswer(message.content)}</div>
-                    </>
-                  ) : (
+	            ) : (
+	              visibleMessages.map(({ message, index }) => (
+	                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}`}>
+	                  {message.role === "assistant" ? (
+	                    <>
+	                      <ManagerAvatar />
+	                      <div className="chat-message-stack">
+	                        {message.content && <div className="chat-message-content">{renderChatAnswer(message.content)}</div>}
+		                    {message.agentDraft && (
+		                      <AgentDraftCard
+		                        draft={message.agentDraft}
+		                        status={message.draftStatus || "pending"}
+		                        onConfirm={() => confirmAgentDraft(index)}
+		                        onCancel={() => cancelAgentDraft(index)}
+		                        onDraftChange={(next) => reviseDraftInPlace(index, next)}
+		                      />
+		                    )}
+	                    {message.clarification && (
+	                      <div className="chat-clarification-card">
+	                        <div className="chat-clarification-options">
+	                          {message.clarification.options.map((option) => (
+	                            <button
+	                              key={option.label}
+	                              type="button"
+	                              className="quiet-button compact"
+	                              onClick={() => void sendMessage(option.hint || option.label)}
+	                              disabled={loading}
+	                            >
+	                              {option.label}
+	                            </button>
+	                          ))}
+	                        </div>
+	                        <small className="chat-action-hint">点上面选项，或者直接打字告诉我。</small>
+	                      </div>
+	                    )}
+	                    {message.orderImportRows && (
+	                      <OrderImportReviewList
+	                        rows={message.orderImportRows}
+	                        items={state.items}
+	                        categories={state.categories}
+	                        mode="chat"
+	                        onRowsChange={(nextRows) => {
+	                          onMessagesChange(messages.map((msg, msgIndex) =>
+	                            msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
+	                          ))
+	                        }}
+	                        onSkipIndex={(rowIndex) => {
+	                          const nextRows = (message.orderImportRows || []).map((row, rowIdx) =>
+	                            rowIdx === rowIndex ? { ...row, targetItem: "__skip__" as const } : row
+	                          )
+	                          onMessagesChange(messages.map((msg, msgIndex) =>
+	                            msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
+	                          ))
+	                        }}
+	                        onConfirmBatch={() => confirmOrderImport(index, messages)}
+	                        onCancelBatch={() => cancelOrderImport(index, messages)}
+	                        result={message.orderImportResult}
+	                        onOpenItem={onOpenItem}
+	                      />
+	                    )}
+	                    {message.links && message.links.length > 0 && (
+	                      <div className="chat-message-links">
+	                        {message.links.map((link, linkIndex) => (
+	                          <button
+	                            key={linkIndex}
+	                            type="button"
+	                            className="chat-link-button"
+	                            onClick={() => link.target.kind === "item" ? onOpenItem(link.target.itemId) : onOpenCategory(link.target.category)}
+	                          >
+	                            {link.label} →
+	                          </button>
+	                        ))}
+	                      </div>
+	                    )}
+	                      </div>
+	                    </>
+	                  ) : (
                     <>
                       <p>{message.content}</p>
                       {message.imageAttachments && message.imageAttachments.length > 0 && (
@@ -2165,75 +2151,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                         </div>
                       )}
                     </>
-                  )}
-	                  {message.role === "assistant" && message.agentDraft && (
-	                    <AgentDraftCard
-	                      draft={message.agentDraft}
-	                      status={message.draftStatus || "pending"}
-	                      onConfirm={() => confirmAgentDraft(index)}
-	                      onCancel={() => cancelAgentDraft(index)}
-	                      onDraftChange={(next) => reviseDraftInPlace(index, next)}
-	                    />
 	                  )}
-                  {message.role === "assistant" && message.clarification && (
-                    <div className="chat-clarification-card">
-                      <div className="chat-clarification-options">
-                        {message.clarification.options.map((option) => (
-                          <button
-                            key={option.label}
-                            type="button"
-                            className="quiet-button compact"
-                            onClick={() => void sendMessage(option.hint || option.label)}
-                            disabled={loading}
-                          >
-                            {option.label}
-                          </button>
-                        ))}
-                      </div>
-                      <small className="chat-action-hint">点上面选项，或者直接打字告诉我。</small>
-                    </div>
-                  )}
-                  {message.role === "assistant" && message.orderImportRows && (
-                    <OrderImportReviewList
-                      rows={message.orderImportRows}
-                      items={state.items}
-                      categories={state.categories}
-                      mode="chat"
-                      onRowsChange={(nextRows) => {
-                        onMessagesChange(messages.map((msg, msgIndex) =>
-                          msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
-                        ))
-                      }}
-                      onSkipIndex={(rowIndex) => {
-                        const nextRows = (message.orderImportRows || []).map((row, rowIdx) =>
-                          rowIdx === rowIndex ? { ...row, targetItem: "__skip__" as const } : row
-                        )
-                        onMessagesChange(messages.map((msg, msgIndex) =>
-                          msgIndex === index ? { ...msg, orderImportRows: nextRows } : msg
-                        ))
-                      }}
-                      onConfirmBatch={() => confirmOrderImport(index, messages)}
-                      onCancelBatch={() => cancelOrderImport(index, messages)}
-                      result={message.orderImportResult}
-                      onOpenItem={onOpenItem}
-                    />
-                  )}
-                  {message.role === "assistant" && message.links && message.links.length > 0 && (
-                    <div className="chat-message-links">
-                      {message.links.map((link, linkIndex) => (
-                        <button
-                          key={linkIndex}
-                          type="button"
-                          className="chat-link-button"
-                          onClick={() => link.target.kind === "item" ? onOpenItem(link.target.itemId) : onOpenCategory(link.target.category)}
-                        >
-                          {link.label} →
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))
+	                </div>
+	              ))
             )}
             {loading && (
               <div className="chat-message assistant is-loading">
@@ -2259,39 +2179,43 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
               style={{ display: "none" }}
               aria-hidden="true"
             />
-            <button
-              type="button"
-              className="quiet-button chat-attach-button"
-              aria-label="上传订单截图"
-              title="上传订单截图"
-              disabled={loading}
-              onClick={() => imageInputRef.current?.click()}
-            >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-                <polyline points="17 8 12 3 7 8" />
-                <line x1="12" y1="3" x2="12" y2="15" />
-              </svg>
-              <span>上传订单截图</span>
-            </button>
-            <textarea
-              id="household-chat-input"
-              ref={inputRef}
-              value={draft}
-              rows={2}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault()
-                  if (!loading) void sendMessage()
-                }
-              }}
-              placeholder=""
-            />
-            <button type="submit" className="primary-button chat-send-button" disabled={loading}>
-              {loading && <span className="chat-send-spinner" aria-hidden="true" />}
-              发送
-            </button>
+            <div className="chat-input-shell">
+              <textarea
+                id="household-chat-input"
+                ref={inputRef}
+                value={draft}
+                rows={2}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault()
+                    if (!loading) void sendMessage()
+                  }
+                }}
+                placeholder=""
+              />
+              <div className="chat-input-tools">
+                <button
+                  type="button"
+                  className="chat-attach-button"
+                  aria-label="上传订单截图"
+                  title="上传订单截图"
+                  disabled={loading}
+                  onClick={() => imageInputRef.current?.click()}
+                >
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="17 8 12 3 7 8" />
+                    <line x1="12" y1="3" x2="12" y2="15" />
+                  </svg>
+                  <span>上传订单截图</span>
+                </button>
+                <button type="submit" className="primary-button chat-send-button" disabled={loading}>
+                  {loading && <span className="chat-send-spinner" aria-hidden="true" />}
+                  发送
+                </button>
+              </div>
+            </div>
           </div>
         </form>
       </aside>
@@ -2465,13 +2389,12 @@ function TaskActions({ item, onRestock, onDismiss, isExpanded }: {
   )
 }
 
-function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onColdStartFeedback, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem, onOpenChat, onOpenOrderImport }: {
+function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem, onOpenChat, onOpenOrderImport }: {
   items: ItemView[]
   snoozedItems: ItemView[]
   allItems: ItemView[]
   onRestock: (item: ReplenishmentItem) => void
   onSnooze: (item: ReplenishmentItem) => void
-  onColdStartFeedback: (item: ReplenishmentItem, feedback: ColdStartFeedback) => void
   onApplySuggestion: (item: ReplenishmentItem) => void
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onOpenItem: (item: ReplenishmentItem) => void
@@ -2509,39 +2432,26 @@ function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onCo
           </div>
           {hasCurrentTasks && (
             <div className="current-list">
-              {items.map(({ item, computed }, i) => {
-                const isLowConfidence = item.source === "onboarding" && item.confidence === "low"
-                return (
-                  <div key={item.id} className="current-card-group" style={{ "--index": i } as React.CSSProperties}>
-                    <article className={`current-card ${computed.status}`}>
-                      <button type="button" className="current-card-copy current-card-open" onClick={() => onOpenItem(item)} aria-label={`查看${item.name}详情`}>
-                        <span className={`status-dot ${computed.status}`} />
-                        <span>
-                          <span className="current-card-title-row">
-                            <strong className="current-item-title">{item.name}</strong>
-                            <span className="current-category-badge">{item.category || "未分类"}</span>
-                          </span>
-                          {isLowConfidence && <span className="cold-start-prompt"><b>可能快到补货周期了</b><em>现在还够用吗？</em></span>}
-                          <small>{formatItemStatusText(item, computed)}<span className="inline-detail-cue">查看详情</span></small>
+              {items.map(({ item, computed }, i) => (
+                <div key={item.id} className="current-card-group" style={{ "--index": i } as React.CSSProperties}>
+                  <article className={`current-card ${computed.status}`}>
+                    <button type="button" className="current-card-copy current-card-open" onClick={() => onOpenItem(item)} aria-label={`查看${item.name}详情`}>
+                      <span className={`status-dot ${computed.status}`} />
+                      <span>
+                        <span className="current-card-title-row">
+                          <strong className="current-item-title">{item.name}</strong>
+                          <span className="current-category-badge">{item.category || "未分类"}</span>
                         </span>
-                      </button>
-                      {isLowConfidence ? (
-                        <div className="cold-start-feedback" aria-label={`${item.name}库存反馈`}>
-                          <button onClick={() => onColdStartFeedback(item, "plenty")}>还很多</button>
-                          <button onClick={() => onColdStartFeedback(item, "low")}>快没了</button>
-                          <button className="is-primary" onClick={() => onRestock(item)}>已补货</button>
-                          <button onClick={() => onColdStartFeedback(item, "later")}>稍后提醒</button>
-                        </div>
-                      ) : (
-                        <div className="current-card-controls">
-                          <button className="task-snooze-link" onClick={() => onSnooze(item)}>稍后提醒</button>
-                          <TaskActions item={item} onRestock={onRestock} />
-                        </div>
-                      )}
-                    </article>
-                  </div>
-                )
-              })}
+                        <small>{formatItemStatusText(item, computed)}<span className="inline-detail-cue">查看详情</span></small>
+                      </span>
+                    </button>
+                    <div className="current-card-controls">
+                      <button className="task-snooze-link" onClick={() => onSnooze(item)}>稍后提醒</button>
+                      <TaskActions item={item} onRestock={onRestock} />
+                    </div>
+                  </article>
+                </div>
+              ))}
             </div>
           )}
         </section>
@@ -3080,14 +2990,6 @@ function ItemDetailPanel({ item, computed, onClose, onSnooze, onRestock, onCalib
           )}
         </div>
 
-        {item.source === "onboarding" && (
-          <div className="model-info-card">
-            <div><span>当前预测周期</span><strong>约 {item.cycleDays} 天</strong></div>
-            <div><span>模型置信度</span><strong>{item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}</strong></div>
-            <div className="model-info-note"><span>校准说明</span><strong>{item.modelNote || (item.anchorEstimated ? "基于家庭画像估算" : "已使用真实补货时间")}</strong><small>{item.history.length < 2 ? `再记录 ${2 - item.history.length} 次补货后，会更接近你家的真实周期。` : "已开始根据你家的真实补货行为学习。"}</small></div>
-          </div>
-        )}
-
         {/* 补货间隔建议 */}
         {visibleSuggestion && (
           <div className={`detail-suggestion${visibleSuggestion.status !== "pending" ? " is-resolved" : ""}`}>
@@ -3356,7 +3258,7 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   )
 }
 
-function SettingsPanel({ state, onChange, onRestartOnboarding, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onRestartOnboarding: () => void; onClose: () => void; isClosing?: boolean }) {
+function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onClose: () => void; isClosing?: boolean }) {
   const settings = state.settings
   const [editingBudget, setEditingBudget] = useState(false)
   const [budgetDraft, setBudgetDraft] = useState(settings.monthlyBudget ? String(settings.monthlyBudget) : "")
@@ -5327,17 +5229,6 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
             </div>
             {expandedId === item.id && (
               <div className="category-item-detail">
-                {item.source === "onboarding" && (
-                  <div className="detail-section category-model-section">
-                    <h4 className="section-title">初始化模型</h4>
-                    <div className="category-model-grid">
-                      <div><span>预测周期</span><strong>约 {item.cycleDays} 天</strong></div>
-                      <div><span>置信度</span><strong>{item.confidence === "high" ? "高" : item.confidence === "medium" ? "中" : "低"}</strong></div>
-                      <div className="category-model-note"><span>最近校准</span><strong>{item.modelNote || "基于家庭画像和库存状态估算"}</strong><small>{item.history.length < 2 ? `再记录 ${2 - item.history.length} 次补货后会更准。` : "已开始学习你家的真实周期。"}</small></div>
-                    </div>
-                  </div>
-                )}
-                
                 {/* 区块2：常购商品 */}
                 <div className="detail-section">
                   <h4 className="section-title">常购商品</h4>
