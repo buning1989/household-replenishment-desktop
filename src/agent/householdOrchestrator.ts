@@ -6,8 +6,7 @@
  */
 
 import { buildLocalClarification, buildLocalDraftFromText, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
-import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent, type BatchLocalIntent } from "./intent"
-import { answerHouseholdQuickly } from "../llm/householdChat"
+import { classifyAgentIntent, classifyBatchIntent, type BatchLocalIntent } from "./intent"
 import {
   composeClarificationMessage,
   composeFallbackMessage,
@@ -92,16 +91,10 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     return { kind: "needLlm", reason: "writeDraft but local parser failed" }
   }
 
-  // 4. 查询意图：本地 quick answer
-  if (!shouldSkipQuickAnswerForAgent(text)) {
-    const quickAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext)
-    if (quickAnswer) {
-      return { kind: "sync", turn: { kind: "answer", message: quickAnswer } }
-    }
-  }
-
-  // 5. 兜底：交给 LLM
-  return { kind: "needLlm", reason: "no local handler matched" }
+  // 4. 查询意图与其他无法本地处理的输入：交给 LLM（任务四 A）
+  //    answerHouseholdQuickly 降级为 LLM 失败兜底，由外层 App.tsx 在 LLM 调用失败时调用。
+  //    buildQueryFacts 作为事实供料，由外层 askHouseholdAssistant 注入系统提示。
+  return { kind: "needLlm", reason: "query intent or unmatched input" }
 }
 
 /** 把 AgentClarification 转成 AgentTurnClarification。 */

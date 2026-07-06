@@ -24,8 +24,9 @@ import {
 import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } from "./model/coldStart"
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
 import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
+import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
 import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
-import { classifyAgentIntent, classifyBatchIntent, shouldSkipQuickAnswerForAgent } from "./agent/intent"
+import { classifyBatchIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
 import { composeFallbackMessage, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage } from "./agent/responseComposer"
 import {
@@ -284,6 +285,8 @@ function App() {
   const [householdChatClosing, setHouseholdChatClosing] = useState(false)
   const [householdChatMessages, setHouseholdChatMessages] = useState<HouseholdChatMessage[]>([])
   const [householdChatLastQuestion, setHouseholdChatLastQuestion] = useState("")
+  // 任务四 A：会话级观察去重状态。同一会话内已展示过的观察（按 kind+itemId）不再重复出现；面板关闭时重置。
+  const seenObservationKeysRef = useRef<Set<string>>(new Set())
   // Item creator dialog state
   const [isItemCreatorOpen, setIsItemCreatorOpen] = useState(false)
   const [creatingCategory, setCreatingCategory] = useState<string | null>(null)
@@ -368,6 +371,17 @@ function App() {
     if (payload.action === "open" && payload.itemIds.length === 1) {
       setDetailItemId(payload.itemIds[0])
     }
+    if (payload.action === "openChat" && payload.itemIds.length === 1) {
+      const item = state.items.find((current) => current.id === payload.itemIds[0])
+      if (item) {
+        const latest = item.history[item.history.length - 1]
+        const platform = latest?.platform || item.platform || "上次购买的平台"
+        const productName = latest?.purchaseProductName || item.name
+        const message = `${item.name}到提醒点了，${platform}买的${productName}，要不要照旧记一单？`
+        setHouseholdChatMessages([{ role: "assistant", content: message }])
+      }
+      setHouseholdChatOpen(true)
+    }
     if (payload.action === "restock" && payload.itemIds.length === 1) {
       const item = state.items.find((current) => current.id === payload.itemIds[0])
       if (item) handleRestock(item)
@@ -384,7 +398,7 @@ function App() {
       if (pendingCategoryDelete) setPendingCategoryDelete(null)
       else if (categoryDialog) setCategoryDialog(null)
       else if (detailItemId) deferredClose(setDetailPanelClosing, () => setDetailItemId(null))
-      else if (householdChatOpen) deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+      else if (householdChatOpen) closeChatWithSessionUpdate()
       else if (settingsOpen) deferredClose(setSettingsClosing, () => setSettingsOpen(false))
       else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
     }
@@ -444,6 +458,30 @@ function App() {
   function handleSnooze(item: ReplenishmentItem) {
     const snoozeUntil = nextSnoozeTimeAfterHours(state.settings.reminderIntervalHours)
     updateItems([item.id], (current) => ({ ...current, snoozeUntil, updatedAt: Date.now() }))
+  }
+
+  function openChatWithBriefing() {
+    const dateContext = buildChatDateContext()
+    const observations = buildManagerObservations(state, itemViews, dateContext)
+    const briefing = buildManagerBriefing(observations, state.settings.lastChatSessionAt, dateContext, seenObservationKeysRef.current)
+
+    if (briefing && householdChatMessages.length === 0) {
+      setHouseholdChatMessages([{ role: "assistant", content: briefing }])
+    }
+    setHouseholdChatOpen(true)
+  }
+
+  function closeChatWithSessionUpdate() {
+    commit({
+      ...state,
+      settings: {
+        ...state.settings,
+        lastChatSessionAt: Date.now()
+      }
+    })
+    // 任务四 A：面板关闭，重置会话级观察去重状态
+    seenObservationKeysRef.current = new Set()
+    deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
   }
 
   function handleColdStartFeedback(item: ReplenishmentItem, feedback: ColdStartFeedback) {
@@ -927,7 +965,7 @@ function App() {
                 setCreatingCategory(state.categories[0] || null)
                 setIsItemCreatorOpen(true)
               }}
-              onOpenChat={() => setHouseholdChatOpen(true)}
+              onOpenChat={() => openChatWithBriefing()}
               onOpenOrderImport={() => setOrderImportOpen(true)}
             />
           )}
@@ -969,22 +1007,23 @@ function App() {
 	          onConfirmDraft={handleAgentDraftConfirm}
           onConfirmBatch={handleAgentDraftBatchConfirm}
           onOpenItem={(itemId) => {
-            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            closeChatWithSessionUpdate()
             setDetailItemId(itemId)
           }}
           onOpenCategory={(category) => {
-            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            closeChatWithSessionUpdate()
             setActiveCategory(category)
           }}
           isClosing={householdChatClosing}
-          onClose={() => deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))}
+          onClose={closeChatWithSessionUpdate}
           onOpenSettings={() => {
-            deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+            closeChatWithSessionUpdate()
             setSettingsOpen(true)
           }}
           orderImageApiKey={state.settings.aiApiKey}
           orderImageModel={state.settings.aiOrderModel ?? state.settings.aiModel}
           orderRecognitionMode={state.settings.aiOrderMode ?? "accurate"}
+          seenObservationKeys={seenObservationKeysRef.current}
         />
       )}
       {isItemCreatorOpen && (
@@ -1568,7 +1607,7 @@ function AgentDraftBatchCard({ drafts, statuses, result, skippedRows, uncertainR
   )
 }
 
-function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode }: {
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode, seenObservationKeys }: {
   state: AppState
   itemViews: ItemView[]
   messages: HouseholdChatMessage[]
@@ -1584,6 +1623,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   orderImageApiKey?: string
   orderImageModel?: string
   orderRecognitionMode?: OrderRecognitionMode
+  /** 任务四 A：会话级观察去重状态，由 App 维护、面板关闭时重置 */
+  seenObservationKeys?: Set<string>
 }) {
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
@@ -1954,7 +1995,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       itemViews,
       messages: nextMessages,
       pendingDraft,
-      dateContext
+      dateContext,
+      seenObservationKeys
     })
 	    if (result.ok) {
 	      setLoading(false)
@@ -1977,7 +2019,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	      onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
 	    } else {
 	      setLoading(false)
-	      onMessagesChange(nextMessages)
+      // 任务四 A：LLM 失败/超时时用 answerHouseholdQuickly 作为兜底回答
+      const fallbackAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext, seenObservationKeys)
+      if (fallbackAnswer) {
+        onMessagesChange([...nextMessages, { role: "assistant", content: fallbackAnswer }])
+        return
+      }
+      onMessagesChange(nextMessages)
       setError(result.error)
       inputRef.current?.focus()
     }

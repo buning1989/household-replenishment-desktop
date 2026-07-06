@@ -102,7 +102,7 @@ test("agent: pending 状态问题由本地状态机接住", () => {
   assert.equal(classifyAgentIntent("取消", true), "cancelDraft")
 })
 
-test("agent: 下周补货查询按未来 7 天回答，不落到今天优先", () => {
+test("agent: 下周补货查询按 8-14 天回答，不落到今天优先", () => {
   const state = makeState()
   const answer = answerHouseholdQuickly("我问的是下周", state, [{
     item: {
@@ -125,18 +125,19 @@ test("agent: 下周补货查询按未来 7 天回答，不落到今天优先", (
       statusLabel: "快用完",
       dueAt: 1,
       depletionAt: 1,
-      daysUntilDue: 5,
-      daysUntilDepletion: 7,
+      daysUntilDue: 10,
+      daysUntilDepletion: 12,
       isDue: false,
       isSnoozed: false,
-      remainingText: "还剩约 7 天",
+      remainingText: "还剩约 12 天",
       statusText: "快用完"
     }
   }])
 
-  assert.match(answer, /接下来 7 天|未来 7 天/)
+  assert.match(answer, /8-14 天内/)
   assert.match(answer, /洗衣液/)
+  assert.match(answer, /10 天后到提醒点/)
   assert.doesNotMatch(answer, /今天优先/)
-  // 新增：管家口吻，不应再像报表
+  // 管家口吻，不应再像报表
   assert.doesNotMatch(answer, /未来 7 天有 \d+ 项/)
 })

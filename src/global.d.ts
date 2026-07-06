@@ -1,7 +1,7 @@
 import type { AppState } from "./types"
 
 type NotificationAction = {
-  action: "open" | "restock" | "snooze"
+  action: "open" | "restock" | "snooze" | "openChat"
   itemIds: string[]
 }
 

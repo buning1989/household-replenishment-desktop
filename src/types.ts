@@ -151,6 +151,8 @@ export type ReminderSettings = {
   aiOrderModel?: string
   /** 订单识别默认模型策略：准确优先或速度优先。 */
   aiOrderMode?: "accurate" | "fast"
+  /** 上次对话会话结束时间戳（面板关闭时更新），用于开场简报触发判断。 */
+  lastChatSessionAt?: number
 }
 
 export type AppState = {

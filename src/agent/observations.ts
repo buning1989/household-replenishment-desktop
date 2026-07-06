@@ -281,3 +281,91 @@ export function pickObservationByPreference(
   }
   return null
 }
+
+// ---------- 开场简报（任务三） ----------
+
+/**
+ * 任务三：开场简报生成。
+ * 触发条件：打开对话面板时，距上次会话结束超过 8 小时，或存在 attention 级观察。
+ * 内容结构：问候（按时段早上/下午/晚上）+ 至多 3 条观察 + 一句收尾。
+ * 不调 LLM，纯模板拼接。
+ *
+ * 任务四 A：新增 seenObservationKeys 参数，会话级去重。
+ * 同一会话内已展示过的观察（按 kind+itemId 判等）不再出现在简报中。
+ * 调用方传入 Set 引用，函数内部把新展示的观察 key 加进 Set。
+ */
+export function buildManagerBriefing(
+  observations: ManagerObservation[],
+  lastSessionAt: number | undefined,
+  dateContext: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): string | null {
+  const now = dateContext.now
+  // 任务四 A：先过滤已 seen 的观察，再判断 attention / 选 top 3
+  const unseen = seenObservationKeys && seenObservationKeys.size > 0
+    ? filterUnseenObservations(observations, seenObservationKeys)
+    : observations
+  const hasAttention = unseen.some((obs) => obs.severity === "attention")
+  const hoursSinceLastSession = lastSessionAt ? (now - lastSessionAt) / (60 * 60 * 1000) : Infinity
+  const shouldShow = hoursSinceLastSession > 8 || hasAttention
+  if (!shouldShow) return null
+
+  // 问候语：按时段
+  const hour = new Date(now).getHours()
+  const greeting = hour < 12 ? "早上好" : hour < 18 ? "下午好" : "晚上好"
+
+  // 至多 3 条观察（已排序，attention 在前）
+  const topObservations = unseen.slice(0, 3)
+  if (seenObservationKeys) {
+    for (const obs of topObservations) {
+      seenObservationKeys.add(observationKey(obs))
+    }
+  }
+
+  // 收尾
+  const closing = "要处理的话跟我说一声就行"
+
+  const parts = [greeting]
+  if (topObservations.length > 0) {
+    parts.push(topObservations.map((obs) => obs.text).join("；"))
+  }
+  parts.push(closing)
+
+  return parts.join("，") + "。"
+}
+
+// ---------- 会话级观察去重（任务四 A） ----------
+
+/**
+ * 观察的唯一键：kind + itemId（预算类无 itemId 用空串）。
+ * 同一 kind+itemId 的观察在一次会话内最多展示一次。
+ */
+export function observationKey(obs: ManagerObservation): string {
+  return `${obs.kind}|${obs.itemId ?? ""}`
+}
+
+/**
+ * 过滤掉已 seen 的观察。seenKeys 为空或未传时返回原数组。
+ * 纯函数：不修改入参。
+ */
+export function filterUnseenObservations(
+  observations: ManagerObservation[],
+  seenKeys: Set<string> | undefined
+): ManagerObservation[] {
+  if (!seenKeys || seenKeys.size === 0) return observations
+  return observations.filter((obs) => !seenKeys.has(observationKey(obs)))
+}
+
+/**
+ * 把展示过的观察 key 累加进 seenKeys（引用传递，原地修改）。
+ * 返回 seenKeys 本身，便于链式调用。
+ */
+export function markObservationsSeen(
+  observations: ManagerObservation[],
+  seenKeys: Set<string>
+): Set<string> {
+  for (const obs of observations) {
+    seenKeys.add(observationKey(obs))
+  }
+  return seenKeys
+}

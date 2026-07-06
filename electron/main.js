@@ -349,7 +349,8 @@ function sendNotification(items) {
 
   notification.on("click", () => {
     showWindow()
-    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: item ? [item.id] : [] })
+    // 任务三：通知点击后打开对话面板，并预置一条与该物品相关的管家消息
+    mainWindow?.webContents.send("notification:action", { action: "openChat", itemIds: item ? [item.id] : [] })
   })
   notification.on("action", (_event, index) => {
     if (index === 0 && item) {
@@ -361,7 +362,8 @@ function sendNotification(items) {
       return
     }
     showWindow()
-    mainWindow?.webContents.send("notification:action", { action: "open", itemIds: item ? [item.id] : [] })
+    // 任务三：通知点击后打开对话面板，并预置一条与该物品相关的管家消息
+    mainWindow?.webContents.send("notification:action", { action: "openChat", itemIds: item ? [item.id] : [] })
   })
   notification.show()
 }

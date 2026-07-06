@@ -43,8 +43,6 @@ const CONFIRM_EXPLICIT_PHRASES = [
 ]
 const CONFIRM_CASUAL_PHRASES = ["可以", "对的", "好的", "好吧", "ok", "OK"]
 const CONFIRM_CASUAL_MAX_LENGTH = 6
-// 合并数组，供 classifyBatchIntent 等批量场景复用（批量场景不受长度限制）。
-const CONFIRM_PHRASES = [...CONFIRM_EXPLICIT_PHRASES, ...CONFIRM_CASUAL_PHRASES]
 
 // 取消草稿：用户想撤回当前 pending 草稿。
 // 注意「不要保存」「别记」这类否定要整词命中，避免误伤「不要保存吗」之类的询问。

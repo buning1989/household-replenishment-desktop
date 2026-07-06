@@ -3,7 +3,7 @@ import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
 import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "../agent/drafts"
 import type { OrderImportRow } from "../OrderImportReview"
-import { buildManagerObservations, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
+import { buildManagerObservations, filterUnseenObservations, markObservationsSeen, observationKey, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
 
 const DEFAULT_CHAT_MODEL = "qwen-plus"
 
@@ -285,7 +285,8 @@ function buildHouseholdContext(
   state: AppState,
   itemViews: HouseholdChatItemView[],
   question: string,
-  dateContext?: ChatDateContext
+  dateContext?: ChatDateContext,
+  seenObservationKeys?: Set<string>
 ): string {
   const contextItems = selectContextItems(question, itemViews)
   const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent")
@@ -322,11 +323,15 @@ function buildHouseholdContext(
   lines.push(orderedItems || "暂无物品。")
 
   // 接入点 1：末尾追加【管家最近注意到】（至多 5 条），让模型同步看到管家视角的注意点
+  // 任务四 A：会话级去重——已注入 LLM 上下文的观察不再重复注入。
   if (dateContext) {
-    const observations = buildManagerObservations(state, itemViews, dateContext)
-    if (observations.length) {
-      const obsText = observations.slice(0, 5).map((obs) => `- ${obs.text}`).join("\n")
+    const allObservations = buildManagerObservations(state, itemViews, dateContext)
+    const unseen = filterUnseenObservations(allObservations, seenObservationKeys)
+    if (unseen.length) {
+      const top = unseen.slice(0, 5)
+      const obsText = top.map((obs) => `- ${obs.text}`).join("\n")
       lines.push(`【管家最近注意到】\n${obsText}`)
+      if (seenObservationKeys) markObservationsSeen(top, seenObservationKeys)
     }
   }
 
@@ -496,11 +501,201 @@ export function shouldRepairMissingActionBlock(content: string): boolean {
   return /创建|新建|添加|登记|录入|确认|清单|方案|更新|已将|已为|已帮|补货记录/.test(text)
 }
 
+// ---------- 查询事实供料（任务四 A） ----------
+
+/** 查询事实类型，对应原快捷回答里的几类本地计算。 */
+export type QueryFactType = "identity" | "budget" | "thisWeek" | "nextWeek" | "today" | "missingInfo" | "priceAnomaly"
+
+/** 检测用户提问对应的查询事实类型。返回 null 表示不是可识别的查询意图（写草稿/确认等）。 */
+export function detectQueryFactType(text: string): QueryFactType | null {
+  const lower = text.trim().toLocaleLowerCase("zh-CN")
+  if (!lower) return null
+  // 写入意图不归为查询
+  if (/添加|新建|创建|录入|登记|帮我加|记一笔|记录一下|买了|下单|购入|入手/.test(lower)) return null
+  if (/你是谁|你是干嘛|你能做什么|你是啥|你是什么|介绍下自己|介绍一下你自己/.test(lower)) return "identity"
+  if (/预算|还剩|花了|支出|超支|本月预算|月预算/.test(lower)) return "budget"
+  // 严格区分「下周」与「这周」：原来合并为一个分支导致返回相同内容（任务四 A 修复点）
+  if (/下周|未来一周|未来7天|未来七天/.test(lower)) return "nextWeek"
+  if (/这周|本周|一周内/.test(lower)) return "thisWeek"
+  // today：要求时间标志词后接补货动作词，避免「今天天气怎么样」误命中
+  if (/(今天|现在).*(补|买|要|急|缺)|优先(补|买)|补什么|买什么/.test(lower)) return "today"
+  if (/缺|没有|补全|信息|哪些信息|信息缺失/.test(lower)) return "missingInfo"
+  if (/价格异常|异常|均价|偏贵|贵了|涨价/.test(lower)) return "priceAnomaly"
+  return null
+}
+
+/**
+ * 按时间窗口切分物品视图：
+ *   overdue   已到提醒点（daysUntilDue <= 0）
+ *   thisWeek  本周（0 < daysUntilDue <= 7）
+ *   nextWeek  下周（7 < daysUntilDue <= 14）
+ * 三者互斥，按 dueAt 升序。
+ */
+export function partitionByWindow(itemViews: HouseholdChatItemView[]): {
+  overdue: HouseholdChatItemView[]
+  thisWeek: HouseholdChatItemView[]
+  nextWeek: HouseholdChatItemView[]
+} {
+  const sortByDueAt = (list: HouseholdChatItemView[]) => [...list].sort((a, b) => a.computed.dueAt - b.computed.dueAt)
+  return {
+    overdue: sortByDueAt(itemViews.filter(({ computed }) => computed.daysUntilDue <= 0)),
+    thisWeek: sortByDueAt(itemViews.filter(({ computed }) => computed.daysUntilDue > 0 && computed.daysUntilDue <= 7)),
+    nextWeek: sortByDueAt(itemViews.filter(({ computed }) => computed.daysUntilDue > 7 && computed.daysUntilDue <= 14))
+  }
+}
+
+function formatBudgetFactLine(state: AppState, dateContext: ChatDateContext): string {
+  const spend = calculateMonthlySpend(state.items, dateContext.now)
+  const budget = state.settings.monthlyBudget
+  if (!budget || budget <= 0) {
+    return `本月预算：未设置；本月已支出 ¥${formatPrice(spend)}`
+  }
+  const remaining = budget - spend
+  const percent = Math.round((spend / budget) * 100)
+  const remainingText = remaining >= 0 ? `剩余 ¥${formatPrice(remaining)}` : `已超出 ¥${formatPrice(Math.abs(remaining))}`
+  return `本月预算：¥${formatPrice(budget)}；本月已支出 ¥${formatPrice(spend)}（使用率 ${percent}%）；${remainingText}`
+}
+
+/**
+ * 任务四 A：把原快捷回答里的本地计算结果序列化为【本地计算的事实】文本，注入 LLM 上下文。
+ * 系统提示约束：数字必须取自该事实段，不得自行推算或编造。
+ *
+ * 返回 null 表示该问题不是可识别的查询意图（writeDraft / confirm / 无法识别）。
+ */
+export function buildQueryFacts(
+  text: string,
+  state: AppState,
+  itemViews: HouseholdChatItemView[],
+  dateContext: ChatDateContext
+): string | null {
+  const type = detectQueryFactType(text)
+  if (!type) return null
+
+  const lines: string[] = ["【本地计算的事实】（数字必须取自此段，不得自行推算或编造）"]
+  lines.push(`提问类型：${type}`)
+
+  if (type === "identity") {
+    const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent").length
+    const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning").length
+    lines.push(`管理物品数：${itemViews.length} 项`)
+    lines.push(`急需补货：${urgent} 项`)
+    lines.push(`快用完：${warning} 项`)
+    lines.push(formatBudgetFactLine(state, dateContext))
+    return lines.join("\n")
+  }
+
+  if (type === "budget") {
+    lines.push(formatBudgetFactLine(state, dateContext))
+    return lines.join("\n")
+  }
+
+  if (type === "thisWeek" || type === "nextWeek") {
+    const { overdue, thisWeek, nextWeek } = partitionByWindow(itemViews)
+    if (type === "thisWeek") {
+      lines.push("提问窗口：今天起 7 天内（含已到提醒点）")
+      if (overdue.length) {
+        lines.push(`已到提醒点：${overdue.map(({ item, computed }) => `${item.name}（${computed.remainingText}）`).join("、")}`)
+      } else {
+        lines.push("已到提醒点：无")
+      }
+      if (thisWeek.length) {
+        const grouped = new Map<string, string[]>()
+        for (const { item, computed } of thisWeek) {
+          const key = formatDate(computed.dueAt)
+          const list = grouped.get(key) || []
+          list.push(`${item.name}（${computed.daysUntilDue} 天后到提醒点）`)
+          grouped.set(key, list)
+        }
+        lines.push(`未来 7 天到提醒点：${[...grouped.entries()].map(([d, names]) => `${d}：${names.join("、")}`).join("；")}`)
+      } else {
+        lines.push("未来 7 天到提醒点：无")
+      }
+    } else {
+      lines.push("提问窗口：8-14 天内")
+      if (nextWeek.length) {
+        const grouped = new Map<string, string[]>()
+        for (const { item, computed } of nextWeek) {
+          const key = formatDate(computed.dueAt)
+          const list = grouped.get(key) || []
+          list.push(`${item.name}（${computed.daysUntilDue} 天后到提醒点）`)
+          grouped.set(key, list)
+        }
+        lines.push(`8-14 天到提醒点：${[...grouped.entries()].map(([d, names]) => `${d}：${names.join("、")}`).join("；")}`)
+      } else {
+        lines.push("8-14 天到提醒点：无")
+      }
+    }
+    lines.push(formatBudgetFactLine(state, dateContext))
+    return lines.join("\n")
+  }
+
+  if (type === "today") {
+    const urgent = itemViews.filter(({ computed }) => computed.displayStatus === "urgent").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
+    const warning = itemViews.filter(({ computed }) => computed.displayStatus === "warning").sort((a, b) => a.computed.dueAt - b.computed.dueAt)
+    lines.push("提问窗口：今日优先")
+    if (urgent.length) {
+      lines.push(`今日急需（urgent）：${urgent.map(({ item, computed }) => `${item.name}（${computed.remainingText}）`).join("、")}`)
+    } else {
+      lines.push("今日急需（urgent）：无")
+    }
+    if (warning.length) {
+      lines.push(`今日快用完（warning）：${warning.map(({ item, computed }) => `${item.name}（${computed.remainingText}）`).join("、")}`)
+    } else {
+      lines.push("今日快用完（warning）：无")
+    }
+    lines.push(formatBudgetFactLine(state, dateContext))
+    return lines.join("\n")
+  }
+
+  if (type === "missingInfo") {
+    const missingPrice = itemViews.filter(({ item }) => !item.history.some((event) => Number.isFinite(event.price) && event.price! > 0))
+    const missingPlatform = itemViews.filter(({ item }) => {
+      const latest = latestHistory(item)
+      return !(latest?.platform || item.platform || item.purchaseOptions.some((option) => option.platform))
+    })
+    const missingOption = itemViews.filter(({ item }) => !item.purchaseOptions || item.purchaseOptions.length === 0)
+    const missingReview = itemViews.filter(({ item }) => {
+      const latest = latestHistory(item)
+      return !(latest?.review || item.purchaseOptions.some((option) => option.review))
+    })
+    lines.push(`缺少价格记录：${missingPrice.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}`)
+    lines.push(`缺少平台/商家：${missingPlatform.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}`)
+    lines.push(`缺少常购商品：${missingOption.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}`)
+    lines.push(`缺少评价：${missingReview.map(({ item }) => item.name).slice(0, 12).join("、") || "无"}`)
+    return lines.join("\n")
+  }
+
+  // priceAnomaly
+  const anomalies: string[] = []
+  for (const { item } of itemViews) {
+    const priced = item.history.filter((event) => Number.isFinite(event.price) && event.price! > 0 && Number.isFinite(event.qty) && event.qty! > 0)
+    if (priced.length < 2) continue
+    const latest = priced[priced.length - 1]
+    const latestUnit = latest.price! / latest.qty!
+    const avgUnit = priced.reduce((total, event) => total + event.price! / event.qty!, 0) / priced.length
+    if (avgUnit <= 0) continue
+    const ratio = latestUnit / avgUnit
+    if (ratio > 1.1) {
+      const pct = Math.round((ratio - 1) * 100)
+      anomalies.push(`${item.name}（本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，贵了 ${pct}%）`)
+    } else if (ratio < 0.9) {
+      const pct = Math.round((1 - ratio) * 100)
+      anomalies.push(`${item.name}（本次单价 ¥${formatPrice(latestUnit)}，均价 ¥${formatPrice(avgUnit)}，便宜了 ${pct}%）`)
+    }
+  }
+  lines.push(`价格异常物品：${anomalies.join("；") || "无"}`)
+  lines.push(formatBudgetFactLine(state, dateContext))
+  return lines.join("\n")
+}
+
+// ---------- 快捷兜底回答（任务四 A 降级为 LLM 失败兜底） ----------
+
 export function answerHouseholdQuickly(
   question: string,
   state: AppState,
   itemViews: HouseholdChatItemView[],
-  dateContext: ChatDateContext = buildChatDateContext()
+  dateContext: ChatDateContext = buildChatDateContext(),
+  seenObservationKeys?: Set<string>
 ): string | null {
   const text = question.trim().toLocaleLowerCase("zh-CN")
   // 添加/新建/记一笔意图需要走 agent 草稿流程，不能被本地快捷回答拦截
@@ -508,14 +703,23 @@ export function answerHouseholdQuickly(
 
   // 接入点 2：观察引擎懒加载 + 跨维度提示。
   // 每类模板回答末尾追加至多 1 条与当前问题不同维度的观察；同维度不追加，避免重复。
+  // 任务四 A：会话级去重——已展示过的观察不再追加。
   let _observations: ManagerObservation[] | null = null
   const getObservations = (): ManagerObservation[] => {
     if (_observations === null) _observations = buildManagerObservations(state, itemViews, dateContext)
     return _observations
   }
   const withObs = (answer: string, preferences: ManagerObservation["kind"][]): string => {
-    const obs = pickObservationByPreference(getObservations(), preferences)
-    return obs ? `${answer}\n${obs.text}` : answer
+    const all = getObservations()
+    const candidates = seenObservationKeys && seenObservationKeys.size > 0
+      ? filterUnseenObservations(all, seenObservationKeys)
+      : all
+    const obs = pickObservationByPreference(candidates, preferences)
+    if (obs) {
+      seenObservationKeys?.add(observationKey(obs))
+      return `${answer}\n${obs.text}`
+    }
+    return answer
   }
 
   // 身份问题：你是谁 / 你能做什么 —— 用管家口吻短句回答，不展开能力清单（不追加观察）
@@ -543,19 +747,30 @@ export function answerHouseholdQuickly(
     return withObs(`本月预算已经超了 ¥${formatPrice(Math.abs(remaining))}（使用率 ${percent}%）。接下来非急需的可以先放放。`, budgetPrefs)
   }
 
-  // 这周 / 下周 要补什么：严格区分 overdue 和 upcoming
-  // 追加 budgetThreshold / negativeReviewRepurchase / priceAnomaly / cycleDrift（排除 dueSoon，答案已列到点物品）
-  if (/下周|未来一周|未来7天|未来七天|这周|本周|一周内/.test(text)) {
-    const overdue = itemViews
-      .filter(({ computed }) => computed.daysUntilDue <= 0)
-      .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
-    const upcoming = itemViews
-      .filter(({ computed }) => computed.daysUntilDue > 0 && computed.daysUntilDue <= 7)
-      .sort((a, b) => a.computed.dueAt - b.computed.dueAt)
+  // 任务四 A：严格区分「下周」与「这周」，不再合并为一个分支。
+  // 下周：8-14 天到提醒点；这周：已到提醒点 + 0-7 天内到提醒点。
+  if (/下周|未来一周|未来7天|未来七天/.test(text)) {
+    const { nextWeek } = partitionByWindow(itemViews)
+    const weekPrefs: ManagerObservation["kind"][] = ["budgetThreshold", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
+    if (!nextWeek.length) {
+      return withObs("下周（8-14 天内）没有新的补货提醒，可以先不用处理。", weekPrefs)
+    }
+    const grouped = new Map<string, string[]>()
+    for (const { item, computed } of nextWeek) {
+      const key = formatDate(computed.dueAt)
+      const list = grouped.get(key) || []
+      list.push(`${item.name}（${computed.daysUntilDue} 天后到提醒点）`)
+      grouped.set(key, list)
+    }
+    const groupLines = [...grouped.entries()].map(([date, names]) => `${date}：${names.join("、")}`)
+    return withObs(`下周（8-14 天内）要留意：${groupLines.join("；")}。`, weekPrefs)
+  }
 
+  if (/这周|本周|一周内/.test(text)) {
+    const { overdue, thisWeek } = partitionByWindow(itemViews)
     const weekPrefs: ManagerObservation["kind"][] = ["budgetThreshold", "negativeReviewRepurchase", "priceAnomaly", "cycleDrift"]
 
-    if (!overdue.length && !upcoming.length) {
+    if (!overdue.length && !thisWeek.length) {
       return withObs("这周没有新的补货提醒，可以先不用处理。", weekPrefs)
     }
 
@@ -566,9 +781,9 @@ export function answerHouseholdQuickly(
         : `先处理已经到点的 ${overdue.length} 项：${overdue.map(({ item, computed }) => `${item.name}（${computed.remainingText}）`).join("、")}。`
       )
     }
-    if (upcoming.length) {
+    if (thisWeek.length) {
       const grouped = new Map<string, string[]>()
-      for (const { item, computed } of upcoming) {
+      for (const { item, computed } of thisWeek) {
         const key = formatDate(computed.dueAt)
         const list = grouped.get(key) || []
         list.push(`${item.name}（${computed.daysUntilDue} 天后到提醒点）`)
@@ -674,7 +889,8 @@ export async function askHouseholdAssistant({
   pendingActions,
   pendingDraft,
   repairMissingActionBlock,
-  dateContext = buildChatDateContext()
+  dateContext = buildChatDateContext(),
+  seenObservationKeys
 }: {
   apiKey: string
   model?: string
@@ -689,8 +905,13 @@ export async function askHouseholdAssistant({
   repairMissingActionBlock?: boolean
   /** 对话日期上下文，所有「今天/这周/未来 7 天」判断以此为准 */
   dateContext?: ChatDateContext
+  /** 任务四 A：会话级观察去重状态，由调用方维护，面板关闭后重置 */
+  seenObservationKeys?: Set<string>
 }): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
   const latestQuestion = [...messages].reverse().find((message) => message.role === "user")?.content || ""
+  // 任务四 A：查询类问题把本地计算结果序列化为【本地计算的事实】注入 LLM 上下文，
+  // 系统提示约束数字必须取自该段，不得自行推算或编造。
+  const queryFacts = buildQueryFacts(latestQuestion, state, itemViews, dateContext)
   const systemPrompt = [
     buildHouseholdManagerSystemPrompt({ pendingDraft, pendingActions, repairMissingActionBlock, dateContext, state }),
     "",
@@ -702,7 +923,8 @@ export async function askHouseholdAssistant({
     "如果家庭数据里出现早于今天的提醒日期，它表示已经过了提醒点，不要说成未来要发生。",
     "",
     "【当前家庭数据】",
-    buildHouseholdContext(state, itemViews, latestQuestion, dateContext)
+    buildHouseholdContext(state, itemViews, latestQuestion, dateContext, seenObservationKeys),
+    ...(queryFacts ? ["", queryFacts] : [])
   ].join("\n")
 
   const requestMessages = [
