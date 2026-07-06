@@ -25,7 +25,7 @@ import { applyColdStartFeedback, createColdStartItems, type ColdStartFeedback } 
 import { extractOrderFromImage, fileToCompressedDataUrl, fuzzyMatchItem, fuzzyMatchOption, type ExtractedOrder, type OrderRecognitionMode } from "./llm/orderImport"
 import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, buildHouseholdChatStarter, type ChatDateContext, type ChatMessageLink, type HouseholdChatMessage } from "./llm/householdChat"
 import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
-import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
+import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
 import { composeFallbackMessage, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage } from "./agent/responseComposer"
@@ -374,11 +374,16 @@ function App() {
     if (payload.action === "openChat" && payload.itemIds.length === 1) {
       const item = state.items.find((current) => current.id === payload.itemIds[0])
       if (item) {
-        const latest = item.history[item.history.length - 1]
-        const platform = latest?.platform || item.platform || "上次购买的平台"
-        const productName = latest?.purchaseProductName || item.name
-        const message = `${item.name}到提醒点了，${platform}买的${productName}，要不要照旧记一单？`
-        setHouseholdChatMessages([{ role: "assistant", content: message }])
+        // 补丁 Bug2：append 而非整体替换，避免清空用户聊天历史。
+        // 补丁规格：附带该物品的本地 restock 草稿，进入 pending 确认流程，用户回「确认」即可记单。
+        const message = buildNotificationRestockMessage(item)
+        const restockDraft = buildNotificationRestockDraft(item, Date.now())
+        setHouseholdChatMessages((current) => [...current, {
+          role: "assistant",
+          content: message,
+          agentDraft: restockDraft,
+          draftStatus: "pending" as const
+        }])
       }
       setHouseholdChatOpen(true)
     }
@@ -465,8 +470,10 @@ function App() {
     const observations = buildManagerObservations(state, itemViews, dateContext)
     const briefing = buildManagerBriefing(observations, state.settings.lastChatSessionAt, dateContext, seenObservationKeysRef.current)
 
-    if (briefing && householdChatMessages.length === 0) {
-      setHouseholdChatMessages([{ role: "assistant", content: briefing }])
+    // 补丁：buildManagerBriefing 返回非 null 即插入（触发判断已在函数内部）。
+    // 历史非空时 append 到末尾，不再因 length===0 条件导致首次对话后简报永不出现。
+    if (briefing) {
+      setHouseholdChatMessages((current) => [...current, { role: "assistant", content: briefing }])
     }
     setHouseholdChatOpen(true)
   }

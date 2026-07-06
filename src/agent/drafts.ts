@@ -961,3 +961,38 @@ export function buildLocalClarification(text: string, state: AppState): AgentCla
   }
   return null
 }
+
+// ---------- 通知带出的草稿构造 ----------
+
+/**
+ * 任务六补丁：通知点击 openChat 时，构造该物品的本地 restock 草稿。
+ * 预填上次购买的平台/商品名/数量（照旧），价格不预填（每笔不同）。
+ * 用户回「确认」即可记单；也可先修订再确认。
+ */
+export function buildNotificationRestockDraft(
+  item: import("../types").ReplenishmentItem,
+  now: number = Date.now()
+): AgentDraft {
+  const latest = item.history[item.history.length - 1]
+  return {
+    kind: "restock",
+    itemId: item.id,
+    itemName: item.name,
+    qty: latest?.qty || 1,
+    unit: latest?.purchaseUnit || item.unit,
+    platform: latest?.platform || item.platform,
+    purchaseProductName: latest?.purchaseProductName,
+    restockDate: startOfDay(now)
+  }
+}
+
+/**
+ * 任务六补丁：通知 openChat 时管家消息文案。
+ * 引用上次购买的平台和商品名，问用户要不要照旧记一单。
+ */
+export function buildNotificationRestockMessage(item: import("../types").ReplenishmentItem): string {
+  const latest = item.history[item.history.length - 1]
+  const platform = latest?.platform || item.platform || "上次购买的平台"
+  const productName = latest?.purchaseProductName || item.name
+  return `${item.name}到提醒点了，${platform}买的${productName}，要不要照旧记一单？`
+}
