@@ -1489,6 +1489,28 @@ function summarizeActionForCard(action: import("./agent/actions").AgentAction): 
     }
     case "setMonthlyBudget":
       return `本月预算设为 ¥${action.amount}`
+    case "renameCategory":
+      return `重命名分类：${action.oldName} → ${action.newName}`
+    case "moveItem":
+      return `把「${action.itemName || action.itemId}」移到分类「${action.targetCategory}」`
+    case "updateItemUnit":
+      return `「${action.itemName || action.itemId}」单位改为 ${action.unit}`
+    case "updateItemReminder":
+      return `「${action.itemName || action.itemId}」提前 ${action.bufferDays} 天提醒`
+    case "updatePurchaseOption": {
+      const changes: string[] = []
+      if (action.patch.productName) changes.push(`名称 ${action.patch.productName}`)
+      if (action.patch.unit) changes.push(`单位 ${action.patch.unit}`)
+      if (action.patch.platform) changes.push(`平台 ${action.patch.platform}`)
+      if (action.patch.price !== undefined) changes.push(`价格 ¥${action.patch.price}`)
+      if (action.patch.link) changes.push("链接")
+      if (action.patch.measureUnit) changes.push(`规格单位 ${action.patch.measureUnit}`)
+      if (action.patch.measureBaseAmount !== undefined) changes.push(`规格基准 ${action.patch.measureBaseAmount}`)
+      const target = action.productName || action.optionId || ""
+      return `「${action.itemName || action.itemId}」·「${target}」：${changes.join("，") || "无变更"}`
+    }
+    case "setDefaultPurchaseOption":
+      return `把「${action.itemName || action.itemId}」的默认常购商品设为「${action.productName || action.optionId}」`
     default:
       return "（未实现的动作）"
   }

@@ -752,3 +752,107 @@
 9. B9 查询返回时旧 pendingPlan 卡片状态不变（仍是 pending，按钮可点击）
 10. B10 旧 Draft 卡片（AgentDraftCard）正常展示，与 AgentPlanCard 视觉一致
 
+---
+
+## 第二阶段真实 Electron UI Smoke Test 结果
+
+> 日期：2026-07-07
+> 执行环境：feature/agent-plan-edit-actions 分支，commit 69728a2 + UI 摘要修复（summarizeActionForCard 补 6 个编辑类 action 分支）
+> 执行方式：`npm run dev` 启动真实 Electron 会话，人工输入对话并观察 UI
+> 前置数据：state 中已有分类「宠物用品」「日常护理」，物品「猫砂」（unit=件，bufferDays=2）属于「宠物用品」，其下有常购商品「pidan 豆腐猫砂」（带空格）和「洁珊」均未设默认
+
+### S1 AgentPlanCard 展示与确认
+
+- 状态：通过
+- 输入：`把宠物用品改成猫咪用品` → `确认`
+- 实际结果：
+  - 输入后出现 AgentPlanCard，标题「准备处理」，列 1 条动作「重命名分类：宠物用品 → 猫咪用品」
+  - 卡片显示「先不处理」和「就这么执行」两个按钮
+  - 未确认前侧栏仍显示「宠物用品」
+  - 输入「确认」后卡片标题变为「已执行」，新增 assistant 消息含「已重命名分类：宠物用品 → 猫咪用品。」
+  - 侧栏「宠物用品」消失、出现「猫咪用品」
+  - 原「宠物用品」下的「猫砂」自动迁移到「猫咪用品」下
+- 是否写入 state：是（确认后写入）
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S2 AgentPlanCard 取消
+
+- 状态：通过
+- 输入：`猫砂提前 5 天提醒` → 点「先不处理」按钮
+- 实际结果：
+  - 出现 AgentPlanCard，列 1 条动作「「猫砂」提前 5 天提醒」
+  - 点「先不处理」后卡片标题变为「已取消」
+  - 「猫砂」详情页 bufferDays 仍为 2，未变为 5
+  - 「已取消」状态下按钮不再可点击
+- 是否写入 state：否
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S3 pendingPlan 修订
+
+- 状态：通过
+- 输入：`pidan 豆腐猫砂价格改成 58` → `价格改成 68` → `确认`
+- 实际结果：
+  - 第一轮：出现 AgentPlanCard，列「「猫砂」·「pidan 豆腐猫砂」：价格 ¥58」
+  - 第二轮输入「价格改成 68」：旧卡片标题实时变为「已替代」，新卡片标题「准备处理」列「价格 ¥68」
+  - 输入「确认」后：新卡片标题变为「已执行」，常购商品「pidan 豆腐猫砂」价格显示 ¥68（不是 58）
+  - 旧卡片不再可确认
+- 是否写入 state：是（仅新 plan 确认后写入 68）
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S4 查询不打断 pendingPlan
+
+- 状态：通过
+- 输入：`猫砂提前 5 天提醒` → `猫砂还剩多少`
+- 实际结果：
+  - 第一轮：出现 AgentPlanCard（pending 状态）
+  - 第二轮查询返回 answer，未生成新的写入 plan
+  - 原 pendingPlan 卡片状态仍为「准备处理」，按钮仍可点击
+  - 查询未取消、未确认 pendingPlan
+- 是否写入 state：否（查询不写入）
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S5 旧 Draft 流程不变
+
+- 状态：通过
+- 输入：`帮我加一袋猫砂` → `45` → `确认`
+- 实际结果：
+  - 第一轮：出现 AgentDraftCard（旧卡片，非 AgentPlanCard），草稿 kind=restock
+  - 第二轮输入「45」：草稿价格补为 45，新卡片标题「我按你说的改了一下」
+  - 第三轮输入「确认」：新增 assistant 消息「已记录：猫砂 本次补货。」，「猫砂」详情页出现新补货记录
+- 是否写入 state：是（确认后写入补货记录）
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S6 loading 不重复
+
+- 状态：通过
+- 输入：`今天优先补什么`（需等待 LLM 响应）
+- 实际结果：
+  - 等待过程中只出现一个 transient 消息（带场景化文案）
+  - 不出现两个 loading 气泡
+  - 最终结果返回后 transient 消息被替换，不残留在历史记录里
+- 是否写入 state：否
+- UI 是否异常：无
+- 是否需要修复：无
+
+### S1-S6 执行结果汇总
+
+| 用例 | 状态 | 是否写入 state | UI 是否异常 | 是否需要修复 |
+| --- | --- | --- | --- | --- |
+| S1 AgentPlanCard 展示与确认 | 通过 | 是（确认后） | 无 | 无 |
+| S2 AgentPlanCard 取消 | 通过 | 否 | 无 | 无 |
+| S3 pendingPlan 修订 | 通过 | 是（仅新 plan 确认后） | 无 | 无 |
+| S4 查询不打断 pendingPlan | 通过 | 否 | 无 | 无 |
+| S5 旧 Draft 流程不变 | 通过 | 是（确认后） | 无 | 无 |
+| S6 loading 不重复 | 通过 | 否 | 无 | 无 |
+
+### 真实 UI Smoke Test 修复记录
+
+| 修复项 | 文件 | 修复内容 | 回归验证 |
+| --- | --- | --- | --- |
+| AgentPlanCard 摘要缺失 6 个编辑类 action 分支 | src/App.tsx | `summarizeActionForCard` 之前对 `renameCategory`/`moveItem`/`updateItemUnit`/`updateItemReminder`/`updatePurchaseOption`/`setDefaultPurchaseOption` 落入 `default` 分支显示「（未实现的动作）」。补全 6 个 case 分支，与 executor.ts 的 commit summary 文案对齐 | typecheck 通过，537/537 测试全通过，S1-S6 真实 UI smoke test 全部通过 |
+
