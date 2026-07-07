@@ -125,12 +125,16 @@ export type AgentTurnPlanCommitted = {
  * orchestrator 返回一个 planCommand turn，由 App.tsx 读取 command 字段分发。
  *
  * - planConfirm：确认 pending plan，调用方应执行 commitAgentPlan
+ * - planAwaitingSecondConfirm：高风险 plan 第一次确认，调用方应把 plan 状态推进到 awaitingSecondConfirm（不执行写入）
+ * - planSecondConfirm：高风险 plan 二次确认删除，调用方应执行 commitAgentPlan
  * - planCancel：取消 pending plan
  * - batchConfirm / batchCancel / batchCancelIndex / batchReviseIndex / batchReviseAll：
  *   订单截图导入的批量操作，沿用原批量处理逻辑（confirmBatch/cancelBatch 等）
  */
 export type AgentPlanCommand =
   | { command: "planConfirm" }
+  | { command: "planAwaitingSecondConfirm" }
+  | { command: "planSecondConfirm" }
   | { command: "planCancel" }
   | { command: "batchConfirm" }
   | { command: "batchCancel" }

@@ -19,8 +19,19 @@
 /** Action 风险等级。low：纯新增；medium：可能覆盖已有数据；high：删除/批量迁移。 */
 export type AgentActionRisk = "low" | "medium" | "high"
 
-/** AgentPlan 生命周期。pending 等待确认；confirmed 已执行；cancelled 用户取消；superseded 被新 plan 替换。 */
-export type AgentPlanStatus = "pending" | "confirmed" | "cancelled" | "superseded"
+/**
+ * AgentPlan 生命周期。
+ * - pending：等待第一次确认
+ * - awaitingSecondConfirm：高风险 plan 第一次确认后，等待二次「确认删除」
+ * - confirmed：已执行
+ * - cancelled：用户取消
+ * - superseded：被新 plan 替换
+ *
+ * 第三期新增 awaitingSecondConfirm：仅 high risk plan 进入此状态。
+ * 普通 plan：pending → confirmed
+ * 高风险 plan：pending → awaitingSecondConfirm → confirmed
+ */
+export type AgentPlanStatus = "pending" | "awaitingSecondConfirm" | "confirmed" | "cancelled" | "superseded"
 
 // ---------- 第一期 Action 类型 ----------
 
@@ -195,7 +206,57 @@ export type SetDefaultPurchaseOptionAction = {
   productName?: string
 }
 
-/** 第一期 + 第二期 Action 联合类型。 */
+// ---------- 第三期 Action 类型：删除类（高风险，需二次确认） ----------
+
+/**
+ * 删除常购商品。
+ * 必须明确 item 与 purchaseOption；匹配不明确时不允许生成 plan。
+ * 若目标是默认常购商品，删除后清除默认标记，不自动设新默认。
+ */
+export type DeletePurchaseOptionAction = {
+  type: "deletePurchaseOption"
+  itemId?: string
+  itemName: string
+  optionId?: string
+  productName?: string
+}
+
+/**
+ * 删除补货记录。
+ * recordId 优先；无 recordId 时由 executor 按 dateHint / price 兜底定位。
+ * 无法唯一定位时不允许生成 plan。
+ */
+export type DeleteRestockRecordAction = {
+  type: "deleteRestockRecord"
+  itemId?: string
+  itemName: string
+  recordId?: string
+  dateHint?: string
+  price?: number
+}
+
+/**
+ * 删除消耗品。
+ * 删除时连带 history / purchaseOptions / 提醒状态全部移除。
+ * 物品名匹配多个候选时不允许生成 plan。
+ */
+export type DeleteItemAction = {
+  type: "deleteItem"
+  itemId?: string
+  itemName: string
+}
+
+/**
+ * 删除分类。
+ * 第三期仅支持空分类删除：分类下还有 item 时返回 ok=false 阻断。
+ * 不实现「删除分类并删除全部物品」或「删除分类并迁移物品」。
+ */
+export type DeleteCategoryAction = {
+  type: "deleteCategory"
+  categoryName: string
+}
+
+/** 第一期 + 第二期 + 第三期 Action 联合类型。 */
 export type AgentAction =
   | CreateCategoryAction
   | CreateItemAction
@@ -210,6 +271,10 @@ export type AgentAction =
   | UpdateItemReminderAction
   | UpdatePurchaseOptionAction
   | SetDefaultPurchaseOptionAction
+  | DeletePurchaseOptionAction
+  | DeleteRestockRecordAction
+  | DeleteItemAction
+  | DeleteCategoryAction
 
 /** 第一期支持的所有 action type 字面量，用于 registry 类型守卫。 */
 export type AgentActionType = AgentAction["type"]
@@ -219,6 +284,8 @@ export type AgentActionType = AgentAction["type"]
  * - actions 按顺序执行；任一失败不静默吞掉，返回错误摘要
  * - 中高风险 action 必须处于 confirmed 状态才能执行
  * - sourceText 保留原始用户输入，供 UI 展示和调试
+ * - requiresSecondConfirm：high risk plan 必须二次确认删除才能执行
+ *   由 createAgentPlan 根据 risk === "high" 自动设置
  */
 export type AgentPlan = {
   id: string
@@ -230,9 +297,11 @@ export type AgentPlan = {
   sourceText: string
   /** 整个 plan 的风险等级 = actions 中最高风险 */
   risk: AgentActionRisk
+  /** 高风险 plan 是否需要二次确认删除。risk === "high" 时为 true。 */
+  requiresSecondConfirm?: boolean
 }
 
-/** 构造 AgentPlan 的工厂：自动生成 id、时间戳、风险等级。 */
+/** 构造 AgentPlan 的工厂：自动生成 id、时间戳、风险等级、二次确认标记。 */
 export function createAgentPlan(
   actions: AgentAction[],
   sourceText: string,
@@ -246,7 +315,8 @@ export function createAgentPlan(
     createdAt: now,
     updatedAt: now,
     sourceText,
-    risk
+    risk,
+    requiresSecondConfirm: risk === "high"
   }
 }
 
@@ -261,7 +331,7 @@ export function computePlanRisk(actions: AgentAction[]): AgentActionRisk {
   return max
 }
 
-/** 单个 action 的风险等级。第二期编辑类默认 medium，避免与 registry 循环依赖。 */
+/** 单个 action 的风险等级。第二期编辑类默认 medium，第三期删除类默认 high。 */
 export function actionRisk(action: AgentAction): AgentActionRisk {
   switch (action.type) {
     case "createCategory":
@@ -279,6 +349,11 @@ export function actionRisk(action: AgentAction): AgentActionRisk {
     case "updatePurchaseOption":
     case "setDefaultPurchaseOption":
       return "medium"
+    case "deletePurchaseOption":
+    case "deleteRestockRecord":
+    case "deleteItem":
+    case "deleteCategory":
+      return "high"
     default:
       return "medium"
   }

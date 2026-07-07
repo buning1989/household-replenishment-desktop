@@ -627,6 +627,26 @@ function linkCategory(links: AgentMessageLink[], category: string) {
   links.push({ label: `查看「${category}」分类`, target: { kind: "category", category } })
 }
 
+/**
+ * 把 timestamp（ms）与 dateHint 字符串匹配。
+ * 支持的 hint：「最近一条」「昨天」「前天」「今天」。
+ * 不支持的 hint 返回 false（executor 会跳过该记录）。
+ */
+function matchesDateHint(at: number, hint: string): boolean {
+  const hintLower = hint.trim()
+  if (hintLower === "最近一条") return true
+  const date = new Date(at)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const target = new Date(date)
+  target.setHours(0, 0, 0, 0)
+  const diffDays = Math.round((today.getTime() - target.getTime()) / (24 * 60 * 60 * 1000))
+  if (hintLower === "今天") return diffDays === 0
+  if (hintLower === "昨天") return diffDays === 1
+  if (hintLower === "前天") return diffDays === 2
+  return false
+}
+
 function ensureWorkCategory(work: AgentWorkState, category: string) {
   if (!work.categories.some((c) => norm(c) === norm(category))) {
     work.categories = [...work.categories, category]
@@ -922,6 +942,101 @@ export function applyAgentAction(
       work.items = work.items.map((item) => item.id === target.id ? updated : item)
       linkItem(links, updated)
       return { summary: `已设默认常购商品：「${target.name}」·「${target.purchaseOptions[optIndex].productName}」。`, ok: true }
+    }
+
+    // ---------- 第三期：删除类 action（高风险，需二次确认） ----------
+
+    case "deletePurchaseOption": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        // 依赖性失败：物品不存在，不应继续后续依赖此物品的 action
+        return { summary: `没有删除。找不到消耗品「${action.itemName}」。`, ok: false }
+      }
+      const prodName = action.productName
+      const optIndex = action.optionId
+        ? target.purchaseOptions.findIndex((o) => o.id === action.optionId)
+        : target.purchaseOptions.findIndex((o) => norm(o.productName) === norm(prodName || ""))
+      if (optIndex < 0) {
+        return { summary: `没有删除。「${target.name}」下找不到常购商品「${action.productName || action.optionId}」。`, ok: false }
+      }
+      const removed = target.purchaseOptions[optIndex]
+      // 直接移除；若是默认商品，移除后该物品不再有默认商品（不自动设新默认）
+      const updatedOptions = target.purchaseOptions.filter((_, i) => i !== optIndex)
+      const updated = { ...target, purchaseOptions: updatedOptions, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已删除常购商品：「${target.name}」·「${removed.productName}」。`, ok: true }
+    }
+
+    case "deleteRestockRecord": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有删除。找不到消耗品「${action.itemName}」。`, ok: false }
+      }
+      if (target.history.length === 0) {
+        return { summary: `没有删除。「${target.name}」还没有补货记录。`, ok: false }
+      }
+      // recordId 优先；无 recordId 时按 dateHint / price / 最近一条定位
+      let eventIndex = -1
+      if (action.recordId) {
+        eventIndex = target.history.findIndex((e) => e.id === action.recordId)
+      } else if (action.dateHint && action.dateHint !== "最近一条" && action.price === undefined) {
+        // 仅按 dateHint 匹配（昨天/前天/今天）；多匹配时不删，返回依赖性失败
+        const matches = target.history.filter((e) => matchesDateHint(e.at, action.dateHint!))
+        if (matches.length === 0) {
+          return { summary: `没有删除。「${target.name}」下没有匹配的补货记录。`, ok: false }
+        }
+        if (matches.length > 1) {
+          return { summary: `没有删除。「${target.name}」下有 ${matches.length} 条匹配的补货记录，请明确指定。`, ok: false }
+        }
+        eventIndex = target.history.findIndex((e) => e.id === matches[0].id)
+      } else if (action.price !== undefined) {
+        // 按 price 匹配；多匹配时不删，返回依赖性失败
+        const matches = target.history.filter((e) => (e.price ?? 0) === action.price)
+        if (matches.length === 0) {
+          return { summary: `没有删除。「${target.name}」下没有价格 ¥${action.price} 的补货记录。`, ok: false }
+        }
+        if (matches.length > 1) {
+          return { summary: `没有删除。「${target.name}」下有 ${matches.length} 条价格 ¥${action.price} 的补货记录，请明确指定。`, ok: false }
+        }
+        eventIndex = target.history.findIndex((e) => e.id === matches[0].id)
+      } else {
+        // 默认删最近一条（dateHint 为空或 "最近一条" 都走这里）
+        eventIndex = target.history.length - 1
+      }
+      if (eventIndex < 0) {
+        return { summary: `没有删除。找不到补货记录 ${action.recordId}。`, ok: false }
+      }
+      const removed = target.history[eventIndex]
+      const updatedHistory = target.history.filter((_, i) => i !== eventIndex)
+      const updated = { ...target, history: updatedHistory, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已删除补货记录：「${target.name}」· ${new Date(removed.at).toLocaleDateString("zh-CN")} ¥${removed.price ?? 0}。`, ok: true }
+    }
+
+    case "deleteItem": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有删除。找不到消耗品「${action.itemName}」。`, ok: false }
+      }
+      // 连带 history / purchaseOptions / 提醒状态全部移除（直接从 items 数组移除即可）
+      work.items = work.items.filter((item) => item.id !== target.id)
+      return { summary: `已删除消耗品：「${target.name}」（含 ${target.history.length} 条补货记录、${target.purchaseOptions.length} 个常购商品）。`, ok: true }
+    }
+
+    case "deleteCategory": {
+      const exists = work.categories.some((c) => norm(c) === norm(action.categoryName))
+      if (!exists) {
+        return { summary: `没有删除。分类「${action.categoryName}」不存在。`, ok: false }
+      }
+      // 非空分类 → 依赖性失败，不删除
+      const itemCount = work.items.filter((item) => norm(item.category) === norm(action.categoryName)).length
+      if (itemCount > 0) {
+        return { summary: `没有删除。分类「${action.categoryName}」下还有 ${itemCount} 个消耗品，请先移动或删除这些消耗品。`, ok: false }
+      }
+      work.categories = work.categories.filter((c) => norm(c) !== norm(action.categoryName))
+      return { summary: `已删除分类：「${action.categoryName}」。`, ok: true }
     }
 
     default: {

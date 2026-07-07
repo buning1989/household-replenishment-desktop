@@ -70,7 +70,8 @@ export type HouseholdChatMessage = {
   /** AgentPlan 多动作计划；与 agentDraft 并存，覆盖建分类/设预算/改周期等 plan-only 能力。
    *  确认前不写入 state，确认后由 commitAgentPlan 统一执行。 */
   agentPlan?: AgentPlan
-  planStatus?: "pending" | "confirmed" | "cancelled" | "superseded"
+  /** AgentPlan 状态。第三期新增 awaitingSecondConfirm：高风险 plan 第一次确认后等待二次「确认删除」。 */
+  planStatus?: "pending" | "awaitingSecondConfirm" | "confirmed" | "cancelled" | "superseded"
   /** 模型或本地生成的澄清追问；用户点选项或自由输入后继续走流程，不写入 state。 */
   clarification?: AgentClarification
   /** 订单截图导入后的批量待确认草稿；每条独立标记 pending/confirmed/cancelled。批量确认前不写入 state。 */

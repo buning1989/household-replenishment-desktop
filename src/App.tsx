@@ -1416,20 +1416,23 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
  */
 function AgentPlanCard({ plan, status, onConfirm, onCancel }: {
   plan: AgentPlan
-  status: "pending" | "confirmed" | "cancelled" | "superseded"
+  status: "pending" | "awaitingSecondConfirm" | "confirmed" | "cancelled" | "superseded"
   onConfirm: () => void
   onCancel: () => void
 }) {
+  const isHighRisk = plan.requiresSecondConfirm === true || plan.risk === "high"
   const statusLabel = status === "pending"
-    ? "准备处理"
-    : status === "confirmed"
-      ? "已执行"
-      : status === "cancelled"
-        ? "已取消"
-        : "已替代"
+    ? (isHighRisk ? "高风险 · 准备处理" : "准备处理")
+    : status === "awaitingSecondConfirm"
+      ? "高风险 · 等待二次确认"
+      : status === "confirmed"
+        ? "已执行"
+        : status === "cancelled"
+          ? "已取消"
+          : "已替代"
 
   return (
-    <div className={`chat-action-card is-${status}`}>
+    <div className={`chat-action-card is-${status}${isHighRisk ? " is-high-risk" : ""}`}>
       <div className="chat-action-card-head">
         <span>{statusLabel}</span>
       </div>
@@ -1440,11 +1443,27 @@ function AgentPlanCard({ plan, status, onConfirm, onCancel }: {
       </ol>
       {status === "pending" && (
         <>
+          {isHighRisk && (
+            <small className="chat-action-hint">这是高风险删除操作，确认后还需要你明确说「确认删除」才能执行。</small>
+          )}
           <div className="chat-action-card-actions">
             <button type="button" className="quiet-button compact" onClick={onCancel}>先不处理</button>
-            <button type="button" className="primary-button compact green" onClick={onConfirm}>就这么执行</button>
+            <button type="button" className="primary-button compact green" onClick={onConfirm}>
+              {isHighRisk ? "继续确认" : "就这么执行"}
+            </button>
           </div>
-          <small className="chat-action-hint">想调整的话直接说，比如「预算改成 800」或「周期 45 天」。</small>
+          {!isHighRisk && (
+            <small className="chat-action-hint">想调整的话直接说，比如「预算改成 800」或「周期 45 天」。</small>
+          )}
+        </>
+      )}
+      {status === "awaitingSecondConfirm" && (
+        <>
+          <small className="chat-action-hint">这是高风险删除操作，操作不可撤销。请明确说「确认删除」执行，或「取消」放弃。</small>
+          <div className="chat-action-card-actions">
+            <button type="button" className="quiet-button compact" onClick={onCancel}>取消</button>
+            <button type="button" className="primary-button compact red" onClick={onConfirm}>确认删除</button>
+          </div>
         </>
       )}
       {status === "confirmed" && (
@@ -1511,6 +1530,22 @@ function summarizeActionForCard(action: import("./agent/actions").AgentAction): 
     }
     case "setDefaultPurchaseOption":
       return `把「${action.itemName || action.itemId}」的默认常购商品设为「${action.productName || action.optionId}」`
+    case "deletePurchaseOption":
+      return `删除常购商品：「${action.itemName}」·「${action.productName || action.optionId}」`
+    case "deleteRestockRecord": {
+      const which = action.recordId
+        ? `记录 ${action.recordId}`
+        : action.dateHint
+          ? `${action.dateHint}的补货记录`
+          : action.price !== undefined
+            ? `价格 ¥${action.price} 的补货记录`
+            : "最近一条补货记录"
+      return `删除补货记录：「${action.itemName}」· ${which}`
+    }
+    case "deleteItem":
+      return `删除消耗品「${action.itemName}」（含历史记录、常购商品、提醒状态）`
+    case "deleteCategory":
+      return `删除分类「${action.categoryName}」`
     default:
       return "（未实现的动作）"
   }
@@ -1738,10 +1773,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	    return -1
 	  }
 
-  // AgentPlan 状态机：找到最近一条 planStatus === "pending" 的 agentPlan 消息。
+  // AgentPlan 状态机：找到最近一条 planStatus 为 "pending" 或 "awaitingSecondConfirm" 的 agentPlan 消息。
+  // 第三期：高风险 plan 第一次确认后进入 awaitingSecondConfirm，仍属于「待处理」。
   function latestPendingPlanMessageIndex(list: HouseholdChatMessage[]): number {
     for (let index = list.length - 1; index >= 0; index -= 1) {
-      if (list[index].role === "assistant" && list[index].planStatus === "pending" && list[index].agentPlan) return index
+      const status = list[index].planStatus
+      if (list[index].role === "assistant" && list[index].agentPlan
+          && (status === "pending" || status === "awaitingSecondConfirm")) return index
     }
     return -1
   }
@@ -1791,6 +1829,14 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   function cancelAgentPlan(messageIndex: number, baseMessages = messages) {
     onMessagesChange(baseMessages.map((message, index) => index === messageIndex
       ? { ...message, planStatus: "cancelled" as const }
+      : message))
+  }
+
+  // 第三期：高风险 plan 第一次确认后推进到 awaitingSecondConfirm 状态。
+  // 不执行任何写入，只改状态，等待用户二次「确认删除」。
+  function advancePlanToSecondConfirm(messageIndex: number, baseMessages = messages) {
+    onMessagesChange(baseMessages.map((message, index) => index === messageIndex
+      ? { ...message, planStatus: "awaitingSecondConfirm" as const }
       : message))
   }
 
@@ -2127,11 +2173,22 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
         return
       }
-      // AgentPlan 命令（planConfirm / planCancel）：typed command，立即反馈，不显示思考
+      // AgentPlan 命令（planConfirm / planAwaitingSecondConfirm / planSecondConfirm / planCancel）：
+      // typed command，立即反馈，不显示思考
       const planCmd = readTurnCommand(turn)
       if (planCmd) {
         if (planCmd.command === "planConfirm" && pendingPlanMessageIndex >= 0) {
           confirmAgentPlan(pendingPlanMessageIndex, nextMessages)
+          return
+        }
+        if (planCmd.command === "planSecondConfirm" && pendingPlanMessageIndex >= 0) {
+          // 二次确认删除：执行写入并标记 confirmed
+          confirmAgentPlan(pendingPlanMessageIndex, nextMessages)
+          return
+        }
+        if (planCmd.command === "planAwaitingSecondConfirm" && pendingPlanMessageIndex >= 0) {
+          // 第一次确认高风险 plan：只推状态，不执行写入
+          advancePlanToSecondConfirm(pendingPlanMessageIndex, nextMessages)
           return
         }
         if (planCmd.command === "planCancel" && pendingPlanMessageIndex >= 0) {
@@ -2359,14 +2416,29 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 		                        onDraftChange={(next) => reviseDraftInPlace(index, next)}
 		                      />
 	                    )}
-	                    {message.agentPlan && (
-	                      <AgentPlanCard
-	                        plan={message.agentPlan}
-	                        status={message.planStatus || "pending"}
-	                        onConfirm={() => confirmAgentPlan(index)}
-	                        onCancel={() => cancelAgentPlan(index)}
-	                      />
-	                    )}
+	                    {message.agentPlan && (() => {
+	                      const plan = message.agentPlan
+	                      const currentStatus = message.planStatus || "pending"
+	                      const isHighRisk = plan.requiresSecondConfirm === true || plan.risk === "high"
+	                      return (
+	                        <AgentPlanCard
+	                          plan={plan}
+	                          status={currentStatus}
+	                          onConfirm={() => {
+	                            // 第三期：高风险 plan 的 onConfirm 行为依赖当前 status
+	                            //   pending + highRisk → 推进到 awaitingSecondConfirm（不执行）
+	                            //   awaitingSecondConfirm → 执行写入并标记 confirmed
+	                            //   普通 pending → 执行写入并标记 confirmed
+	                            if (isHighRisk && currentStatus === "pending") {
+	                              advancePlanToSecondConfirm(index)
+	                            } else {
+	                              confirmAgentPlan(index)
+	                            }
+	                          }}
+	                          onCancel={() => cancelAgentPlan(index)}
+	                        />
+	                      )
+	                    })()}
 	                    {message.clarification && (
 	                      <div className="chat-clarification-card">
 	                        <div className="chat-clarification-options">

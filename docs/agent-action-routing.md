@@ -47,15 +47,31 @@
 | 修改常购商品信息 | "pidan 豆腐猫砂价格改成 58" / "猫砂常购商品平台改成京东" | `updatePurchaseOption` |
 | 设置默认常购商品 | "把猫砂默认商品设成 pidan 豆腐猫砂" | `setDefaultPurchaseOption` |
 | 多动作组合计划 | 后续阶段支持（如"加一袋猫砂并把猫粮周期改 30 天"） | 多 action 数组 |
-| 未来产品操作 | 删除类（删除分类/消耗品/常购商品/补货记录） | 第三阶段补 |
+| 删除常购商品 | "删除猫砂的 pidan 豆腐猫砂常购商品" | `deletePurchaseOption` |
+| 删除补货记录 | "删除猫砂最近一条补货记录" / "删除猫砂价格 58 的那条补货记录" | `deleteRestockRecord` |
+| 删除消耗品 | "删除猫砂" / "把猫砂这个消耗品删掉" / "不再管理猫砂" | `deleteItem` |
+| 删除分类 | "删除宠物用品分类" / "把宠物用品分类删掉" | `deleteCategory` |
 
 **plan-only 判定**：planner 返回的 plan 中只要含以下任一 action 类型，就走 `planProposal`：
 - 第一期：`createCategory` / `setMonthlyBudget` / `updateItem`
 - 第二期：`renameCategory` / `moveItem` / `updateItemUnit` / `updateItemReminder` / `updatePurchaseOption` / `setDefaultPurchaseOption`
+- 第三期：`deletePurchaseOption` / `deleteRestockRecord` / `deleteItem` / `deleteCategory`
 
 否则回退到旧 AgentDraft。
 
-**风险分级**：createCategory / createItem / recordRestock / addPurchaseOption / setMonthlyBudget 为 `low`；updateItem / updateRestockRecord / renameCategory / moveItem / updateItemUnit / updateItemReminder / updatePurchaseOption / setDefaultPurchaseOption 为 `medium`；删除类（第三阶段）为 `high`。
+**风险分级**：
+- `low`：createCategory / createItem / recordRestock / addPurchaseOption / setMonthlyBudget
+- `medium`：updateItem / updateRestockRecord / renameCategory / moveItem / updateItemUnit / updateItemReminder / updatePurchaseOption / setDefaultPurchaseOption
+- `high`：deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory
+
+**高风险动作二次确认机制（第三期）**：
+所有 `high` 风险动作（删除类）需要二次确认：
+1. 用户输入删除意图 → 生成 `planProposal`，`requiresSecondConfirm=true`，`risk="high"`
+2. 用户说"确认"/"好的" → orchestrator 返回 `planAwaitingSecondConfirm` command，plan 状态推进到 `awaitingSecondConfirm`
+3. 用户说"确认删除"/"确定删除" → orchestrator 返回 `planSecondConfirm` command，执行删除
+4. 用户说"取消" → orchestrator 返回 `planCancel` command，取消操作
+
+普通 `low`/`medium` 风险动作只需一次确认。
 
 **多 action 失败语义（第二期）**：`commitAgentPlan` 按顺序执行每个 action，单步返回 `{ summary, ok }`：
 - `ok=true`：成功或良性跳过（如目标物品/常购商品不存在），继续后续 action

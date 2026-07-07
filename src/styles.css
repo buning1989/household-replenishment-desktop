@@ -5206,6 +5206,20 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   padding-top: 3px;
 }
 
+/* 第三期：高风险删除 plan 卡片样式 */
+.chat-action-card.is-high-risk {
+  border-color: var(--signal-red);
+}
+.chat-action-card.is-high-risk .chat-action-card-head span {
+  color: var(--signal-red);
+}
+.chat-action-card.is-awaitingSecondConfirm .chat-action-card-head span {
+  color: var(--signal-red);
+}
+/* 高风险删除二次确认按钮：红色变体 */
+.primary-button.red { background: var(--signal-red); }
+.primary-button.red:hover { background: #9c3f2c; }
+
 .chat-action-hint {
   font-size: 12px;
   color: var(--faint);

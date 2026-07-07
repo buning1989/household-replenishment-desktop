@@ -399,6 +399,214 @@ function tryParseSetDefaultPurchaseOption(text: string, state: AppState): AgentA
   return null
 }
 
+// ---------- 第三期：删除类本地 parser ----------
+
+/**
+ * 删除常购商品：「删除猫砂的 pidan 豆腐猫砂常购商品」「把猫砂里的 pidan 豆腐猫砂删掉」
+ * 必须明确 item + purchaseOption；匹配不明确（0 个或多个）返回 clarification。
+ */
+function tryParseDeletePurchaseOption(text: string, state: AppState): BuildAgentPlanResult {
+  const compact = cleanText(text)
+  if (!/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
+  // 文本含「补货记录」或「分类」时交给对应 parser，避免误匹配
+  if (/补货记录|分类/.test(compact)) return { kind: "noPlan" }
+  // 模式 1：「删除 X 的 Y 常购商品」「删掉 X 的 Y 常购商品」
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的里]+?)(?:的|里的)(.+?)(?:常购商品)?$/)
+  if (m1) {
+    const itemName = cleanName(m1[1])
+    const productName = cleanName(m1[2])
+    if (!productName) return { kind: "noPlan" }
+    return buildDeletePurchaseOptionPlan(itemName, productName, state, text)
+  }
+  // 模式 2：「把 X 里的 Y (常购商品) 删掉」
+  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的里]+?)(?:的|里的)(.+?)(?:常购商品)?(?:删掉|删除|去掉|移除)/)
+  if (m2) {
+    const itemName = cleanName(m2[1])
+    const productName = cleanName(m2[2])
+    if (!productName) return { kind: "noPlan" }
+    return buildDeletePurchaseOptionPlan(itemName, productName, state, text)
+  }
+  return { kind: "noPlan" }
+}
+
+function buildDeletePurchaseOptionPlan(itemName: string, productName: string, state: AppState, sourceText: string): BuildAgentPlanResult {
+  const match = findItemMatch(state, itemName)
+  if (!match.item) {
+    return { kind: "clarification", message: `找不到消耗品「${itemName}」。` }
+  }
+  const opts = match.item.purchaseOptions.filter((o) => cleanName(o.productName) === productName)
+  if (opts.length === 0) {
+    return { kind: "clarification", message: `「${match.item.name}」下没有常购商品匹配「${productName}」。` }
+  }
+  if (opts.length > 1) {
+    return { kind: "clarification", message: `「${match.item.name}」下有多个常购商品匹配「${productName}」，请明确指定。` }
+  }
+  return { kind: "plan", plan: createAgentPlan([{
+    type: "deletePurchaseOption",
+    itemId: match.item.id,
+    itemName: match.item.name,
+    optionId: opts[0].id,
+    productName: opts[0].productName
+  }], sourceText) }
+}
+
+/**
+ * 删除补货记录：「删除猫砂最近一条补货记录」「删除猫砂昨天那条补货记录」「删除猫砂价格 58 的那条补货记录」
+ * 无法唯一定位时返回 clarification，不生成 plan。
+ */
+function tryParseDeleteRestockRecord(text: string, state: AppState): BuildAgentPlanResult {
+  const compact = cleanText(text)
+  if (!/补货记录/.test(compact) || !/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
+  // 提取物品名：「删除 X ...」或「把 X 的 ... 删掉」
+  const m = compact.match(/(?:删除|删掉|去掉|移除|把)([^\s，。,!.！？?把的最近一条昨天前天今天价格元块那补货记录删掉]+)/)
+  if (!m) return { kind: "noPlan" }
+  const itemName = cleanName(m[1])
+  const match = findItemMatch(state, itemName)
+  if (!match.item) {
+    return { kind: "clarification", message: `找不到消耗品「${itemName}」。` }
+  }
+  if (match.item.history.length === 0) {
+    return { kind: "clarification", message: `「${match.item.name}」还没有补货记录。` }
+  }
+  let dateHint: string | undefined
+  let price: number | undefined
+  if (/最近一条|最后一条/.test(compact)) dateHint = "最近一条"
+  else if (/昨天/.test(compact)) dateHint = "昨天"
+  else if (/前天/.test(compact)) dateHint = "前天"
+  else if (/今天/.test(compact)) dateHint = "今天"
+  const priceMatch = compact.match(/价格(\d+(?:\.\d+)?)|(\d+(?:\.\d+)?)\s*[元块]/)
+  if (priceMatch) {
+    price = Number(priceMatch[1] || priceMatch[2])
+  }
+
+  if (!dateHint && price === undefined) {
+    return { kind: "plan", plan: createAgentPlan([{
+      type: "deleteRestockRecord",
+      itemId: match.item.id,
+      itemName: match.item.name,
+      dateHint: "最近一条"
+    }], text) }
+  }
+  const matches = match.item.history.filter((e) => {
+    if (dateHint && !matchesDateHintLocal(e.at, dateHint)) return false
+    if (price !== undefined && (e.price ?? 0) !== price) return false
+    return true
+  })
+  if (matches.length === 0) {
+    return { kind: "clarification", message: `「${match.item.name}」下没有匹配的补货记录。` }
+  }
+  if (matches.length > 1) {
+    return { kind: "clarification", message: `「${match.item.name}」下有 ${matches.length} 条匹配的补货记录，请明确指定（如「价格 58 那条」）。` }
+  }
+  return { kind: "plan", plan: createAgentPlan([{
+    type: "deleteRestockRecord",
+    itemId: match.item.id,
+    itemName: match.item.name,
+    recordId: matches[0].id,
+    dateHint,
+    price
+  }], text) }
+}
+
+/** 本地版 matchesDateHint，与 executor.ts 的 matchesDateHint 保持一致。 */
+function matchesDateHintLocal(at: number, hint: string): boolean {
+  const hintLower = hint.trim()
+  if (hintLower === "最近一条") return true
+  const date = new Date(at)
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  const target = new Date(date)
+  target.setHours(0, 0, 0, 0)
+  const diffDays = Math.round((today.getTime() - target.getTime()) / (24 * 60 * 60 * 1000))
+  if (hintLower === "今天") return diffDays === 0
+  if (hintLower === "昨天") return diffDays === 1
+  if (hintLower === "前天") return diffDays === 2
+  return false
+}
+
+/**
+ * 删除消耗品：「删除猫砂」「把猫砂这个消耗品删掉」「不再管理猫砂」
+ * 物品名匹配多个候选时返回 clarification。
+ */
+function tryParseDeleteItem(text: string, state: AppState): BuildAgentPlanResult {
+  const compact = cleanText(text)
+  if (!/(删除|删掉|去掉|移除|不再管理|不要了)/.test(compact)) return { kind: "noPlan" }
+  // 「不再管理 X」「不再管 X」
+  const m0 = compact.match(/不再管(?:理)?([^\s，。,!.！？?]+)/)
+  if (m0) {
+    return buildDeleteItemPlan(cleanName(m0[1]), state, text)
+  }
+  // 「删除 X」「删掉 X」「去掉 X」
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉]+)/)
+  if (m1) {
+    if (/(分类|补货记录|常购商品)/.test(m1[1])) return { kind: "noPlan" }
+    return buildDeleteItemPlan(cleanName(m1[1]), state, text)
+  }
+  // 「把 X (这个消耗品) 删掉」
+  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉]+?)(?:这个消耗品|这个物品)?(?:删掉|删除|去掉|移除)/)
+  if (m2) {
+    if (/(分类|补货记录|常购商品)/.test(m2[1])) return { kind: "noPlan" }
+    return buildDeleteItemPlan(cleanName(m2[1]), state, text)
+  }
+  return { kind: "noPlan" }
+}
+
+function buildDeleteItemPlan(itemName: string, state: AppState, sourceText: string): BuildAgentPlanResult {
+  if (!itemName) return { kind: "noPlan" }
+  const match = findItemMatch(state, itemName)
+  if (match.confidence === "ambiguous" && match.candidates.length > 1) {
+    return {
+      kind: "clarification",
+      message: `「${itemName}」可能对应：${match.candidates.join("、")}，请确认要删除哪一个。`
+    }
+  }
+  if (!match.item) {
+    return { kind: "clarification", message: `找不到消耗品「${itemName}」。` }
+  }
+  return { kind: "plan", plan: createAgentPlan([{
+    type: "deleteItem",
+    itemId: match.item.id,
+    itemName: match.item.name
+  }], sourceText) }
+}
+
+/**
+ * 删除分类：「删除猫咪用品分类」「把猫咪用品分类删掉」
+ * 非空分类 → clarification（不生成可确认 plan）。
+ */
+function tryParseDeleteCategory(text: string, state: AppState): BuildAgentPlanResult {
+  const compact = cleanText(text)
+  if (!/分类/.test(compact) || !/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的分类删掉]+?)分类/)
+  if (m1) {
+    return buildDeleteCategoryPlan(cleanName(m1[1]), state, text)
+  }
+  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的分类删掉]+?)分类(?:删掉|删除|去掉|移除)/)
+  if (m2) {
+    return buildDeleteCategoryPlan(cleanName(m2[1]), state, text)
+  }
+  return { kind: "noPlan" }
+}
+
+function buildDeleteCategoryPlan(categoryName: string, state: AppState, sourceText: string): BuildAgentPlanResult {
+  if (!categoryName) return { kind: "noPlan" }
+  const exists = state.categories.some((c) => c === categoryName)
+  if (!exists) {
+    return { kind: "clarification", message: `分类「${categoryName}」不存在。` }
+  }
+  const itemCount = state.items.filter((item) => item.category === categoryName).length
+  if (itemCount > 0) {
+    return {
+      kind: "clarification",
+      message: `分类「${categoryName}」下还有 ${itemCount} 个消耗品，请先移动或删除这些消耗品。`
+    }
+  }
+  return { kind: "plan", plan: createAgentPlan([{
+    type: "deleteCategory",
+    categoryName
+  }], sourceText) }
+}
+
 // ---------- 把 AgentDraft 转成 AgentAction[] ----------
 
 function draftToActions(draft: AgentDraft, state: AppState): AgentAction[] {
@@ -545,6 +753,21 @@ export function buildAgentPlan(input: BuildAgentPlanInput): BuildAgentPlanResult
     return { kind: "plan", plan: createAgentPlan([setDefaultAction], text) }
   }
 
+  // 4c. 第三期删除类：删除分类、删除消耗品、删除常购商品、删除补货记录
+  //     删除类返回 BuildAgentPlanResult（含 clarification），直接透传
+  //     顺序：分类 → 消耗品 → 常购商品 → 补货记录（先匹配带「分类」「常购商品」「补货记录」关键字的）
+  const deleteCategoryResult = tryParseDeleteCategory(text, state)
+  if (deleteCategoryResult.kind !== "noPlan") return deleteCategoryResult
+
+  const deletePurchaseOptionResult = tryParseDeletePurchaseOption(text, state)
+  if (deletePurchaseOptionResult.kind !== "noPlan") return deletePurchaseOptionResult
+
+  const deleteRestockRecordResult = tryParseDeleteRestockRecord(text, state)
+  if (deleteRestockRecordResult.kind !== "noPlan") return deleteRestockRecordResult
+
+  const deleteItemResult = tryParseDeleteItem(text, state)
+  if (deleteItemResult.kind !== "noPlan") return deleteItemResult
+
   // 5. 复用 buildLocalDraftFromText 处理「买了/添加/常购商品」
   const draft = buildLocalDraftFromText(text, state)
   if (draft) {
@@ -660,6 +883,28 @@ function summarizeActionLocal(action: AgentAction, state: AppState): string {
       const target = action.itemName || action.itemId || "目标物品"
       const which = action.productName || action.optionId || "常购商品"
       return `把「${target}」的默认常购商品设为「${which}」`
+    }
+    case "deletePurchaseOption": {
+      const target = action.itemName || action.itemId || "目标物品"
+      const which = action.productName || action.optionId || "常购商品"
+      return `删除常购商品「${which}」（归属「${target}」）`
+    }
+    case "deleteRestockRecord": {
+      const target = action.itemName || action.itemId || "目标物品"
+      const which = action.recordId
+        ? `记录 ${action.recordId}`
+        : action.dateHint
+          ? `${action.dateHint}的补货记录`
+          : action.price !== undefined
+            ? `价格 ¥${action.price} 的补货记录`
+            : "最近一条补货记录"
+      return `删除「${target}」的${which}`
+    }
+    case "deleteItem": {
+      return `删除消耗品「${action.itemName}」（含补货记录、常购商品及提醒状态，不可撤销）`
+    }
+    case "deleteCategory": {
+      return `删除分类「${action.categoryName}」`
     }
     default:
       return "（未实现的动作）"

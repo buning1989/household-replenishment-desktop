@@ -469,6 +469,133 @@ const setDefaultPurchaseOptionDef: ActionDefinition<Extract<AgentAction, { type:
   }
 }
 
+// ---------- 第三期：删除类 action（高风险，需二次确认） ----------
+
+const deletePurchaseOptionDef: ActionDefinition<Extract<AgentAction, { type: "deletePurchaseOption" }>> = {
+  type: "deletePurchaseOption",
+  risk: "high",
+  requiredFields: ["itemName"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemName?.trim()) errors.push("物品名不能为空")
+    if (!action.optionId && !action.productName?.trim()) {
+      errors.push("必须指定要删除的常购商品名或 optionId")
+    }
+    if (action.itemName?.trim()) {
+      const target = resolveTargetItem(action, state)
+      if (!target) {
+        // 物品不存在 → error 阻断，避免误删
+        errors.push(`找不到消耗品「${action.itemName}」，无法删除常购商品`)
+      } else if (!action.optionId && action.productName) {
+        const prodName = action.productName
+        const matches = target.purchaseOptions.filter((o) => norm(o.productName) === norm(prodName))
+        if (matches.length === 0) {
+          errors.push(`「${target.name}」下没有常购商品「${prodName}」`)
+        } else if (matches.length > 1) {
+          errors.push(`「${target.name}」下有多个常购商品匹配「${prodName}」，请明确指定`)
+        }
+      }
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    const which = action.productName || action.optionId || "常购商品"
+    return `删除常购商品：「${target}」·「${which}」`
+  }
+}
+
+const deleteRestockRecordDef: ActionDefinition<Extract<AgentAction, { type: "deleteRestockRecord" }>> = {
+  type: "deleteRestockRecord",
+  risk: "high",
+  requiredFields: ["itemName"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemName?.trim()) errors.push("物品名不能为空")
+    if (action.itemName?.trim()) {
+      const target = resolveTargetItem(action, state)
+      if (!target) {
+        errors.push(`找不到消耗品「${action.itemName}」，无法删除补货记录`)
+      } else if (target.history.length === 0) {
+        errors.push(`「${target.name}」还没有补货记录`)
+      } else if (action.recordId) {
+        const event = target.history.find((e) => e.id === action.recordId)
+        if (!event) errors.push(`找不到补货记录 ${action.recordId}`)
+      }
+      // 无 recordId 时由 planner 在解析阶段做唯一定位；这里不阻断
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    const which = action.recordId
+      ? `记录 ${action.recordId}`
+      : action.dateHint
+        ? `${action.dateHint}的补货记录`
+        : action.price !== undefined
+          ? `价格 ¥${action.price} 的补货记录`
+          : "最近一条补货记录"
+    return `删除补货记录：「${target}」· ${which}`
+  }
+}
+
+const deleteItemDef: ActionDefinition<Extract<AgentAction, { type: "deleteItem" }>> = {
+  type: "deleteItem",
+  risk: "high",
+  requiredFields: ["itemName"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemName?.trim()) errors.push("物品名不能为空")
+    if (action.itemName?.trim()) {
+      const target = resolveTargetItem(action, state)
+      if (!target) {
+        errors.push(`找不到消耗品「${action.itemName}」，无法删除`)
+      }
+      // 多候选匹配由 planner 在解析阶段拦截（findItemByName 只取第一个 exact match），
+      // 这里不重复实现歧义检查，交给 planner 的 clarification 流程。
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action, state) {
+    const target = resolveTargetItem(action, state)
+    const name = target?.name || action.itemName || action.itemId || "目标物品"
+    const historyCount = target?.history.length ?? 0
+    const optionCount = target?.purchaseOptions.length ?? 0
+    const impact = `将同时清除 ${historyCount} 条补货记录、${optionCount} 个常购商品及提醒状态`
+    return `删除消耗品「${name}」：${impact}，操作不可撤销`
+  }
+}
+
+const deleteCategoryDef: ActionDefinition<Extract<AgentAction, { type: "deleteCategory" }>> = {
+  type: "deleteCategory",
+  risk: "high",
+  requiredFields: ["categoryName"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.categoryName.trim()) errors.push("分类名不能为空")
+    if (action.categoryName.trim()) {
+      const exists = state.categories.some((c) => norm(c) === norm(action.categoryName))
+      if (!exists) {
+        errors.push(`分类「${action.categoryName}」不存在`)
+      } else {
+        // 非空分类 → error 阻断，不生成可确认 plan
+        const itemCount = state.items.filter((item) => norm(item.category) === norm(action.categoryName)).length
+        if (itemCount > 0) {
+          errors.push(`分类「${action.categoryName}」下还有 ${itemCount} 个消耗品，请先移动或删除这些消耗品`)
+        }
+      }
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    return `删除分类：「${action.categoryName}」`
+  }
+}
+
 // ---------- Registry 表 ----------
 
 const REGISTRY: Record<AgentActionType, ActionDefinition> = {
@@ -484,7 +611,11 @@ const REGISTRY: Record<AgentActionType, ActionDefinition> = {
   updateItemUnit: updateItemUnitDef as ActionDefinition,
   updateItemReminder: updateItemReminderDef as ActionDefinition,
   updatePurchaseOption: updatePurchaseOptionDef as ActionDefinition,
-  setDefaultPurchaseOption: setDefaultPurchaseOptionDef as ActionDefinition
+  setDefaultPurchaseOption: setDefaultPurchaseOptionDef as ActionDefinition,
+  deletePurchaseOption: deletePurchaseOptionDef as ActionDefinition,
+  deleteRestockRecord: deleteRestockRecordDef as ActionDefinition,
+  deleteItem: deleteItemDef as ActionDefinition,
+  deleteCategory: deleteCategoryDef as ActionDefinition
 }
 
 /** 取某个 action type 的 definition。未知 type 抛错（不应发生，类型已约束）。 */
