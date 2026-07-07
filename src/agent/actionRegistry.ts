@@ -39,7 +39,9 @@ export type ActionDefinition<T extends AgentAction = AgentAction> = {
 // ---------- 工具函数 ----------
 
 function norm(value: string): string {
-  return value.trim().toLocaleLowerCase("zh-CN")
+  // 与 drafts.ts / executor.ts 的 norm 保持一致：去掉所有空白字符，
+  // 让 "pidan 豆腐猫砂" 和 "pidan豆腐猫砂" 能匹配到同一个常购商品。
+  return value.replace(/\s+/g, "").toLocaleLowerCase("zh-CN")
 }
 
 function findItemByName(items: ReplenishmentItem[], name: string): ReplenishmentItem | undefined {
@@ -274,6 +276,199 @@ const setMonthlyBudgetDef: ActionDefinition<Extract<AgentAction, { type: "setMon
   }
 }
 
+// ---------- 第二期：编辑类 action ----------
+
+const renameCategoryDef: ActionDefinition<Extract<AgentAction, { type: "renameCategory" }>> = {
+  type: "renameCategory",
+  risk: "medium",
+  requiredFields: ["oldName", "newName"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.oldName.trim()) errors.push("原分类名不能为空")
+    if (!action.newName.trim()) errors.push("新分类名不能为空")
+    if (norm(action.oldName) === norm(action.newName)) {
+      errors.push("新分类名与原分类名相同")
+    }
+    // 原分类不存在 → error（阻断，避免 plan 一上来就废）
+    if (action.oldName.trim() && !state.categories.some((c) => norm(c) === norm(action.oldName))) {
+      errors.push(`分类「${action.oldName}」不存在`)
+    }
+    // 新名与已有分类同名（且不是 oldName 自己）→ error
+    if (
+      action.newName.trim()
+      && norm(action.newName) !== norm(action.oldName)
+      && state.categories.some((c) => norm(c) === norm(action.newName))
+    ) {
+      errors.push(`已有分类「${action.newName}」，不能重名`)
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    return `重命名分类：${action.oldName} → ${action.newName}`
+  }
+}
+
+const moveItemDef: ActionDefinition<Extract<AgentAction, { type: "moveItem" }>> = {
+  type: "moveItem",
+  risk: "medium",
+  requiredFields: ["targetCategory"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemId && !action.itemName) {
+      errors.push("必须指定 itemId 或 itemName")
+    }
+    if (!action.targetCategory.trim()) errors.push("目标分类不能为空")
+    // 目标物品不存在
+    if (!action.itemId && action.itemName) {
+      const target = resolveTargetItem(action, state)
+      if (!target) warnings.push(`找不到消耗品「${action.itemName}」，将跳过这条`)
+    }
+    // 目标分类不存在：本期不自动创建，给 warning 让用户确认
+    if (action.targetCategory.trim() && !state.categories.some((c) => norm(c) === norm(action.targetCategory))) {
+      warnings.push(`分类「${action.targetCategory}」不存在，本期不会自动创建，将跳过移动`)
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    return `移动：${target} → 分类 ${action.targetCategory}`
+  }
+}
+
+const updateItemUnitDef: ActionDefinition<Extract<AgentAction, { type: "updateItemUnit" }>> = {
+  type: "updateItemUnit",
+  risk: "medium",
+  requiredFields: ["unit"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemId && !action.itemName) {
+      errors.push("必须指定 itemId 或 itemName")
+    }
+    if (!action.unit.trim()) errors.push("单位不能为空")
+    if (!action.itemId && action.itemName) {
+      const target = resolveTargetItem(action, state)
+      if (!target) warnings.push(`找不到消耗品「${action.itemName}」，将跳过这条`)
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    return `修改单位：${target} → ${action.unit}`
+  }
+}
+
+const updateItemReminderDef: ActionDefinition<Extract<AgentAction, { type: "updateItemReminder" }>> = {
+  type: "updateItemReminder",
+  risk: "medium",
+  requiredFields: ["bufferDays"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemId && !action.itemName) {
+      errors.push("必须指定 itemId 或 itemName")
+    }
+    // 提前提醒天数必须为非负整数（0 = 到期当天提醒）
+    if (!Number.isFinite(action.bufferDays) || action.bufferDays < 0 || !Number.isInteger(action.bufferDays)) {
+      errors.push("提前提醒天数必须为非负整数")
+    }
+    if (!Number.isFinite(action.bufferDays) || action.bufferDays > 365) {
+      errors.push("提前提醒天数不能超过 365")
+    }
+    if (!action.itemId && action.itemName) {
+      const target = resolveTargetItem(action, state)
+      if (!target) warnings.push(`找不到消耗品「${action.itemName}」，将跳过这条`)
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    return `修改提醒：${target} 提前 ${action.bufferDays} 天`
+  }
+}
+
+const updatePurchaseOptionDef: ActionDefinition<Extract<AgentAction, { type: "updatePurchaseOption" }>> = {
+  type: "updatePurchaseOption",
+  risk: "medium",
+  requiredFields: ["patch"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemId && !action.itemName) {
+      errors.push("必须指定 itemId 或 itemName")
+    }
+    if (!action.optionId && !action.productName) {
+      errors.push("必须指定 optionId 或 productName")
+    }
+    if (action.patch.price !== undefined && (!Number.isFinite(action.patch.price) || action.patch.price < 0)) {
+      errors.push("价格不能为负")
+    }
+    if (action.patch.measureBaseAmount !== undefined && (!Number.isFinite(action.patch.measureBaseAmount) || action.patch.measureBaseAmount <= 0)) {
+      errors.push("计量基准数量必须为正数")
+    }
+    // 目标物品/常购商品不存在：只给 warning（执行时跳过）
+    if (!action.itemId && action.itemName) {
+      const target = resolveTargetItem(action, state)
+      if (!target) {
+        warnings.push(`找不到消耗品「${action.itemName}」，将跳过这条`)
+      } else if (!action.optionId && action.productName) {
+        const prodName = action.productName
+        const opt = target.purchaseOptions.find((o) => norm(o.productName) === norm(prodName))
+        if (!opt) warnings.push(`「${target.name}」下找不到常购商品「${prodName}」，将跳过这条`)
+      }
+    }
+    const hasPatch = [action.patch.productName, action.patch.unit, action.patch.platform, action.patch.price, action.patch.link, action.patch.measureUnit, action.patch.measureBaseAmount].some((v) => v !== undefined)
+    if (!hasPatch) warnings.push("没有指定要修改的字段")
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    const which = action.productName || action.optionId || "常购商品"
+    const changes: string[] = []
+    if (action.patch.productName) changes.push(`名称改为 ${action.patch.productName}`)
+    if (action.patch.unit) changes.push(`单位改为 ${action.patch.unit}`)
+    if (action.patch.platform) changes.push(`平台改为 ${action.patch.platform}`)
+    if (action.patch.price !== undefined) changes.push(`价格改为 ¥${action.patch.price}`)
+    if (action.patch.measureUnit) changes.push(`计量单位改为 ${action.patch.measureUnit}`)
+    if (action.patch.measureBaseAmount !== undefined) changes.push(`计量基准改为 ${action.patch.measureBaseAmount}`)
+    return `修改常购商品：${target} · ${which}：${changes.join("，") || "无字段变更"}`
+  }
+}
+
+const setDefaultPurchaseOptionDef: ActionDefinition<Extract<AgentAction, { type: "setDefaultPurchaseOption" }>> = {
+  type: "setDefaultPurchaseOption",
+  risk: "medium",
+  requiredFields: [],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemId && !action.itemName) {
+      errors.push("必须指定 itemId 或 itemName")
+    }
+    if (!action.optionId && !action.productName) {
+      errors.push("必须指定 optionId 或 productName")
+    }
+    if (!action.itemId && action.itemName) {
+      const target = resolveTargetItem(action, state)
+      if (!target) {
+        warnings.push(`找不到消耗品「${action.itemName}」，将跳过这条`)
+      } else if (!action.optionId && action.productName) {
+        const prodName = action.productName
+        const opt = target.purchaseOptions.find((o) => norm(o.productName) === norm(prodName))
+        if (!opt) warnings.push(`「${target.name}」下找不到常购商品「${prodName}」，将跳过这条`)
+      }
+    }
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const target = action.itemName || action.itemId || "目标物品"
+    const which = action.productName || action.optionId || "常购商品"
+    return `设默认常购商品：${target} · ${which}`
+  }
+}
+
 // ---------- Registry 表 ----------
 
 const REGISTRY: Record<AgentActionType, ActionDefinition> = {
@@ -283,7 +478,13 @@ const REGISTRY: Record<AgentActionType, ActionDefinition> = {
   addPurchaseOption: addPurchaseOptionDef as ActionDefinition,
   recordRestock: recordRestockDef as ActionDefinition,
   updateRestockRecord: updateRestockRecordDef as ActionDefinition,
-  setMonthlyBudget: setMonthlyBudgetDef as ActionDefinition
+  setMonthlyBudget: setMonthlyBudgetDef as ActionDefinition,
+  renameCategory: renameCategoryDef as ActionDefinition,
+  moveItem: moveItemDef as ActionDefinition,
+  updateItemUnit: updateItemUnitDef as ActionDefinition,
+  updateItemReminder: updateItemReminderDef as ActionDefinition,
+  updatePurchaseOption: updatePurchaseOptionDef as ActionDefinition,
+  setDefaultPurchaseOption: setDefaultPurchaseOptionDef as ActionDefinition
 }
 
 /** 取某个 action type 的 definition。未知 type 抛错（不应发生，类型已约束）。 */

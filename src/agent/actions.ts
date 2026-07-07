@@ -122,7 +122,80 @@ export type SetMonthlyBudgetAction = {
   amount: number
 }
 
-/** 第一期 Action 联合类型。 */
+// ---------- 第二期 Action 类型：编辑类核心动作 ----------
+
+/**
+ * 重命名分类。
+ * oldName 必须存在；newName 不能与已有分类同名（含其他分类重命名后产生的冲突）。
+ */
+export type RenameCategoryAction = {
+  type: "renameCategory"
+  oldName: string
+  newName: string
+}
+
+/**
+ * 移动消耗品到指定分类。
+ * 目标分类不存在时本期不自动创建，由 registry 给 warning，executor 跳过。
+ */
+export type MoveItemAction = {
+  type: "moveItem"
+  itemId?: string
+  itemName?: string
+  targetCategory: string
+}
+
+/** 修改消耗品单位。 */
+export type UpdateItemUnitAction = {
+  type: "updateItemUnit"
+  itemId?: string
+  itemName?: string
+  unit: string
+}
+
+/** 修改消耗品提前提醒天数（bufferDays）。 */
+export type UpdateItemReminderAction = {
+  type: "updateItemReminder"
+  itemId?: string
+  itemName?: string
+  bufferDays: number
+}
+
+/**
+ * 修改常购商品（PurchaseOption）信息。
+ * optionId 与 productName 二选一：optionId 优先；只有 productName 时按物品下匹配。
+ * patch 只列可改字段，未列字段保持不变。
+ */
+export type UpdatePurchaseOptionAction = {
+  type: "updatePurchaseOption"
+  itemId?: string
+  itemName?: string
+  optionId?: string
+  productName?: string
+  patch: {
+    productName?: string
+    unit?: string
+    platform?: string
+    price?: number
+    link?: string
+    measureUnit?: string
+    measureBaseAmount?: number
+  }
+}
+
+/**
+ * 设置默认常购商品。
+ * 一个物品下同一时间最多一个默认 PurchaseOption；设新默认时旧默认自动取消。
+ */
+export type SetDefaultPurchaseOptionAction = {
+  type: "setDefaultPurchaseOption"
+  itemId?: string
+  itemName?: string
+  optionId?: string
+  productName?: string
+}
+
+/** 第一期 + 第二期 Action 联合类型。 */
 export type AgentAction =
   | CreateCategoryAction
   | CreateItemAction
@@ -131,6 +204,12 @@ export type AgentAction =
   | RecordRestockAction
   | UpdateRestockRecordAction
   | SetMonthlyBudgetAction
+  | RenameCategoryAction
+  | MoveItemAction
+  | UpdateItemUnitAction
+  | UpdateItemReminderAction
+  | UpdatePurchaseOptionAction
+  | SetDefaultPurchaseOptionAction
 
 /** 第一期支持的所有 action type 字面量，用于 registry 类型守卫。 */
 export type AgentActionType = AgentAction["type"]
@@ -182,7 +261,7 @@ export function computePlanRisk(actions: AgentAction[]): AgentActionRisk {
   return max
 }
 
-/** 单个 action 的风险等级。第一期内嵌在 actions.ts，避免与 registry 循环依赖。 */
+/** 单个 action 的风险等级。第二期编辑类默认 medium，避免与 registry 循环依赖。 */
 export function actionRisk(action: AgentAction): AgentActionRisk {
   switch (action.type) {
     case "createCategory":
@@ -193,6 +272,12 @@ export function actionRisk(action: AgentAction): AgentActionRisk {
       return "low"
     case "updateItem":
     case "updateRestockRecord":
+    case "renameCategory":
+    case "moveItem":
+    case "updateItemUnit":
+    case "updateItemReminder":
+    case "updatePurchaseOption":
+    case "setDefaultPurchaseOption":
       return "medium"
     default:
       return "medium"

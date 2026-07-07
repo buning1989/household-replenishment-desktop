@@ -1,6 +1,6 @@
 # 对话 Agent 路由说明
 
-> 适用版本：AgentPlan 第一阶段（与 AgentDraft 并存）
+> 适用版本：AgentPlan 第一阶段 + 第二阶段编辑类动作（与 AgentDraft 并存）
 > 关联代码：`src/agent/householdOrchestrator.ts` `decideSync()`、`src/agent/orchestrator.ts`
 
 ## 总览
@@ -40,12 +40,26 @@
 | 建分类 | "新建一个宠物用品分类" | `createCategory` |
 | 设置预算 | "这个月预算设成 500" | `setMonthlyBudget` |
 | 修改消耗品周期 | "猫砂周期改成 20 天" | `updateItem` (cycleDays) |
+| 重命名分类 | "把宠物用品改成猫咪用品" | `renameCategory` |
+| 移动消耗品分类 | "把猫砂移到日常护理" | `moveItem` |
+| 修改消耗品单位 | "猫砂单位改成袋" | `updateItemUnit` |
+| 修改提前提醒天数 | "猫砂提前 5 天提醒" | `updateItemReminder` |
+| 修改常购商品信息 | "pidan 豆腐猫砂价格改成 58" / "猫砂常购商品平台改成京东" | `updatePurchaseOption` |
+| 设置默认常购商品 | "把猫砂默认商品设成 pidan 豆腐猫砂" | `setDefaultPurchaseOption` |
 | 多动作组合计划 | 后续阶段支持（如"加一袋猫砂并把猫粮周期改 30 天"） | 多 action 数组 |
-| 未来产品操作 | 重命名 / 删除 / 移动 / 常购商品编辑 / 提醒设置 | 第二阶段补 |
+| 未来产品操作 | 删除类（删除分类/消耗品/常购商品/补货记录） | 第三阶段补 |
 
-**plan-only 判定**：planner 返回的 plan 中只要含 `createCategory` / `setMonthlyBudget` / `updateItem` 任一，就走 `planProposal`；否则回退到旧 AgentDraft。
+**plan-only 判定**：planner 返回的 plan 中只要含以下任一 action 类型，就走 `planProposal`：
+- 第一期：`createCategory` / `setMonthlyBudget` / `updateItem`
+- 第二期：`renameCategory` / `moveItem` / `updateItemUnit` / `updateItemReminder` / `updatePurchaseOption` / `setDefaultPurchaseOption`
 
-**风险分级**：createCategory / createItem / recordRestock / addPurchaseOption / setMonthlyBudget 为 `low`；updateItem / updateRestockRecord 为 `medium`；删除类（第二阶段）为 `high`。
+否则回退到旧 AgentDraft。
+
+**风险分级**：createCategory / createItem / recordRestock / addPurchaseOption / setMonthlyBudget 为 `low`；updateItem / updateRestockRecord / renameCategory / moveItem / updateItemUnit / updateItemReminder / updatePurchaseOption / setDefaultPurchaseOption 为 `medium`；删除类（第三阶段）为 `high`。
+
+**多 action 失败语义（第二期）**：`commitAgentPlan` 按顺序执行每个 action，单步返回 `{ summary, ok }`：
+- `ok=true`：成功或良性跳过（如目标物品/常购商品不存在），继续后续 action
+- `ok=false`：依赖性失败（如分类不存在、重命名冲突、目标分类不存在），立即停止后续 action 并回滚 work，返回原 state + 错误摘要，state 不被部分错误污染
 
 ## 3. 走只读查询的场景
 
@@ -81,10 +95,26 @@ AgentPlan 是未来主方向，但当前阶段必须与 AgentDraft 并存：
 - **不绕过**：所有写入必须经 `commitAgentDraft` / `commitAgentDraftBatch` / `commitAgentPlan`，不允许在 `App.tsx` 里手写新的 agent 写入逻辑。
 - **typed command**：批量意图和 plan confirm/cancel 一律走 `AgentPlanCommand`（`planConfirm` / `planCancel` / `batchConfirm` / `batchCancel` / `batchCancelIndex` / `batchReviseIndex` / `batchReviseAll`），不再使用 `__BATCH_CONFIRM__` 等魔法字符串。
 
-## 第二阶段方向（本期不实现）
+## 第二阶段已实现（编辑类核心动作）
 
-- 重命名 / 删除 / 移动 / 常购商品编辑 / 提醒设置
+第二阶段已落地 6 个编辑类 action：
+- `renameCategory` 重命名分类（同步迁移物品 category 字段）
+- `moveItem` 移动消耗品分类（目标分类不存在时本期不自动创建，返回 ok=false 阻断）
+- `updateItemUnit` 修改消耗品单位
+- `updateItemReminder` 修改提前提醒天数
+- `updatePurchaseOption` 修改常购商品信息（platform/price/unit/link/measureUnit/measureBaseAmount）
+- `setDefaultPurchaseOption` 设置默认常购商品（同物品下排他，旧默认自动取消）
+
+第二期还扩展了：
+- `tryRevisePendingPlan` 覆盖 `updatePurchaseOption` 的价格/平台/单位修订
+- 多 action plan 失败回滚：`commitAgentPlan` 在任一 action `ok=false` 时停止后续 action 并返回原 state
+
+测试覆盖：tests/agent-plan-edit-registry.test.mjs、tests/agent-plan-edit-executor.test.mjs、tests/agent-plan-edit-planner.test.mjs、tests/agent-plan-edit-orchestrator.test.mjs（共 81 个测试）。
+
+## 第三阶段方向（本期不实现）
+
+- 删除类动作：删除分类 / 删除消耗品 / 删除常购商品 / 删除补货记录 / 批量删除
 - 多动作组合 plan（如"加一袋猫砂并把猫粮周期改 30 天"）
 - LLM 直接输出 AgentPlan JSON（当前 LLM 仍只输出 AgentDraft / queryAnswer / clarification）
 
-第二阶段必须在第一阶段全绿并完成手动验收后启动。
+第三阶段必须在第二阶段全绿并完成手动验收后启动；删除类必须加二次确认。

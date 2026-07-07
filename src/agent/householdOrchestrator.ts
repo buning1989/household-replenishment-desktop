@@ -105,14 +105,25 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     if (clarification) {
       return { kind: "sync", turn: clarifyToTurn(clarification) }
     }
-    // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期）
+    // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期 + 第二期编辑类）
     //     只对 AgentDraft 无法处理的新能力生成 planProposal，避免破坏旧 confirm/cancel/revise 流程
     const planResult = buildAgentPlan({ text, state, dateContext, pendingPlan: undefined })
     if (planResult.kind === "plan") {
       const plan = planResult.plan
-      // 判断是否是 AgentPlan-only 能力：包含 createCategory / setMonthlyBudget / updateItem
+      // 判断是否是 AgentPlan-only 能力：
+      //   第一期：createCategory / setMonthlyBudget / updateItem
+      //   第二期：renameCategory / moveItem / updateItemUnit / updateItemReminder /
+      //           updatePurchaseOption / setDefaultPurchaseOption
       const isPlanOnly = plan.actions.some(
-        (a) => a.type === "createCategory" || a.type === "setMonthlyBudget" || a.type === "updateItem"
+        (a) => a.type === "createCategory"
+          || a.type === "setMonthlyBudget"
+          || a.type === "updateItem"
+          || a.type === "renameCategory"
+          || a.type === "moveItem"
+          || a.type === "updateItemUnit"
+          || a.type === "updateItemReminder"
+          || a.type === "updatePurchaseOption"
+          || a.type === "setDefaultPurchaseOption"
       )
       if (isPlanOnly) {
         return {
@@ -224,6 +235,12 @@ function shortActionHint(action: import("./actions").AgentAction): string {
     case "recordRestock": return `记补货「${action.itemName}」`
     case "updateRestockRecord": return `改补货记录`
     case "setMonthlyBudget": return `设预算 ¥${action.amount}`
+    case "renameCategory": return `重命名分类「${action.oldName}」→「${action.newName}」`
+    case "moveItem": return `移动「${action.itemName || action.itemId}」到「${action.targetCategory}」`
+    case "updateItemUnit": return `改单位「${action.itemName || action.itemId}」→${action.unit}`
+    case "updateItemReminder": return `改提醒「${action.itemName || action.itemId}」提前${action.bufferDays}天`
+    case "updatePurchaseOption": return `改常购商品「${action.productName || action.optionId}」`
+    case "setDefaultPurchaseOption": return `设默认「${action.productName || action.optionId}」`
     default: return "（未实现）"
   }
 }

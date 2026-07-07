@@ -135,7 +135,9 @@ export type AgentWorkState = {
 }
 
 function norm(value: string): string {
-  return value.trim().toLocaleLowerCase("zh-CN")
+  // 与 drafts.ts 的 norm 保持一致：去掉所有空白字符（不只是首尾 trim），
+  // 这样 "pidan 豆腐猫砂" 和 "pidan豆腐猫砂" 能匹配到同一个常购商品。
+  return value.replace(/\s+/g, "").toLocaleLowerCase("zh-CN")
 }
 
 function findItem(items: ReplenishmentItem[], itemId: string | undefined, itemName: string): ReplenishmentItem | undefined {
@@ -636,30 +638,34 @@ function ensureWorkCategory(work: AgentWorkState, category: string) {
  * 所有写入复用 domain 逻辑（createItem / restockItem / updateRestockRecord / updateItemFromDraft）。
  * 不修改 state，调用方负责拼装新 state。
  *
- * 返回写入摘要；找不到目标/重复/异常时返回带「跳过/未变更」字样的摘要，不抛错。
+ * 返回 { summary, ok }：
+ *   - ok=true：成功执行；或目标不存在这类「良性跳过」（不阻断后续 action）。
+ *   - ok=false：依赖性失败（如目标分类不存在、重名冲突、写入门类未实现）。
+ *     commitAgentPlan 遇到 ok=false 会停止后续 action，并回滚本次 plan 已写入的 work，
+ *     避免 state 被部分错误污染。
  */
 export function applyAgentAction(
   work: AgentWorkState,
   action: AgentAction,
   now: number,
   links: AgentMessageLink[]
-): string {
+): { summary: string; ok: boolean } {
   switch (action.type) {
     case "createCategory": {
       if (work.categories.some((c) => norm(c) === norm(action.name))) {
         linkCategory(links, action.name)
-        return `没有创建新分类。「${action.name}」已存在。`
+        return { summary: `没有创建新分类。「${action.name}」已存在。`, ok: true }
       }
       work.categories = [...work.categories, action.name]
       linkCategory(links, action.name)
-      return `已新建分类：${action.name}。`
+      return { summary: `已新建分类：${action.name}。`, ok: true }
     }
 
     case "createItem": {
       const existing = findWorkItem(work, undefined, action.name)
       if (existing) {
         linkItem(links, existing)
-        return `没有创建新消耗品。「${existing.name}」已存在。`
+        return { summary: `没有创建新消耗品。「${existing.name}」已存在。`, ok: true }
       }
       ensureWorkCategory(work, action.category)
       const draft: import("../types").ItemDraft = {
@@ -685,15 +691,19 @@ export function applyAgentAction(
       const item = createItem(draft, now)
       work.items = [...work.items, item]
       linkItem(links, item)
-      return action.addPurchaseOption
-        ? `已创建：消耗品「${item.name}」，并挂上常购商品「${action.addPurchaseOption.productName}」。`
-        : `已创建：消耗品「${item.name}」。`
+      return {
+        summary: action.addPurchaseOption
+          ? `已创建：消耗品「${item.name}」，并挂上常购商品「${action.addPurchaseOption.productName}」。`
+          : `已创建：消耗品「${item.name}」。`,
+        ok: true
+      }
     }
 
     case "updateItem": {
       const target = findWorkItem(work, action.itemId, action.itemName)
       if (!target) {
-        return `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`
+        // 良性跳过：目标物品不存在，不影响后续 action
+        return { summary: `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
       }
       const nextDraft: import("../types").ItemDraft = {
         name: action.name ?? target.name,
@@ -711,17 +721,17 @@ export function applyAgentAction(
       const updated = updateItemFromDraft(target, nextDraft)
       work.items = work.items.map((item) => item.id === target.id ? updated : item)
       linkItem(links, updated)
-      return `已修改：消耗品「${updated.name}」。`
+      return { summary: `已修改：消耗品「${updated.name}」。`, ok: true }
     }
 
     case "addPurchaseOption": {
       const target = findWorkItem(work, action.itemId, action.itemName)
       if (!target) {
-        return `没有添加。找不到消耗品「${action.itemName}」。`
+        return { summary: `没有添加。找不到消耗品「${action.itemName}」。`, ok: true }
       }
       if (target.purchaseOptions.some((opt) => norm(opt.productName) === norm(action.productName))) {
         linkItem(links, target)
-        return `没有创建新内容。「${target.name}」下已有常购商品「${action.productName}」。`
+        return { summary: `没有创建新内容。「${target.name}」下已有常购商品「${action.productName}」。`, ok: true }
       }
       const option: PurchaseOption = {
         id: crypto.randomUUID(),
@@ -736,13 +746,13 @@ export function applyAgentAction(
       }
       work.items = work.items.map((item) => item.id === target.id ? updated : item)
       linkItem(links, updated)
-      return `已添加：常购商品「${action.productName}」挂到「${target.name}」下。`
+      return { summary: `已添加：常购商品「${action.productName}」挂到「${target.name}」下。`, ok: true }
     }
 
     case "recordRestock": {
       const target = findWorkItem(work, action.itemId, action.itemName)
       if (!target) {
-        return `没有记录补货。找不到消耗品「${action.itemName}」。`
+        return { summary: `没有记录补货。找不到消耗品「${action.itemName}」。`, ok: true }
       }
       const itemForRestock = action.cycleDaysPatch
         ? { ...target, cycleDays: action.cycleDaysPatch, updatedAt: now }
@@ -755,21 +765,21 @@ export function applyAgentAction(
       )
       work.items = work.items.map((item) => item.id === target.id ? restocked : item)
       linkItem(links, restocked)
-      return `已记录：${restocked.name} 本次补货。`
+      return { summary: `已记录：${restocked.name} 本次补货。`, ok: true }
     }
 
     case "updateRestockRecord": {
       const target = findWorkItem(work, action.itemId, undefined)
       if (!target) {
-        return `没有修改。找不到物品 ${action.itemId}。`
+        return { summary: `没有修改。找不到物品 ${action.itemId}。`, ok: true }
       }
       const eventId = action.eventId || target.history[target.history.length - 1]?.id
       if (!eventId) {
-        return `没有修改。${target.name} 还没有补货记录。`
+        return { summary: `没有修改。${target.name} 还没有补货记录。`, ok: true }
       }
       const existing = target.history.find((e) => e.id === eventId)
       if (!existing) {
-        return `没有修改。找不到补货记录 ${action.eventId}。`
+        return { summary: `没有修改。找不到补货记录 ${action.eventId}。`, ok: true }
       }
       const patch = {
         at: action.patch.at ?? existing.at,
@@ -783,24 +793,151 @@ export function applyAgentAction(
       const updated = updateRestockRecord(target, eventId, patch, now)
       work.items = work.items.map((item) => item.id === target.id ? updated : item)
       linkItem(links, updated)
-      return `已修改：${updated.name} 的补货记录。`
+      return { summary: `已修改：${updated.name} 的补货记录。`, ok: true }
     }
 
     case "setMonthlyBudget": {
       work.settings = { ...(work.settings || ({} as AppState["settings"])), monthlyBudget: action.amount }
-      return `已设置本月预算：¥${action.amount}。`
+      return { summary: `已设置本月预算：¥${action.amount}。`, ok: true }
+    }
+
+    // ---------- 第二期：编辑类 action ----------
+
+    case "renameCategory": {
+      // 原分类不存在 → 依赖性失败（ok=false），阻断后续依赖此分类的 action
+      if (!work.categories.some((c) => norm(c) === norm(action.oldName))) {
+        return { summary: `没有重命名。分类「${action.oldName}」不存在。`, ok: false }
+      }
+      // 新名与已有分类同名（且不是 oldName 自己）→ 依赖性失败
+      if (
+        norm(action.newName) !== norm(action.oldName)
+        && work.categories.some((c) => norm(c) === norm(action.newName))
+      ) {
+        return { summary: `没有重命名。已有分类「${action.newName}」，不能重名。`, ok: false }
+      }
+      // 复用 updateItemFromDraft 不可行（分类是 state 顶层字段），直接替换
+      work.categories = work.categories.map((c) => norm(c) === norm(action.oldName) ? action.newName : c)
+      // 同步迁移物品的 category 字段
+      work.items = work.items.map((item) =>
+        norm(item.category) === norm(action.oldName) ? { ...item, category: action.newName, updatedAt: now } : item
+      )
+      linkCategory(links, action.newName)
+      return { summary: `已重命名分类：${action.oldName} → ${action.newName}。`, ok: true }
+    }
+
+    case "moveItem": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有移动。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
+      }
+      // 目标分类不存在 → 依赖性失败（本期不自动创建，避免静默写入不存在的分类）
+      if (!work.categories.some((c) => norm(c) === norm(action.targetCategory))) {
+        return { summary: `没有移动。分类「${action.targetCategory}」不存在，本期不会自动创建。`, ok: false }
+      }
+      // 同分类不算失败
+      if (norm(target.category) === norm(action.targetCategory)) {
+        linkItem(links, target)
+        return { summary: `没有移动。「${target.name}」已经在分类「${action.targetCategory}」下。`, ok: true }
+      }
+      const updated = { ...target, category: action.targetCategory, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已移动：「${target.name}」 → 分类「${action.targetCategory}」。`, ok: true }
+    }
+
+    case "updateItemUnit": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
+      }
+      const updated = { ...target, unit: action.unit, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已修改单位：「${target.name}」 → ${action.unit}。`, ok: true }
+    }
+
+    case "updateItemReminder": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
+      }
+      const updated = { ...target, bufferDays: action.bufferDays, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已修改提醒：「${target.name}」提前 ${action.bufferDays} 天。`, ok: true }
+    }
+
+    case "updatePurchaseOption": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
+      }
+      // 定位常购商品：optionId 优先，productName 兜底
+      const prodName = action.productName
+      const optIndex = action.optionId
+        ? target.purchaseOptions.findIndex((o) => o.id === action.optionId)
+        : target.purchaseOptions.findIndex((o) => norm(o.productName) === norm(prodName || ""))
+      if (optIndex < 0) {
+        return { summary: `没有修改。「${target.name}」下找不到常购商品「${action.productName || action.optionId}」。`, ok: true }
+      }
+      const existing = target.purchaseOptions[optIndex]
+      const updatedOpt: PurchaseOption = {
+        ...existing,
+        productName: action.patch.productName ?? existing.productName,
+        unit: action.patch.unit ?? existing.unit,
+        platform: action.patch.platform ?? existing.platform,
+        price: action.patch.price ?? existing.price,
+        link: action.patch.link ?? existing.link,
+        measureUnit: action.patch.measureUnit ?? existing.measureUnit,
+        measureBaseAmount: action.patch.measureBaseAmount ?? existing.measureBaseAmount
+      }
+      const updated = {
+        ...target,
+        purchaseOptions: target.purchaseOptions.map((o, i) => i === optIndex ? updatedOpt : o),
+        updatedAt: now
+      }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已修改常购商品：「${target.name}」·「${existing.productName}」。`, ok: true }
+    }
+
+    case "setDefaultPurchaseOption": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有设置。找不到消耗品「${action.itemName || action.itemId}」。`, ok: true }
+      }
+      const prodName = action.productName
+      const optIndex = action.optionId
+        ? target.purchaseOptions.findIndex((o) => o.id === action.optionId)
+        : target.purchaseOptions.findIndex((o) => norm(o.productName) === norm(prodName || ""))
+      if (optIndex < 0) {
+        return { summary: `没有设置。「${target.name}」下找不到常购商品「${action.productName || action.optionId}」。`, ok: true }
+      }
+      // 同一物品同时最多一个默认：把其他默认取消，把目标设为默认
+      const updatedOptions = target.purchaseOptions.map((o, i) => ({
+        ...o,
+        isDefault: i === optIndex ? true : false
+      }))
+      const updated = { ...target, purchaseOptions: updatedOptions, updatedAt: now }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return { summary: `已设默认常购商品：「${target.name}」·「${target.purchaseOptions[optIndex].productName}」。`, ok: true }
     }
 
     default: {
-      // 类型已约束，走到这里说明是未实现的第二期 action
-      return `未实现：${(action as { type: string }).type} 动作本期不支持。`
+      // 类型已约束，走到这里说明是未实现的 action
+      return { summary: `未实现：${(action as { type: string }).type} 动作本期不支持。`, ok: false }
     }
   }
 }
 
 /**
- * 执行整个 AgentPlan。按顺序应用每个 action，任一失败不阻塞后续。
- * 中高风险 plan 必须处于 confirmed 状态（由调用方保证，这里不再检查）。
+ * 执行整个 AgentPlan。按顺序应用每个 action。
+ *
+ * 失败语义（第二期）：
+ *   - ok=true（成功或良性跳过）：继续后续 action。
+ *   - ok=false（依赖性失败）：立即停止后续 action，回滚本次 plan 已写入的 work，
+ *     返回原 state + 错误摘要，避免 state 被部分错误污染。
  *
  * 写入后观察：取最重要的一条命中（与 commitAgentDraftBatch 行为对齐）。
  */
@@ -818,10 +955,26 @@ export function commitAgentPlan(
     settings: { ...state.settings }
   }
   const summaries: string[] = []
+  let failed = false
   for (const action of plan.actions) {
-    const summary = applyAgentAction(work, action, now, links)
-    if (summary) summaries.push(summary)
+    const result = applyAgentAction(work, action, now, links)
+    summaries.push(result.summary)
+    if (!result.ok) {
+      failed = true
+      break
+    }
   }
+
+  // 依赖性失败：回滚本次 plan 已写入的 work，返回原 state + 错误摘要
+  if (failed) {
+    return {
+      state,
+      summary: summaries.join("\n"),
+      links,
+      observation: undefined
+    }
+  }
+
   const nextState: AppState = {
     ...state,
     categories: work.categories,

@@ -76,6 +76,7 @@ function tryRevisePendingPlan(input: BuildAgentPlanInput): AgentPlan | null {
     return revisePlanActions(plan, (action) => {
       if (action.type === "recordRestock") return { ...action, price }
       if (action.type === "updateRestockRecord") return { ...action, patch: { ...action.patch, price } }
+      if (action.type === "updatePurchaseOption") return { ...action, patch: { ...action.patch, price } }
       return action
     })
   }
@@ -87,6 +88,7 @@ function tryRevisePendingPlan(input: BuildAgentPlanInput): AgentPlan | null {
     return revisePlanActions(plan, (action) => {
       if (action.type === "recordRestock") return { ...action, price }
       if (action.type === "updateRestockRecord") return { ...action, patch: { ...action.patch, price } }
+      if (action.type === "updatePurchaseOption") return { ...action, patch: { ...action.patch, price } }
       return action
     })
   }
@@ -97,6 +99,7 @@ function tryRevisePendingPlan(input: BuildAgentPlanInput): AgentPlan | null {
     return revisePlanActions(plan, (action) => {
       if (action.type === "recordRestock") return { ...action, platform }
       if (action.type === "updateRestockRecord") return { ...action, patch: { ...action.patch, platform } }
+      if (action.type === "updatePurchaseOption") return { ...action, patch: { ...action.patch, platform } }
       return action
     })
   }
@@ -195,6 +198,201 @@ function tryParseUpdateItem(text: string, state: AppState): AgentAction | null {
         itemName: match.item.name,
         cycleDays,
         bufferDays: Math.min(match.item.bufferDays, cycleDays - 1)
+      }
+    }
+  }
+  return null
+}
+
+// ---------- 第二期：编辑类本地 parser ----------
+
+/** 重命名分类：「把宠物用品改成猫咪用品」「宠物用品分类改名为猫咪用品」「分类「宠物用品」重命名为「猫咪用品」」 */
+function tryParseRenameCategory(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 「把 X 改成/改为/改叫 Y」「把 X 分类改成 Y」
+  const m1 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)(?:分类)?(?:改成|改为|改名为|改叫|重命名(?:为)?)((?:[^\s，。,!.！？?])+)/)
+  if (m1 && /(?:改成|改为|改名为|改叫|重命名)/.test(compact)) {
+    const oldName = cleanName(m1[1])
+    const newName = cleanName(m1[2])
+    // oldName 必须是已有分类
+    if (oldName && newName && state.categories.some((c) => c === oldName)) {
+      return { type: "renameCategory", oldName, newName }
+    }
+  }
+  return null
+}
+
+/** 移动消耗品分类：「把猫砂移到猫咪用品」「猫砂归到猫咪用品分类」「把豆腐猫砂放到宠物用品里」 */
+function tryParseMoveItem(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 「把 X 移到/放到/归到 Y」「X 移到/归到 Y 分类」
+  const m1 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)(?:移到|放到|归到|归入|放到)([^\s，。,!.！？?分类的]+?)(?:分类|里|下)?$/)
+  if (m1) {
+    const itemName = cleanName(m1[1])
+    const targetCategory = cleanName(m1[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item && targetCategory) {
+      return {
+        type: "moveItem",
+        itemId: match.item.id,
+        itemName: match.item.name,
+        targetCategory
+      }
+    }
+  }
+  return null
+}
+
+/** 修改单位：「猫砂单位改成袋」「洗衣液单位改成瓶」「厨房纸按包记」 */
+function tryParseUpdateItemUnit(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 「X 单位改成/改为 Y」—— Y 可能是多字单位（如「公斤」「毫升」），用 + 捕获
+  const m1 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)(?:的)?单位(?:改成|改为|设为|设成)([^\s，。,!.！？?]+)/)
+  if (m1) {
+    const itemName = cleanName(m1[1])
+    const unit = cleanName(m1[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item && unit) {
+      return { type: "updateItemUnit", itemId: match.item.id, itemName: match.item.name, unit }
+    }
+  }
+  // 「X 按 Y 记」
+  const m2 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)按([^\s，。,!.！？?]+?)记/)
+  if (m2) {
+    const itemName = cleanName(m2[1])
+    const unit = cleanName(m2[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item && unit) {
+      return { type: "updateItemUnit", itemId: match.item.id, itemName: match.item.name, unit }
+    }
+  }
+  return null
+}
+
+/** 修改提前提醒天数：「猫砂提前 5 天提醒」「洗衣液快用完前 7 天提醒」「牙膏提前 3 天提示我」 */
+function tryParseUpdateItemReminder(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 「X 提前 N 天提醒/提示」「X 快用完前 N 天提醒」
+  const m = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)(?:快用完前|提前)(\d+)\s*天(?:提醒|提示|通知)?/)
+  if (m) {
+    const itemName = cleanName(m[1])
+    const bufferDays = Number(m[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item && Number.isInteger(bufferDays) && bufferDays >= 0) {
+      return { type: "updateItemReminder", itemId: match.item.id, itemName: match.item.name, bufferDays }
+    }
+  }
+  return null
+}
+
+/**
+ * 修改常购商品信息：「猫砂常购商品平台改成京东」「pidan 豆腐猫砂价格改成 58」
+ * 注意：常购商品 productName 可能含空格（如 "pidan 豆腐猫砂"），但 cleanText 会去空格，
+ *      所以这里从原文（text 而非 compact）里提取 productName，再从 state 匹配。
+ */
+function tryParseUpdatePurchaseOption(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 模式 1：「X 常购商品平台/价格/单位 改成 Y」—— Y 可能多字（如「京东」「淘宝」），用 + 捕获
+  const m1 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)常购商品(?:的)?(平台|价格|单位|链接|计量单位|计量基准)(?:改成|改为|设为|设成)([^\s，。,!.！？?]+)/)
+  if (m1) {
+    const itemName = cleanName(m1[1])
+    const field = m1[2]
+    const value = m1[3]
+    const match = findItemMatch(state, itemName)
+    if (match.item) {
+      const patch: Record<string, unknown> = {}
+      if (field === "平台") patch.platform = value
+      else if (field === "价格") {
+        const price = Number(value)
+        if (!Number.isFinite(price) || price < 0) return null
+        patch.price = price
+      }
+      else if (field === "单位") patch.unit = value
+      else if (field === "链接") patch.link = value
+      else if (field === "计量单位") patch.measureUnit = value
+      else if (field === "计量基准") {
+        const amount = Number(value)
+        if (!Number.isFinite(amount) || amount <= 0) return null
+        patch.measureBaseAmount = amount
+      }
+      // 从物品下找第一个常购商品作为目标
+      const firstOpt = match.item.purchaseOptions[0]
+      if (!firstOpt) return null
+      return {
+        type: "updatePurchaseOption",
+        itemId: match.item.id,
+        itemName: match.item.name,
+        optionId: firstOpt.id,
+        productName: firstOpt.productName,
+        patch: patch as { productName?: string; unit?: string; platform?: string; price?: number; link?: string; measureUnit?: string; measureBaseAmount?: number }
+      }
+    }
+  }
+  // 模式 2：「pidan 豆腐猫砂价格改成 58」（productName 在前，field 在后）
+  //        需要遍历所有物品的 purchaseOptions 找匹配
+  const m2 = compact.match(/^(.+?)(?:价格|平台|单位)(?:改成|改为|设为|设成)(.+)$/)
+  if (m2 && !m2[1].includes("常购商品")) {
+    const prodNameRaw = m2[1]
+    const field2 = compact.includes("价格") ? "price" : compact.includes("平台") ? "platform" : "unit"
+    const valueRaw = m2[2]
+    // 遍历物品找匹配 productName 的常购商品
+    for (const item of state.items) {
+      const opt = item.purchaseOptions.find((o) => cleanName(o.productName) === cleanName(prodNameRaw))
+      if (opt) {
+        const patch: Record<string, unknown> = {}
+        if (field2 === "price") {
+          const price = Number(valueRaw)
+          if (!Number.isFinite(price) || price < 0) return null
+          patch.price = price
+        } else if (field2 === "platform") {
+          patch.platform = valueRaw
+        } else {
+          patch.unit = valueRaw
+        }
+        return {
+          type: "updatePurchaseOption",
+          itemId: item.id,
+          itemName: item.name,
+          optionId: opt.id,
+          productName: opt.productName,
+          patch: patch as { productName?: string; unit?: string; platform?: string; price?: number; link?: string; measureUnit?: string; measureBaseAmount?: number }
+        }
+      }
+    }
+  }
+  return null
+}
+
+/** 设置默认常购商品：「把猫砂默认商品设成 pidan 豆腐猫砂」「把 X 设为默认」 */
+function tryParseSetDefaultPurchaseOption(text: string, state: AppState): AgentAction | null {
+  const compact = cleanText(text)
+  // 「把 X 默认商品设成 Y」「把 Y 设为 X 的默认商品」「把猫砂默认商品设成 pidan 豆腐猫砂」
+  const m1 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)默认商品(?:设成|设为|改为)([^\s，。,!.！？?]+)/)
+  if (m1) {
+    const itemName = cleanName(m1[1])
+    const productName = cleanName(m1[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item) {
+      return {
+        type: "setDefaultPurchaseOption",
+        itemId: match.item.id,
+        itemName: match.item.name,
+        productName
+      }
+    }
+  }
+  // 「把 Y 设为 X 的默认常购商品」
+  const m2 = compact.match(/(?:把)?([^\s，。,!.！？?把的]+?)(?:设为|设成)([^\s，。,!.！？?把的]+?)的默认(?:常购商品|商品)/)
+  if (m2) {
+    const productName = cleanName(m2[1])
+    const itemName = cleanName(m2[2])
+    const match = findItemMatch(state, itemName)
+    if (match.item) {
+      return {
+        type: "setDefaultPurchaseOption",
+        itemId: match.item.id,
+        itemName: match.item.name,
+        productName
       }
     }
   }
@@ -321,6 +519,32 @@ export function buildAgentPlan(input: BuildAgentPlanInput): BuildAgentPlanResult
     return { kind: "plan", plan: createAgentPlan([updateAction], text) }
   }
 
+  // 4b. 第二期编辑类：重命名分类、移动分类、改单位、改提醒、改常购商品、设默认
+  const renameAction = tryParseRenameCategory(text, state)
+  if (renameAction) {
+    return { kind: "plan", plan: createAgentPlan([renameAction], text) }
+  }
+  const moveAction = tryParseMoveItem(text, state)
+  if (moveAction) {
+    return { kind: "plan", plan: createAgentPlan([moveAction], text) }
+  }
+  const unitAction = tryParseUpdateItemUnit(text, state)
+  if (unitAction) {
+    return { kind: "plan", plan: createAgentPlan([unitAction], text) }
+  }
+  const reminderAction = tryParseUpdateItemReminder(text, state)
+  if (reminderAction) {
+    return { kind: "plan", plan: createAgentPlan([reminderAction], text) }
+  }
+  const updateOptAction = tryParseUpdatePurchaseOption(text, state)
+  if (updateOptAction) {
+    return { kind: "plan", plan: createAgentPlan([updateOptAction], text) }
+  }
+  const setDefaultAction = tryParseSetDefaultPurchaseOption(text, state)
+  if (setDefaultAction) {
+    return { kind: "plan", plan: createAgentPlan([setDefaultAction], text) }
+  }
+
   // 5. 复用 buildLocalDraftFromText 处理「买了/添加/常购商品」
   const draft = buildLocalDraftFromText(text, state)
   if (draft) {
@@ -406,6 +630,37 @@ function summarizeActionLocal(action: AgentAction, state: AppState): string {
     }
     case "setMonthlyBudget":
       return `本月预算设为 ¥${action.amount}`
+    case "renameCategory":
+      return `重命名分类：${action.oldName} → ${action.newName}`
+    case "moveItem": {
+      const target = action.itemName || action.itemId || "目标物品"
+      return `把「${target}」移到分类「${action.targetCategory}」`
+    }
+    case "updateItemUnit": {
+      const target = action.itemName || action.itemId || "目标物品"
+      return `「${target}」单位改为 ${action.unit}`
+    }
+    case "updateItemReminder": {
+      const target = action.itemName || action.itemId || "目标物品"
+      return `「${target}」提前 ${action.bufferDays} 天提醒`
+    }
+    case "updatePurchaseOption": {
+      const target = action.itemName || action.itemId || "目标物品"
+      const which = action.productName || action.optionId || "常购商品"
+      const changes: string[] = []
+      if (action.patch.productName) changes.push(`名称 ${action.patch.productName}`)
+      if (action.patch.unit) changes.push(`单位 ${action.patch.unit}`)
+      if (action.patch.platform) changes.push(`平台 ${action.patch.platform}`)
+      if (action.patch.price !== undefined) changes.push(`价格 ¥${action.patch.price}`)
+      if (action.patch.measureUnit) changes.push(`计量单位 ${action.patch.measureUnit}`)
+      if (action.patch.measureBaseAmount !== undefined) changes.push(`计量基准 ${action.patch.measureBaseAmount}`)
+      return `「${target}」·「${which}」：${changes.join("，") || "无变更"}`
+    }
+    case "setDefaultPurchaseOption": {
+      const target = action.itemName || action.itemId || "目标物品"
+      const which = action.productName || action.optionId || "常购商品"
+      return `把「${target}」的默认常购商品设为「${which}」`
+    }
     default:
       return "（未实现的动作）"
   }

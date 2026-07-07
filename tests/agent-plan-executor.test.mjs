@@ -338,8 +338,9 @@ test("summarizePlan: 多行摘要按顺序编号", () => {
 test("applyAgentAction: 单个 action 可独立调用", () => {
   const work = { categories: ["卫生间"], items: [], settings: { reminderIntervalHours: 1, quietStart: "22:00", quietEnd: "08:00", notificationEnabled: true } }
   const links = []
-  const summary = applyAgentAction(work, { type: "createCategory", name: "园艺" }, 1000, links)
+  const result = applyAgentAction(work, { type: "createCategory", name: "园艺" }, 1000, links)
   assert.ok(work.categories.includes("园艺"))
-  assert.match(summary, /已新建分类/)
+  assert.equal(result.ok, true)
+  assert.match(result.summary, /已新建分类/)
   assert.equal(links.length, 1)
 })
