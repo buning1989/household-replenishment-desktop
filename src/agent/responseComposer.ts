@@ -13,6 +13,8 @@ import { describeAgentDraft, type AgentDraft, type OrderRow } from "./drafts"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { OrderImportRow } from "../OrderImportReview"
 import type { ConversationBoundary } from "./conversationBoundary"
+import type { AppState } from "../types"
+import { buildRecordSuggestions, findSuggestionByField, type FieldSuggestion, type InferenceItemView } from "./recordInference"
 
 /**
  * 草稿卡片的状态标签文案。
@@ -125,7 +127,7 @@ export function composeProposalMessage(draft: AgentDraft): string {
     return `我先把「${draft.itemName}」加进来，按 ${draft.cycleDays} 天一轮帮你盯着。你要是没问题，我就先这么记下。`
   }
   if (draft.kind === "restock") {
-    return `「${draft.itemName}」我先按这次补货记上，价格和平台没说也不影响。你要是没问题，我就这么保存。`
+    return `「${draft.itemName}」这次补货我先记一笔。你要是没问题，我就这么保存。`
   }
   if (draft.kind === "createItemWithRestock") {
     const qty = draft.restock.qty
@@ -138,36 +140,146 @@ export function composeProposalMessage(draft: AgentDraft): string {
 }
 
 /**
- * 任务四 B3：草稿产出时检测金额/平台缺失，返回对话式追问文案。
- * 仅在 restock / createItemWithRestock 草稿首次产出时调用。
- * 不在 revise / confirm / committed 路径调用，避免追问第二次。
+ * 草稿产出时的「信息采集」文案。
  *
- * 返回 null 表示无需追问（字段齐全或草稿类型不涉及金额/平台）。
+ * 设计目标（任务：基于历史/常识给参考，不再追问字段）：
+ *   - 价格缺失：优先用历史价格帮用户估一版；没历史就用常识给区间。
+ *     绝不直接问「多少钱」，而是说「我先按……估」「实际金额你直接改」。
+ *   - 平台缺失：如果历史有平台习惯，提一句「之前一般是在 X 买」做参考；
+ *     没有历史平台就不主动追问平台（用户没说不重要）。
+ *   - 文案中不出现「不记得也可以」「没关系」「先空着也不影响」「大概多少钱」这类迁就式语言。
+ *
+ * 返回 null 表示草稿类型不涉及采集，或字段已齐全无需采集。
+ * 调用方在 draftToProposal 首次产出时调用一次；revise/confirm 路径不再调用。
  */
-export function composeMissingFieldPrompt(draft: AgentDraft): string | null {
-  if (draft.kind === "restock") {
-    const missingPrice = draft.price === undefined || draft.price === null
-    const missingPlatform = !draft.platform
-    return buildMissingFieldPrompt(missingPrice, missingPlatform)
+export function composeCollectionGuidance(
+  draft: AgentDraft,
+  state: AppState,
+  itemViews: InferenceItemView[]
+): string | null {
+  if (draft.kind !== "restock" && draft.kind !== "createItemWithRestock") {
+    return null
   }
-  if (draft.kind === "createItemWithRestock") {
-    const missingPrice = draft.restock.price === undefined || draft.restock.price === null
-    const missingPlatform = !draft.restock.platform
-    return buildMissingFieldPrompt(missingPrice, missingPlatform)
+  const suggestions = buildRecordSuggestions(draft, state, itemViews)
+  if (suggestions.length === 0) return null
+
+  const restockDetails = draft.kind === "restock" ? draft : draft.restock
+  const itemName = draft.kind === "restock" ? draft.itemName : draft.item.itemName
+  const qty = restockDetails.qty && restockDetails.qty > 0 ? restockDetails.qty : 1
+  const unit = restockDetails.unit || (draft.kind === "createItemWithRestock" ? draft.item.unit : undefined) || "件"
+  const platformSaid = restockDetails.platform
+
+  const priceSuggestion = findSuggestionByField(suggestions, "price")
+  const platformSuggestion = findSuggestionByField(suggestions, "platform")
+
+  const lines: string[] = []
+
+  // 价格采集：基于建议给参考
+  if (priceSuggestion) {
+    lines.push(buildPriceGuidanceLine(itemName, qty, unit, platformSaid, priceSuggestion))
   }
-  // createItem / addPurchaseOption 不涉及金额/平台，不追问
-  return null
+
+  // 平台采集：仅在用户没说平台且有历史平台习惯时给参考
+  if (platformSuggestion && !platformSaid) {
+    lines.push(buildPlatformGuidanceLine(platformSuggestion))
+  }
+
+  if (lines.length === 0) return null
+  return lines.join(" ")
 }
 
-function buildMissingFieldPrompt(missingPrice: boolean, missingPlatform: boolean): string | null {
-  if (!missingPrice && !missingPlatform) return null
-  if (missingPrice && missingPlatform) {
-    return "多少钱、在哪家买的？顺口说一声我一起记上，不说也行。"
+/** 价格采集文案：根据建议来源和置信度生成口语化提示。 */
+function buildPriceGuidanceLine(
+  itemName: string,
+  qty: number,
+  unit: string,
+  platformSaid: string | undefined,
+  suggestion: FieldSuggestion
+): string {
+  const perWhat = unit
+
+  // itemHistory：明确说出历史单价 + 估算总价
+  if (suggestion.source === "itemHistory") {
+    // 平台差异表达：用户说的平台和历史平台不同时，做自然判断
+    const platformHint = buildPlatformDifferentialHint(platformSaid, suggestion)
+    if (suggestion.range) {
+      return `之前${itemName}单价在 ¥${Math.round(suggestion.range.min / qty)}~¥${Math.round(suggestion.range.max / qty)}/${perWhat}，这次 ${qty}${unit} 我先按 ¥${suggestion.range.min}~¥${suggestion.range.max} 估着。${platformHint}实际金额有差你直接说个数。`
+    }
+    const unitPrice = typeof suggestion.value === "number"
+      ? Math.round(suggestion.value / qty)
+      : null
+    if (unitPrice !== null) {
+      return `之前${itemName}基本在 ¥${unitPrice}/${perWhat} 左右，这次 ${qty}${unit} 我先按 ¥${suggestion.value} 附近估着。${platformHint}实际金额有差你直接说个数。`
+    }
+    return `之前${itemName}的价格我可以参考，这次 ${qty}${unit} ${platformHint}实际金额你直接说个数，我再改准。`
   }
-  if (missingPrice) {
-    return "多少钱买的？顺口说一声我一起记上，不说也行。"
+
+  // purchaseOption：常购商品价格
+  if (suggestion.source === "purchaseOption") {
+    if (suggestion.range) {
+      return `按常购商品估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。实际金额你直接改。`
+    }
+    return `按常购商品价格估，${qty}${unit} 我先按 ¥${suggestion.value} 记。实际金额你直接改。`
   }
-  return "在哪家买的？说了我顺手记上，不说也行。"
+
+  // categoryHistory：同品类参考（低置信）
+  if (suggestion.source === "categoryHistory") {
+    if (suggestion.range) {
+      return `同分类其他物品的单价在 ¥${Math.round(suggestion.range.min / qty)}~¥${Math.round(suggestion.range.max / qty)}/${perWhat}，${qty}${unit} 我先按 ¥${suggestion.range.min}~¥${suggestion.range.max} 估着（只是参考）。实际金额你直接说个数。`
+    }
+    return `同分类其他物品价格我参考了一下，${qty}${unit} 我先按 ¥${suggestion.value} 估着。实际金额你直接改。`
+  }
+
+  // llmPrior：常识区间（最低置信，文案必须说「常见价格范围」）
+  if (suggestion.source === "llmPrior") {
+    if (suggestion.range) {
+      return `${itemName}之前还没记过价格。我先按常见价格范围估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。你说个实际金额，我再改准。`
+    }
+    return `${itemName}之前还没记过价格。我先按常见范围估，${qty}${unit} 大概 ¥${suggestion.value}。你说个实际金额，我再改准。`
+  }
+
+  // template：极少走到这里
+  return `我先按常见范围估一版，${qty}${unit} 大概 ¥${suggestion.value ?? ""}。实际金额你直接改。`
+}
+
+/**
+ * 平台差异表达：基于用户当前说的平台和历史平台做自然判断。
+ * 不硬编码平台折扣，只给方向性提示。
+ */
+function buildPlatformDifferentialHint(
+  platformSaid: string | undefined,
+  suggestion: FieldSuggestion
+): string {
+  if (!platformSaid) return ""
+  // llmPrior 没有平台信息，不做事
+  if (suggestion.source === "llmPrior" || suggestion.source === "template") return ""
+
+  // 山姆/线下/盒马：规格可能不一样
+  if (/山姆|线下|盒马|超市/.test(platformSaid)) {
+    return `${platformSaid}这类平台规格可能不一样，我先按单件价格估，具体金额还是以订单为准。`
+  }
+  // 拼多多：可能更低一点
+  if (platformSaid === "拼多多") {
+    return "拼多多这次可能更低一点，"
+  }
+  // 京东/天猫/淘宝：和大部分历史平台接近时不特别提示
+  return ""
+}
+
+/** 平台采集文案：仅在用户没说平台时给参考。 */
+function buildPlatformGuidanceLine(suggestion: FieldSuggestion): string {
+  if (typeof suggestion.value === "string") {
+    return `${suggestion.reason}，没特别说就先按这个记。`
+  }
+  return ""
+}
+
+/**
+ * @deprecated 用 composeCollectionGuidance 代替。
+ * 保留空实现仅为兼容旧测试；新代码不应再调用。
+ */
+export function composeMissingFieldPrompt(_draft: AgentDraft): string | null {
+  return null
 }
 
 /**

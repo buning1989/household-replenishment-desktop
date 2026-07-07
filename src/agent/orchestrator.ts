@@ -24,6 +24,7 @@
 import type { AgentClarification, AgentDraft, AgentDraftStatus, OrderRow } from "./drafts"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { AppState } from "../types"
+import type { AgentPlan } from "./actions"
 
 /** 只读查询的回答。orchestrator 不再让 quick answer 直接吐字符串给 UI。 */
 export type AgentTurnAnswer = {
@@ -92,6 +93,58 @@ export type AgentTurnProposalBatch = {
   status: AgentDraftStatus
 }
 
+/**
+ * AgentPlan 待确认方案。
+ * 一次用户请求可以生成多个动作（建分类+加消耗品+记补货），统一封装在 plan 里。
+ * UI 渲染 AgentPlanCard，不直接读 actions 字段表。
+ * 用户确认前不写入 state；确认后由 commitAgentPlan 执行。
+ */
+export type AgentTurnPlanProposal = {
+  kind: "planProposal"
+  /** 管家口吻的处理方案文案，由 planner.composePlanMessage 生成 */
+  message: string
+  /** 待确认计划；用户确认后由 commitAgentPlan 消费 */
+  plan: AgentPlan
+}
+
+/** AgentPlan 确认后已写入 state。 */
+export type AgentTurnPlanCommitted = {
+  kind: "planCommitted"
+  /** 写入结果摘要 + 跳转入口提示，由 responseComposer 生成 */
+  message: string
+  /** 写入结果摘要，例如「已记下「猫砂」本次补货」 */
+  summary: string
+  /** 跳转入口：查看物品 / 查看分类 */
+  links: ChatMessageLink[]
+}
+
+/**
+ * Typed Command：用于替代旧的 __BATCH_CONFIRM__ 等魔法字符串。
+ *
+ * 当用户输入是确认/取消/修订意图但执行需要由 App.tsx 完成（因为涉及 state 写入或数组操作）时，
+ * orchestrator 返回一个 planCommand turn，由 App.tsx 读取 command 字段分发。
+ *
+ * - planConfirm：确认 pending plan，调用方应执行 commitAgentPlan
+ * - planCancel：取消 pending plan
+ * - batchConfirm / batchCancel / batchCancelIndex / batchReviseIndex / batchReviseAll：
+ *   订单截图导入的批量操作，沿用原批量处理逻辑（confirmBatch/cancelBatch 等）
+ */
+export type AgentPlanCommand =
+  | { command: "planConfirm" }
+  | { command: "planCancel" }
+  | { command: "batchConfirm" }
+  | { command: "batchCancel" }
+  | { command: "batchCancelIndex"; index: number }
+  | { command: "batchReviseIndex"; index: number }
+  | { command: "batchReviseAll" }
+
+/** 带 typed command 的 turn：App.tsx 读取 command 后分发到对应的处理函数。 */
+export type AgentTurnPlanCommand = {
+  kind: "planCommand"
+  message: string
+  command: AgentPlanCommand
+}
+
 /** 统一对话回合输出。UI 只渲染这个类型，不再直接渲染 AgentDraft。 */
 export type AgentTurn =
   | AgentTurnAnswer
@@ -100,6 +153,9 @@ export type AgentTurn =
   | AgentTurnCancelled
   | AgentTurnCommitted
   | AgentTurnProposalBatch
+  | AgentTurnPlanProposal
+  | AgentTurnPlanCommitted
+  | AgentTurnPlanCommand
 
 /** orchestrator 处理用户输入时需要的上下文。 */
 export type OrchestrateInput = {
@@ -113,6 +169,8 @@ export type OrchestrateInput = {
   pendingDraft?: AgentDraft
   /** 当前是否有 pending 批量草稿（订单导入） */
   pendingBatch?: AgentDraft[]
+  /** 当前是否有 pending AgentPlan（多动作计划）；存在时优先按修订/确认/取消处理 */
+  pendingPlan?: AgentPlan
   /** 对话日期上下文 */
   dateContext: import("../llm/householdChat").ChatDateContext
 }
@@ -126,14 +184,17 @@ export type OrchestrateDecision =
  * AgentOrchestrator 同步入口：根据用户输入和当前上下文，决定这一轮输出什么 AgentTurn。
  *
  * 决策优先级（高 → 低）：
- *   1. pending proposal + 用户确认 → committed（由调用方执行 commitAgentDraft 后构造）
- *   2. pending proposal + 用户取消 → cancelled
- *   3. pending proposal + 用户修订 → 新 proposal（supersede 旧的）
- *   4. pending proposal + 用户询问状态 → answer
- *   5. pending batch + 批量意图 → 批量处理（confirm/cancel/revise index/all）
- *   6. writeDraft 意图 + 本地可解析 → proposal 或 clarification
- *   7. 查询意图 + 本地可回答 → answer
- *   8. 其他 → needLlm（交给 LLM fallback）
+ *   1. pending plan + 用户确认 → 返回 typed command 让调用方执行 commitAgentPlan
+ *   2. pending plan + 用户取消 → 返回 cancelled turn
+ *   3. pending plan + 用户修订 → 生成新 planProposal，旧 plan 标记 superseded
+ *   4. pending plan + 用户询问状态 → answer
+ *   5. pending proposal（旧 AgentDraft）+ 用户确认/取消/修订 → 沿用旧 proposal 流程
+ *   6. pending batch + 批量意图 → 批量处理（typed command）
+ *   7. 新写入意图 + 本地 planner 可解析 → planProposal
+ *   8. 新写入意图 + 本地 drafts 可解析 → proposal 或 clarification
+ *   9. 查询意图 + 本地可回答 → answer
+ *   10. 对话边界（identity/realtime/casual）→ 本地自然回应
+ *   11. 其他 → needLlm（交给 LLM fallback）
  *
  * 注意：本函数是纯函数，不调用 LLM，不修改 state。
  * 调用方拿到 needLlm 时自行调用 askHouseholdAssistant，再把结果传给 normalizeLlmResponse。
