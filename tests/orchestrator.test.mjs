@@ -15,10 +15,11 @@ registerHooks({
   }
 })
 
-const { createHouseholdOrchestrator, isBatchIntentMarker } = await import("../src/agent/householdOrchestrator.ts")
+const { createHouseholdOrchestrator, isBatchIntentMarker, readTurnCommand } = await import("../src/agent/householdOrchestrator.ts")
 const { composeProposalMessage, composeCancelledMessage, composePendingReminder, composeRevisedMessage, findForbiddenPhrase } = await import("../src/agent/responseComposer.ts")
 const { buildLocalDraftFromText } = await import("../src/agent/drafts.ts")
 const { buildChatDateContext } = await import("../src/llm/householdChat.ts")
+const { createAgentPlan } = await import("../src/agent/actions.ts")
 
 function makeState(overrides = {}) {
   return {
@@ -42,7 +43,7 @@ function catItem(id, name, category = "宠物用品") {
 
 // ---------- 1. orchestrator.decide 统一入口 ----------
 
-test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 proposal turn", () => {
+test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 proposal turn（沿用旧 AgentDraft 流程）", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({
@@ -52,6 +53,7 @@ test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 proposal tu
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
+  // restock/createItem 沿用旧 proposal 流程，保持 confirm/cancel/revise 不变
   assert.equal(decision.turn.kind, "proposal")
   assert.equal(decision.turn.executableDraft.kind, "createItemWithRestock")
   assert.equal(decision.turn.executableDraft.item.itemName, "猫砂")
@@ -74,6 +76,57 @@ test("orchestrator: 有猫砂时「帮我加一袋猫砂」生成 restock propos
   assert.equal(decision.turn.kind, "proposal")
   assert.equal(decision.turn.executableDraft.kind, "restock")
   assert.equal(decision.turn.executableDraft.itemId, "i1")
+})
+
+// ---------- 1b. AgentPlan 新能力（planProposal）----------
+
+test("orchestrator: 「新建一个宠物用品分类」生成 planProposal turn（createCategory）", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({
+    text: "新建一个宠物用品分类",
+    state,
+    itemViews: [],
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planProposal")
+  assert.equal(decision.turn.plan.actions.length, 1)
+  assert.equal(decision.turn.plan.actions[0].type, "createCategory")
+  assert.equal(decision.turn.plan.actions[0].name, "宠物用品")
+  assert.ok(decision.turn.message.includes("宠物用品"))
+})
+
+test("orchestrator: 「这个月预算设成 500」生成 planProposal turn（setMonthlyBudget）", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({
+    text: "这个月预算设成 500",
+    state,
+    itemViews: [],
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planProposal")
+  assert.equal(decision.turn.plan.actions.length, 1)
+  assert.equal(decision.turn.plan.actions[0].type, "setMonthlyBudget")
+  assert.equal(decision.turn.plan.actions[0].amount, 500)
+})
+
+test("orchestrator: 「猫粮周期改成 30 天」生成 planProposal turn（updateItem）", () => {
+  const state = makeState({ items: [catItem("i1", "猫粮")] })
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({
+    text: "猫粮周期改成 30 天",
+    state,
+    itemViews: [],
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planProposal")
+  assert.equal(decision.turn.plan.actions.length, 1)
+  assert.equal(decision.turn.plan.actions[0].type, "updateItem")
+  assert.equal(decision.turn.plan.actions[0].cycleDays, 30)
 })
 
 test("orchestrator: 有猫砂时「帮我加一个猫砂」生成 clarification turn，不生成 draft", () => {
@@ -345,14 +398,115 @@ test("composer: composeCancelledMessage / composePendingReminder / composeRevise
   assert.equal(findForbiddenPhrase(composeRevisedMessage()), null)
 })
 
-// ---------- 7. isBatchIntentMarker ----------
+// ---------- 7. isBatchIntentMarker / readTurnCommand ----------
 
-test("orchestrator: isBatchIntentMarker 识别批量意图标记", () => {
-  assert.deepEqual(isBatchIntentMarker({ kind: "answer", message: "__BATCH_CONFIRM__" }), { intent: "batchConfirm" })
-  assert.deepEqual(isBatchIntentMarker({ kind: "answer", message: "__BATCH_CANCEL__" }), { intent: "batchCancel" })
-  assert.deepEqual(isBatchIntentMarker({ kind: "answer", message: "__BATCH_CANCEL_INDEX__:2" }), { intent: "batchCancelIndex", index: 2 })
-  assert.deepEqual(isBatchIntentMarker({ kind: "answer", message: "__BATCH_REVISE_INDEX__:1" }), { intent: "batchReviseIndex", index: 1 })
-  assert.deepEqual(isBatchIntentMarker({ kind: "answer", message: "__BATCH_REVISE_ALL__" }), { intent: "batchReviseAll" })
+test("orchestrator: isBatchIntentMarker 识别 typed command 批量意图", () => {
+  // typed command 替代旧的 __BATCH_CONFIRM__ 魔法字符串
+  assert.deepEqual(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "batchConfirm" } }), { intent: "batchConfirm" })
+  assert.deepEqual(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "batchCancel" } }), { intent: "batchCancel" })
+  assert.deepEqual(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "batchCancelIndex", index: 2 } }), { intent: "batchCancelIndex", index: 2 })
+  assert.deepEqual(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "batchReviseIndex", index: 1 } }), { intent: "batchReviseIndex", index: 1 })
+  assert.deepEqual(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "batchReviseAll" } }), { intent: "batchReviseAll" })
+  // 非 planCommand turn 返回 null
   assert.equal(isBatchIntentMarker({ kind: "answer", message: "普通回答" }), null)
   assert.equal(isBatchIntentMarker({ kind: "proposal", message: "x", executableDraft: {}, status: "pending" }), null)
+  // planConfirm/planCancel 不属于 batch 意图
+  assert.equal(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "planConfirm" } }), null)
+  assert.equal(isBatchIntentMarker({ kind: "planCommand", message: "", command: { command: "planCancel" } }), null)
+})
+
+test("orchestrator: readTurnCommand 读取 planConfirm/planCancel typed command", () => {
+  assert.deepEqual(readTurnCommand({ kind: "planCommand", message: "", command: { command: "planConfirm" } }), { command: "planConfirm" })
+  assert.deepEqual(readTurnCommand({ kind: "planCommand", message: "", command: { command: "planCancel" } }), { command: "planCancel" })
+  assert.deepEqual(readTurnCommand({ kind: "planCommand", message: "", command: { command: "batchConfirm" } }), { command: "batchConfirm" })
+  assert.equal(readTurnCommand({ kind: "answer", message: "普通回答" }), null)
+})
+
+// ---------- 8. pendingPlan 状态机（新 AgentPlan 流程） ----------
+
+test("orchestrator: pendingPlan + 「确认吧」→ planCommand(planConfirm)，调用方执行 commitAgentPlan", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const plan = createAgentPlan([{ type: "createCategory", name: "园艺" }], "建一个园艺分类")
+  const decision = orch.decide({
+    text: "确认吧",
+    state,
+    itemViews: [],
+    pendingPlan: plan,
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.deepEqual(decision.turn.command, { command: "planConfirm" })
+})
+
+test("orchestrator: pendingPlan + 「算了」→ planCommand(planCancel)", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const plan = createAgentPlan([{ type: "createCategory", name: "园艺" }], "建一个园艺分类")
+  const decision = orch.decide({
+    text: "算了",
+    state,
+    itemViews: [],
+    pendingPlan: plan,
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.deepEqual(decision.turn.command, { command: "planCancel" })
+})
+
+test("orchestrator: pendingPlan + 「记了吗」→ answer（提示还没写入）", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const plan = createAgentPlan([{ type: "setMonthlyBudget", amount: 500 }], "把预算设成 500")
+  const decision = orch.decide({
+    text: "记了吗",
+    state,
+    itemViews: [],
+    pendingPlan: plan,
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "answer")
+  assert.ok(decision.turn.message.includes("还没真正写入"))
+})
+
+test("orchestrator: pendingPlan + 「价格改成 68」→ planProposal(修订后)", () => {
+  const state = makeState({ items: [catItem("i1", "猫砂")] })
+  const orch = createHouseholdOrchestrator()
+  const plan = createAgentPlan([{
+    type: "recordRestock", itemName: "猫砂", itemId: "i1", qty: 1, price: 58
+  }], "刚买了猫砂花了 58")
+  const decision = orch.decide({
+    text: "价格改成 68",
+    state,
+    itemViews: [],
+    pendingPlan: plan,
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planProposal")
+  assert.notEqual(decision.turn.plan.actions[0].price, 58)
+  assert.equal(decision.turn.plan.actions[0].price, 68)
+})
+
+test("orchestrator: pendingPlan + 新建分类请求 → 生成新 planProposal（旧 plan 由 App.tsx 标 superseded）", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  // 旧的 pending plan：建园艺分类
+  const oldPlan = createAgentPlan([{ type: "createCategory", name: "园艺" }], "新建一个园艺分类")
+  // 用户改主意，发新请求：新建一个宠物用品分类（plan-only 能力，走 planProposal）
+  const decision = orch.decide({
+    text: "新建一个宠物用品分类",
+    state,
+    itemViews: [],
+    pendingPlan: oldPlan,
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planProposal")
+  assert.notEqual(decision.turn.plan, oldPlan)
+  assert.equal(decision.turn.plan.actions[0].type, "createCategory")
+  assert.equal(decision.turn.plan.actions[0].name, "宠物用品")
 })

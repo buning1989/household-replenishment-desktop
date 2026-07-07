@@ -26,7 +26,7 @@ import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, bu
 import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent, classifyAgentIntent } from "./agent/intent"
-import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
+import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, commitAgentPlan, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
 import { buildAgentContextPack, supersedeOldPendingDraft } from "./agent/conversationContext"
 import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
@@ -51,8 +51,9 @@ import {
   getMeasureBaseAmount as getOptionMeasureBaseAmount,
   type MeasureUnitDefinition
 } from "./orderImportHelpers"
-import { createHouseholdOrchestrator, isBatchIntentMarker } from "./agent/householdOrchestrator"
-import type { AgentTurn } from "./agent/orchestrator"
+import { createHouseholdOrchestrator, isBatchIntentMarker, readTurnCommand } from "./agent/householdOrchestrator"
+import type { AgentPlanCommand, AgentTurn } from "./agent/orchestrator"
+import type { AgentPlan } from "./agent/actions"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, ItemComputed, ItemDraft, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
@@ -547,6 +548,15 @@ function App() {
     return { summary: result.summary, links: result.links, observation: result.observation }
   }
 
+  // AgentPlan 确认：所有写入复用 commitAgentPlan → applyAgentAction → domain 逻辑。
+  // 不在 App.tsx 里手写新的 agent 写入路径；确认前不修改 state。
+  function handleAgentPlanConfirm(plan: AgentPlan): { summary: string; links: AgentMessageLink[]; observation?: string } {
+    const dateContext = buildChatDateContext()
+    const result = commitAgentPlan(state, plan, Date.now(), dateContext, seenObservationKeysRef.current)
+    if (result.state !== state) commit(result.state)
+    return { summary: result.summary, links: result.links, observation: result.observation }
+  }
+
   function addCategory(name: string): string | undefined {
     const normalized = name.trim()
     if (!normalized) return undefined
@@ -902,6 +912,7 @@ function App() {
 	          onQuestionSent={setHouseholdChatLastQuestion}
 	          onConfirmDraft={handleAgentDraftConfirm}
           onConfirmBatch={handleAgentDraftBatchConfirm}
+          onConfirmPlan={handleAgentPlanConfirm}
           onOpenItem={(itemId) => {
             closeChatWithSessionUpdate()
             setDetailItemId(itemId)
@@ -1393,6 +1404,96 @@ function AgentDraftCard({ draft, status, onConfirm, onCancel, onDraftChange }: {
   )
 }
 
+/**
+ * AgentPlanCard：多动作计划的确认卡片。
+ *
+ * 与 AgentDraftCard 的区别：
+ *   - AgentDraftCard 是单条草稿（restock / createItem 等），有内联字段编辑
+ *   - AgentPlanCard 是一组动作（建分类 / 设预算 / 改周期 等），只展示 + 确认/取消
+ *
+ * 确认前不写 state；确认后由 commitAgentPlan 统一执行。
+ * 修订由对话完成（如「周期改成 45 天」），卡片本身不提供内联编辑。
+ */
+function AgentPlanCard({ plan, status, onConfirm, onCancel }: {
+  plan: AgentPlan
+  status: "pending" | "confirmed" | "cancelled" | "superseded"
+  onConfirm: () => void
+  onCancel: () => void
+}) {
+  const statusLabel = status === "pending"
+    ? "准备处理"
+    : status === "confirmed"
+      ? "已执行"
+      : status === "cancelled"
+        ? "已取消"
+        : "已替代"
+
+  return (
+    <div className={`chat-action-card is-${status}`}>
+      <div className="chat-action-card-head">
+        <span>{statusLabel}</span>
+      </div>
+      <ol className="chat-plan-action-list">
+        {plan.actions.map((action, index) => (
+          <li key={index}>{summarizeActionForCard(action)}</li>
+        ))}
+      </ol>
+      {status === "pending" && (
+        <>
+          <div className="chat-action-card-actions">
+            <button type="button" className="quiet-button compact" onClick={onCancel}>先不处理</button>
+            <button type="button" className="primary-button compact green" onClick={onConfirm}>就这么执行</button>
+          </div>
+          <small className="chat-action-hint">想调整的话直接说，比如「预算改成 800」或「周期 45 天」。</small>
+        </>
+      )}
+      {status === "confirmed" && (
+        <small className="chat-action-hint">已写入。点上方链接查看。</small>
+      )}
+    </div>
+  )
+}
+
+/** AgentPlanCard 里每条动作的摘要。只读字段，不做 validation。 */
+function summarizeActionForCard(action: import("./agent/actions").AgentAction): string {
+  switch (action.type) {
+    case "createCategory":
+      return `新建分类「${action.name}」`
+    case "createItem": {
+      const parts = [`添加消耗品「${action.name}」 · 分类 ${action.category} · 周期 ${action.cycleDays} 天`]
+      if (action.addPurchaseOption?.productName) parts.push(`常购商品 ${action.addPurchaseOption.productName}`)
+      return parts.join(" · ")
+    }
+    case "updateItem": {
+      const changes: string[] = []
+      if (action.cycleDays !== undefined) changes.push(`周期 ${action.cycleDays} 天`)
+      if (action.bufferDays !== undefined) changes.push(`提前 ${action.bufferDays} 天`)
+      if (action.category) changes.push(`分类 ${action.category}`)
+      if (action.unit) changes.push(`单位 ${action.unit}`)
+      return `修改「${action.itemName || action.itemId}」：${changes.join("，") || "无变更"}`
+    }
+    case "addPurchaseOption":
+      return `常购商品「${action.productName}」挂到「${action.itemName}」下`
+    case "recordRestock": {
+      const parts = [`记补货「${action.itemName}」`]
+      if (action.qty) parts.push(`${action.qty}${action.unit || "件"}`)
+      if (action.platform) parts.push(action.platform)
+      if (action.price !== undefined) parts.push(`¥${action.price}`)
+      return parts.join(" · ")
+    }
+    case "updateRestockRecord": {
+      const changes: string[] = []
+      if (action.patch.price !== undefined) changes.push(`价格 ¥${action.patch.price}`)
+      if (action.patch.platform) changes.push(`平台 ${action.patch.platform}`)
+      return `改补货记录：${changes.join("，") || "无变更"}`
+    }
+    case "setMonthlyBudget":
+      return `本月预算设为 ¥${action.amount}`
+    default:
+      return "（未实现的动作）"
+  }
+}
+
 /** 批量待确认草稿卡片：订单截图导入后在对话中展示，支持逐条跳过与全部确认。 */
 function AgentDraftBatchCard({ drafts, statuses, result, skippedRows, uncertainRows, onConfirmBatch, onCancelBatch, onSkipIndex, onOpenItem }: {
   drafts: AgentDraft[]
@@ -1556,7 +1657,7 @@ function AgentDraftBatchCard({ drafts, statuses, result, skippedRows, uncertainR
   )
 }
 
-function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode, seenObservationKeys }: {
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onConfirmPlan, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode, seenObservationKeys }: {
   state: AppState
   itemViews: ItemView[]
   messages: HouseholdChatMessage[]
@@ -1564,6 +1665,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   onQuestionSent: (question: string) => void
   onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[]; observation?: string }
   onConfirmBatch: (drafts: AgentDraft[]) => { summary: string; links: AgentMessageLink[]; observation?: string }
+  onConfirmPlan: (plan: AgentPlan) => { summary: string; links: AgentMessageLink[]; observation?: string }
   onOpenItem: (itemId: string) => void
   onOpenCategory: (category: string) => void
   onClose: () => void
@@ -1596,6 +1698,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     }
     return result
   }, [messages])
+  // loading 重复修复：transient message 已经承担 loading 指示，
+  // 此时若末条可见消息是 transient，不再追加额外的 loading 气泡，避免双气泡。
+  const lastVisibleIsTransient = visibleMessages.length > 0
+    ? Boolean(visibleMessages[visibleMessages.length - 1].message.isTransient)
+    : false
 		  const quickQuestions = [
 	    "今天优先补什么？",
 	    "这周可能要补什么？",
@@ -1608,6 +1715,14 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	    }
 	    return -1
 	  }
+
+  // AgentPlan 状态机：找到最近一条 planStatus === "pending" 的 agentPlan 消息。
+  function latestPendingPlanMessageIndex(list: HouseholdChatMessage[]): number {
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      if (list[index].role === "assistant" && list[index].planStatus === "pending" && list[index].agentPlan) return index
+    }
+    return -1
+  }
 
 	  // 文案统一由 responseComposer 生成；draftIntro / buildPendingDraftReminder / safeQueryFallback
 	  // 已下线，全部收敛到 composeProposalMessage / composePendingReminder / composeFallbackMessage。
@@ -1631,6 +1746,29 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  function cancelAgentDraft(messageIndex: number, baseMessages = messages) {
     onMessagesChange(baseMessages.map((message, index) => index === messageIndex
       ? { ...message, draftStatus: "cancelled" as const }
+      : message))
+  }
+
+  // AgentPlan 确认：调用 onConfirmPlan 写入 state，标记 confirmed，追加结果消息。
+  // 确认前不写入；写入后观察命中时拼接到结果消息末尾。
+  function confirmAgentPlan(messageIndex: number, baseMessages = messages) {
+    const message = baseMessages[messageIndex]
+    if (!message?.agentPlan) return
+    const result = onConfirmPlan(message.agentPlan)
+    const content = result.observation
+      ? `${result.summary} ${result.observation}`
+      : result.summary
+    onMessagesChange([
+      ...baseMessages.map((current, index) => index === messageIndex
+        ? { ...current, planStatus: "confirmed" as const }
+        : current),
+      { role: "assistant" as const, content, links: result.links }
+    ])
+  }
+
+  function cancelAgentPlan(messageIndex: number, baseMessages = messages) {
+    onMessagesChange(baseMessages.map((message, index) => index === messageIndex
+      ? { ...message, planStatus: "cancelled" as const }
       : message))
   }
 
@@ -1825,19 +1963,23 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       return
     }
     setError(null)
-    // 用户消息（含缩略图）+ 管家「看一眼」提示
-    const baseMessages: HouseholdChatMessage[] = [
+    // 用户消息（含缩略图）+ 管家「看一眼」transient 提示
+    // transient 作为 loading 指示，识别完成后会被替换掉，不进入长期历史
+    const userMessages: HouseholdChatMessage[] = [
       ...messages,
       {
         role: "user",
         content: userContent,
         imageAttachments: [{ name: file.name, dataUrl }]
-      },
-      { role: "assistant", content: composeOrderRecognizingMessage() }
+      }
     ]
-    onMessagesChange(baseMessages)
+    const transient: HouseholdChatMessage = {
+      role: "assistant",
+      content: composeOrderRecognizingMessage(),
+      isTransient: true
+    }
+    onMessagesChange([...userMessages, transient])
     setLoading(true)
-    setLoadingText("我看一下这张订单。")
     // 构造 catalog：与 OrderImportModal 一致，按最近活跃度排序
     const catalog = [...state.items]
       .sort((a, b) => {
@@ -1852,13 +1994,14 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const result = await extractOrderFromImage(orderImageApiKey, dataUrl, catalog, orderImageModel, orderRecognitionMode || "accurate")
     setLoading(false)
     setLoadingText(null)
+    // 用最终消息替换 transient：base 用 userMessages（不含 transient）
     if (!result.ok) {
-      onMessagesChange([...baseMessages, { role: "assistant", content: result.error }])
+      onMessagesChange([...userMessages, { role: "assistant", content: result.error }])
       return
     }
     const rows = buildOrderImportRowsFromExtract(result.order, state.items, state.categories, 0)
     if (rows.length === 0) {
-      onMessagesChange([...baseMessages, { role: "assistant", content: "我看了下这张订单，暂时没识别到需要管理的消耗品。" }])
+      onMessagesChange([...userMessages, { role: "assistant", content: "我看了下这张订单，暂时没识别到需要管理的消耗品。" }])
       return
     }
     // 管家口吻总结：识别到几样，命中已有的有哪些，准备新建的有哪些
@@ -1866,7 +2009,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const skippedRows = rows.filter((row) => row.targetItem === "__skip__")
     const message = composeOrderImportSummary(rows, result.order.platform)
     onMessagesChange([
-      ...baseMessages,
+      ...userMessages,
       {
         role: "assistant",
         content: message,
@@ -1929,6 +2072,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     }
     const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
     const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
+    const pendingPlanMessageIndex = latestPendingPlanMessageIndex(messages)
+    const pendingPlan = pendingPlanMessageIndex >= 0 ? messages[pendingPlanMessageIndex].agentPlan : undefined
     const dateContext = buildChatDateContext()
 
     // 统一管家决策层：所有路径都先经过 orchestrator.decide
@@ -1937,17 +2082,18 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       state,
       itemViews,
       pendingDraft,
+      pendingPlan,
       dateContext
     })
 
     // 响应节奏层：根据意图/turn/上下文决定这一轮的最小延迟和 loading 文案。
     // 用 transient assistant message 显示过程态，让用户看到「管家正在处理」。
-    const pacingIntent = classifyAgentIntent(text, Boolean(pendingDraft))
+    const pacingIntent = classifyAgentIntent(text, Boolean(pendingDraft || pendingPlan))
     const timing = getResponseTiming({
       text,
       intent: pacingIntent,
       turn: decision.kind === "sync" ? decision.turn : null,
-      hasPendingDraft: Boolean(pendingDraft)
+      hasPendingDraft: Boolean(pendingDraft || pendingPlan)
     })
 
     if (decision.kind === "sync") {
@@ -1955,6 +2101,22 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       // 批量意图标记：交回外层 batch 处理函数（应该在上面已处理，走到这里说明 batch 已失效）
       if (isBatchIntentMarker(turn)) {
         // 仍走节奏，避免秒回
+        await waitWithTransient(nextMessages, timing)
+        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
+        return
+      }
+      // AgentPlan 命令（planConfirm / planCancel）：typed command，立即反馈，不显示思考
+      const planCmd = readTurnCommand(turn)
+      if (planCmd) {
+        if (planCmd.command === "planConfirm" && pendingPlanMessageIndex >= 0) {
+          confirmAgentPlan(pendingPlanMessageIndex, nextMessages)
+          return
+        }
+        if (planCmd.command === "planCancel" && pendingPlanMessageIndex >= 0) {
+          cancelAgentPlan(pendingPlanMessageIndex, nextMessages)
+          return
+        }
+        // 其他 typed command（batch 类）走到这里说明 batch 已失效，给个兜底
         await waitWithTransient(nextMessages, timing)
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
         return
@@ -1969,8 +2131,18 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         cancelAgentDraft(pendingMessageIndex, nextMessages)
         return
       }
-      // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal）：走节奏
+      // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal / planProposal）：走节奏
       await waitWithTransient(nextMessages, timing)
+      if (turn.kind === "planProposal") {
+        // 旧 pendingPlan（若有）标 superseded，新 plan 标 pending
+        const base = pendingPlanMessageIndex >= 0
+          ? nextMessages.map((message, index) => index === pendingPlanMessageIndex
+            ? { ...message, planStatus: "superseded" as const }
+            : message)
+          : nextMessages
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const }])
+        return
+      }
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft !== pendingDraft) {
         // 修订：旧 pending 标 superseded，新 draft 标 pending
         const base = nextMessages.map((message, index) => index === pendingMessageIndex
@@ -2097,6 +2269,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     if (turn.kind === "proposal") {
       return { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }
     }
+    if (turn.kind === "planProposal") {
+      return { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const }
+    }
     if (turn.kind === "clarification") {
       return {
         role: "assistant",
@@ -2161,7 +2336,15 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 		                        onCancel={() => cancelAgentDraft(index)}
 		                        onDraftChange={(next) => reviseDraftInPlace(index, next)}
 		                      />
-		                    )}
+	                    )}
+	                    {message.agentPlan && (
+	                      <AgentPlanCard
+	                        plan={message.agentPlan}
+	                        status={message.planStatus || "pending"}
+	                        onConfirm={() => confirmAgentPlan(index)}
+	                        onCancel={() => cancelAgentPlan(index)}
+	                      />
+	                    )}
 	                    {message.clarification && (
 	                      <div className="chat-clarification-card">
 	                        <div className="chat-clarification-options">
@@ -2243,7 +2426,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	                </div>
 	              ))
             )}
-            {loading && (
+            {loading && !lastVisibleIsTransient && (
               <div className="chat-message assistant is-loading">
                 <p>{loadingText || "…"}</p>
               </div>

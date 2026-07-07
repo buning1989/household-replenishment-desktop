@@ -1,10 +1,11 @@
-import { createItem, restockItem } from "../domain"
+import { createItem, restockItem, updateItemFromDraft, updateRestockRecord } from "../domain"
 import type { AppState, PurchaseOption, ReplenishmentItem } from "../types"
 import { fuzzyMatchItem, type ExtractedOrder, type ExtractedOrderLine } from "../llm/orderImport"
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import { createItemDraftFromName, findItemMatch, type AgentDraft, type CreateItemDraft, type OrderRow, type RestockDraftDetails } from "./drafts"
 import { buildPostCommitObservation } from "./observations"
 import type { ChatDateContext } from "../llm/householdChat"
+import type { AgentAction, AgentPlan } from "./actions"
 
 export type AgentMessageLink = {
   label: string
@@ -125,10 +126,12 @@ export function buildAgentDraftsFromOrderRows(
   return drafts
 }
 
-/** 可变工作区：批量写入时多个草稿共享同一份 categories/items。 */
+/** 可变工作区：批量写入时多个草稿/动作共享同一份 categories/items。
+ *  settings 仅 setMonthlyBudget 等设置类 action 使用；旧 commitAgentDraft 不初始化此字段。 */
 export type AgentWorkState = {
   categories: string[]
   items: ReplenishmentItem[]
+  settings?: AppState["settings"]
 }
 
 function norm(value: string): string {
@@ -592,4 +595,261 @@ export function mapOrderLinesToDrafts(
   }
 
   return { drafts, skippedRows, uncertainRows }
+}
+
+// ---------- AgentPlan 执行入口（与 AgentDraft 并存的新协议） ----------
+
+/** 在工作区里按 itemId 优先、itemName 兜底查找物品。用于 applyAgentAction。 */
+function findWorkItem(work: AgentWorkState, itemId?: string, itemName?: string): ReplenishmentItem | undefined {
+  if (itemId) {
+    const byId = work.items.find((item) => item.id === itemId)
+    if (byId) return byId
+  }
+  if (itemName) {
+    // 复用 drafts.ts 的匹配逻辑（exact > synonym > substring）
+    const stateLike: AppState = { categories: work.categories, items: work.items, settings: {} as AppState["settings"], householdProfile: null, updatedAt: 0, version: 3 }
+    const match = findItemMatch(stateLike, itemName)
+    if (match.item) return match.item
+    // 兜底：裸 substring
+    const lowered = norm(itemName)
+    return work.items.find((item) => norm(item.name).includes(lowered) || lowered.includes(norm(item.name)))
+  }
+  return undefined
+}
+
+function linkItem(links: AgentMessageLink[], item: ReplenishmentItem) {
+  links.push({ label: `查看「${item.name}」`, target: { kind: "item", itemId: item.id } })
+}
+
+function linkCategory(links: AgentMessageLink[], category: string) {
+  links.push({ label: `查看「${category}」分类`, target: { kind: "category", category } })
+}
+
+function ensureWorkCategory(work: AgentWorkState, category: string) {
+  if (!work.categories.some((c) => norm(c) === norm(category))) {
+    work.categories = [...work.categories, category]
+  }
+}
+
+/**
+ * 把单个 AgentAction 应用到可变工作区。
+ * 所有写入复用 domain 逻辑（createItem / restockItem / updateRestockRecord / updateItemFromDraft）。
+ * 不修改 state，调用方负责拼装新 state。
+ *
+ * 返回写入摘要；找不到目标/重复/异常时返回带「跳过/未变更」字样的摘要，不抛错。
+ */
+export function applyAgentAction(
+  work: AgentWorkState,
+  action: AgentAction,
+  now: number,
+  links: AgentMessageLink[]
+): string {
+  switch (action.type) {
+    case "createCategory": {
+      if (work.categories.some((c) => norm(c) === norm(action.name))) {
+        linkCategory(links, action.name)
+        return `没有创建新分类。「${action.name}」已存在。`
+      }
+      work.categories = [...work.categories, action.name]
+      linkCategory(links, action.name)
+      return `已新建分类：${action.name}。`
+    }
+
+    case "createItem": {
+      const existing = findWorkItem(work, undefined, action.name)
+      if (existing) {
+        linkItem(links, existing)
+        return `没有创建新消耗品。「${existing.name}」已存在。`
+      }
+      ensureWorkCategory(work, action.category)
+      const draft: import("../types").ItemDraft = {
+        name: action.name,
+        category: action.category,
+        cycleDays: action.cycleDays,
+        bufferDays: action.bufferDays,
+        link: "",
+        remainingDays: "",
+        learningEnabled: true,
+        unit: action.unit,
+        defaultQty: "",
+        platform: "",
+        purchaseOptions: action.addPurchaseOption
+          ? [{
+              id: crypto.randomUUID(),
+              productName: action.addPurchaseOption.productName,
+              unit: action.addPurchaseOption.unit || action.unit,
+              pricingMode: "spec"
+            }]
+          : []
+      }
+      const item = createItem(draft, now)
+      work.items = [...work.items, item]
+      linkItem(links, item)
+      return action.addPurchaseOption
+        ? `已创建：消耗品「${item.name}」，并挂上常购商品「${action.addPurchaseOption.productName}」。`
+        : `已创建：消耗品「${item.name}」。`
+    }
+
+    case "updateItem": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return `没有修改。找不到消耗品「${action.itemName || action.itemId}」。`
+      }
+      const nextDraft: import("../types").ItemDraft = {
+        name: action.name ?? target.name,
+        category: action.category ?? target.category,
+        cycleDays: action.cycleDays ?? target.cycleDays,
+        bufferDays: action.bufferDays ?? target.bufferDays,
+        link: target.link ?? "",
+        remainingDays: "",
+        learningEnabled: target.learningEnabled ?? true,
+        unit: action.unit ?? target.unit ?? "件",
+        defaultQty: target.defaultQty?.toString() ?? "",
+        platform: target.platform ?? "",
+        purchaseOptions: target.purchaseOptions
+      }
+      const updated = updateItemFromDraft(target, nextDraft)
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return `已修改：消耗品「${updated.name}」。`
+    }
+
+    case "addPurchaseOption": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return `没有添加。找不到消耗品「${action.itemName}」。`
+      }
+      if (target.purchaseOptions.some((opt) => norm(opt.productName) === norm(action.productName))) {
+        linkItem(links, target)
+        return `没有创建新内容。「${target.name}」下已有常购商品「${action.productName}」。`
+      }
+      const option: PurchaseOption = {
+        id: crypto.randomUUID(),
+        productName: action.productName,
+        unit: action.unit || target.unit || "件",
+        pricingMode: "spec"
+      }
+      const updated = {
+        ...target,
+        purchaseOptions: [...target.purchaseOptions, option],
+        updatedAt: now
+      }
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return `已添加：常购商品「${action.productName}」挂到「${target.name}」下。`
+    }
+
+    case "recordRestock": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return `没有记录补货。找不到消耗品「${action.itemName}」。`
+      }
+      const itemForRestock = action.cycleDaysPatch
+        ? { ...target, cycleDays: action.cycleDaysPatch, updatedAt: now }
+        : target
+      const restocked = restockItem(
+        itemForRestock, now, action.price, action.qty, action.platform, undefined,
+        action.purchaseProductName || target.name, action.unit || target.unit,
+        undefined, undefined, action.purchaseMeasureAmount, action.purchaseMeasureUnit,
+        action.review, action.restockDate
+      )
+      work.items = work.items.map((item) => item.id === target.id ? restocked : item)
+      linkItem(links, restocked)
+      return `已记录：${restocked.name} 本次补货。`
+    }
+
+    case "updateRestockRecord": {
+      const target = findWorkItem(work, action.itemId, undefined)
+      if (!target) {
+        return `没有修改。找不到物品 ${action.itemId}。`
+      }
+      const eventId = action.eventId || target.history[target.history.length - 1]?.id
+      if (!eventId) {
+        return `没有修改。${target.name} 还没有补货记录。`
+      }
+      const existing = target.history.find((e) => e.id === eventId)
+      if (!existing) {
+        return `没有修改。找不到补货记录 ${action.eventId}。`
+      }
+      const patch = {
+        at: action.patch.at ?? existing.at,
+        qty: action.patch.qty ?? existing.qty ?? 1,
+        price: action.patch.price ?? existing.price ?? 0,
+        platform: action.patch.platform ?? existing.platform,
+        review: action.patch.review ?? existing.review,
+        purchaseMeasureAmount: action.patch.purchaseMeasureAmount ?? existing.purchaseMeasureAmount,
+        purchaseMeasureUnit: action.patch.purchaseMeasureUnit ?? existing.purchaseMeasureUnit
+      }
+      const updated = updateRestockRecord(target, eventId, patch, now)
+      work.items = work.items.map((item) => item.id === target.id ? updated : item)
+      linkItem(links, updated)
+      return `已修改：${updated.name} 的补货记录。`
+    }
+
+    case "setMonthlyBudget": {
+      work.settings = { ...(work.settings || ({} as AppState["settings"])), monthlyBudget: action.amount }
+      return `已设置本月预算：¥${action.amount}。`
+    }
+
+    default: {
+      // 类型已约束，走到这里说明是未实现的第二期 action
+      return `未实现：${(action as { type: string }).type} 动作本期不支持。`
+    }
+  }
+}
+
+/**
+ * 执行整个 AgentPlan。按顺序应用每个 action，任一失败不阻塞后续。
+ * 中高风险 plan 必须处于 confirmed 状态（由调用方保证，这里不再检查）。
+ *
+ * 写入后观察：取最重要的一条命中（与 commitAgentDraftBatch 行为对齐）。
+ */
+export function commitAgentPlan(
+  state: AppState,
+  plan: AgentPlan,
+  now: number = Date.now(),
+  dateContext?: ChatDateContext,
+  seenObservationKeys?: Set<string>
+): AgentCommitResult {
+  const links: AgentMessageLink[] = []
+  const work: AgentWorkState = {
+    categories: [...state.categories],
+    items: [...state.items],
+    settings: { ...state.settings }
+  }
+  const summaries: string[] = []
+  for (const action of plan.actions) {
+    const summary = applyAgentAction(work, action, now, links)
+    if (summary) summaries.push(summary)
+  }
+  const nextState: AppState = {
+    ...state,
+    categories: work.categories,
+    items: work.items,
+    settings: work.settings || state.settings,
+    updatedAt: now
+  }
+
+  // 写入后观察：对涉及补货的 action 运行判定，取第一条命中
+  let observation: string | undefined
+  if (dateContext) {
+    for (const action of plan.actions) {
+      if (action.type !== "recordRestock" && action.type !== "createItem") continue
+      const itemName = action.type === "recordRestock" ? action.itemName : action.name
+      const targetItem = nextState.items.find((item) => norm(item.name) === norm(itemName))
+      if (!targetItem) continue
+      const obs = buildPostCommitObservation(targetItem, dateContext, seenObservationKeys)
+      if (obs?.text) {
+        observation = obs.text
+        break
+      }
+    }
+  }
+
+  return {
+    state: nextState,
+    summary: summaries.join("\n"),
+    links,
+    observation
+  }
 }

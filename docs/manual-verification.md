@@ -294,3 +294,137 @@
 3. **长时间运行后的内存泄漏**：未做长时间运行测试，`setInterval` 每分钟触发 `checkReminders` 和 `checkBudgetNotification` 看起来无泄漏风险。
 
 4. **IPC 通信异常**：`state:load` IPC 的异常处理已在 reconcileState 中通过 try-catch 兜底，但未模拟主进程崩溃场景。
+
+---
+
+## AgentPlan 第一阶段验证
+
+> 日期：2026-07-07
+> 关联文档：docs/agent-action-routing.md
+> 验证目标：建分类 / 设预算 / 改周期走 planProposal，旧 Draft 流程不变形，loading 不重复，订单截图不残留假消息。
+
+### 验证 A1：建分类（planProposal → confirm 写入）
+
+**步骤**：
+1. 打开 403管家对话框
+2. 输入 "新建一个猫咪用品分类"
+3. 检查对话返回
+4. 输入 "确认"
+
+**预期**：
+- 第 2 步返回 `AgentPlanCard`，标题"准备处理"，列 1 条动作"新建分类「猫咪用品」"
+- 卡片显示"先不处理"和"就这么执行"两个按钮
+- 此时分类的 state **未变化**（侧栏不出现"猫咪用品"）
+- 第 4 步后：原卡片标题变为"已执行"，新增一条 assistant 消息"已新建分类：猫咪用品。"，侧栏出现"猫咪用品"分类
+
+### 验证 A2：设置预算（planProposal → confirm 写入）
+
+**步骤**：
+1. 输入 "这个月预算设成 500"
+2. 检查卡片
+3. 输入 "确认"
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`，列 1 条动作"本月预算设为 ¥500"
+- 此前 budget state **未变化**
+- 第 3 步后：新增 assistant 消息"已设置本月预算：¥500。"，打开设置面板可见月预算显示 500
+
+### 验证 A3：修改周期（planProposal → 修订 → confirm）
+
+**步骤**：
+1. state 中已有"猫砂"（周期 14 天）
+2. 输入 "猫砂周期改成 30 天"
+3. 输入 "周期改成 20 天"（修订）
+4. 输入 "确认"
+
+**预期**：
+- 第 2 步返回 `AgentPlanCard`，列 1 条动作"修改「猫砂」：周期 30 天"
+- 第 3 步返回新 `AgentPlanCard`，标题含"我按你说的改了一下"，列"修改「猫砂」：周期 20 天"；原卡片标题变为"已替代"
+- 第 4 步后：新增 assistant 消息"已修改：消耗品「猫砂」。"，打开猫砂详情可见周期 20 天
+
+### 验证 A4：保持旧 Draft 流程（restock 不回退）
+
+**步骤**：
+1. state 中已有"猫砂"
+2. 输入 "帮我加一袋猫砂"
+3. 输入 "45"（补价格）
+4. 输入 "确认"
+
+**预期**：
+- 第 2 步返回 `AgentDraftCard`（旧卡片，非 `AgentPlanCard`），草稿 kind=restock
+- 卡片 receipt 行显示"猫砂 × 1袋 · ¥45"等已填字段
+- 第 3 步草稿价格补为 45，新卡片标题"我按你说的改了一下"
+- 第 4 步后：新增 assistant 消息"已记录：猫砂 本次补货。"，猫砂详情出现新补货记录
+
+### 验证 A5：loading 不重复（双气泡修复）
+
+**步骤**：
+1. 输入任意需要等待的回答（如未配置 AI Key 时输入"今天优先补什么"，或上传订单截图）
+2. 观察等待过程中的气泡
+
+**预期**：
+- 只出现一个 loading 指示：
+  - sync 路径：一个 transient message（带"我看一下当前记录。"等场景化文案，灰色），不出现底部三点 loading 气泡
+  - LLM 路径：一个 transient message，不出现底部三点 loading 气泡
+  - 订单截图：一个 transient message"我看一下这张订单。"，不出现底部三点 loading 气泡
+- 最终结果返回后，transient 消息被替换，不残留
+
+### 验证 A6：订单截图 transient 不残留
+
+**步骤**：
+1. 上传一张订单截图
+2. 等待识别完成
+3. 观察消息列表
+
+**预期**：
+- 识别过程中：用户消息（含缩略图）+ transient"我看一下这张订单。"（灰色，仅一个气泡）
+- 识别完成后：transient 消失，被识别结果消息替换（含 orderImportRows）
+- 历史消息中不残留"我看一下这张订单。"假消息
+
+### 验证 A7：planProposal 取消
+
+**步骤**：
+1. 输入 "新建一个宠物用品分类"
+2. 点"先不处理"按钮（或输入"算了"）
+
+**预期**：
+- 卡片标题变为"已取消"
+- state 中不出现"宠物用品"分类
+- 不新增 assistant 消息
+
+### 验证 A8：planProposal 与查询不冲突
+
+**步骤**：
+1. 输入 "新建一个宠物用品分类"（生成 pendingPlan）
+2. 不确认，直接输入 "猫砂还剩多少"
+
+**预期**：
+- 第 2 步返回 answer（query 路径，调 LLM 或 quick answer）
+- 原 pendingPlan 卡片状态不变（仍是 pending，可继续确认或取消）
+- 不生成新 plan 覆盖旧 plan
+
+### 验证 A9：planProposal 被 superseded
+
+**步骤**：
+1. 输入 "新建一个宠物用品分类"（pendingPlan 1）
+2. 不确认，直接输入 "新建一个猫咪用品分类"
+
+**预期**：
+- 第 2 步返回新 `AgentPlanCard`（猫咪用品）
+- 原 pendingPlan 1 卡片标题变为"已替代"
+- state 中无任何分类（两次都没写入）
+
+### 验证 A10：AgentPlanCard 状态检查点（组件级）
+
+如果未来引入 React 组件测试框架，以下检查点需覆盖：
+1. pending 状态显示"先不处理"和"就这么执行"按钮，aria-label 正确
+2. confirmed 状态不显示按钮，显示"已写入。点上方链接查看。"
+3. cancelled 状态不显示按钮，标题"已取消"
+4. superseded 状态不显示按钮，标题"已替代"
+5. plan 含多 action 时按 `<ol>` 顺序展示，每个 `<li>` 含动作摘要
+6. 点"就这么执行"调用 `onConfirm` → `confirmAgentPlan` → `commitAgentPlan`
+7. 点"先不处理"调用 `onCancel` → `cancelAgentPlan`（不写 state）
+8. cancelled/superseded 状态的按钮不重复触发
+
+当前无 React 组件测试环境，以上检查点在手动 QA 中验证。
+

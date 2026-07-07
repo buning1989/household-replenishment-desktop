@@ -139,12 +139,12 @@ export function parseAmount(value: string | undefined): number | undefined {
   return CHINESE_DIGITS[value]
 }
 
-function parseQty(text: string): { qty?: number; unit?: string } {
+export function parseQty(text: string): { qty?: number; unit?: string } {
   const match = text.match(new RegExp(`([一二两三四五六七八九十\\d]+)\\s*(${UNIT_PATTERN})`))
   return { qty: parseAmount(match?.[1]), unit: match?.[2] }
 }
 
-function parsePrice(text: string): number | undefined {
+export function parsePrice(text: string): number | undefined {
   // 优先匹配「前缀 + 数字 + 后缀单位」（如 花了100块钱、128元）
   const withSuffix = text.match(/(?:花了|花|价格|金额|共|一共|￥|¥)?\s*(\d+(?:\.\d+)?)\s*(?:块钱|块|元)/)
   if (withSuffix) return Number(withSuffix[1])
@@ -154,7 +154,7 @@ function parsePrice(text: string): number | undefined {
   return undefined
 }
 
-function parsePlatform(text: string): string | undefined {
+export function parsePlatform(text: string): string | undefined {
   const match = text.match(/京东|淘宝|天猫|拼多多|抖音|1688|盒马|山姆|美团|超市|线下/)
   return match?.[0]
 }
@@ -255,7 +255,7 @@ function inferCycleDays(itemName: string): number {
 function cleanItemName(raw: string): string {
   return cleanText(raw)
     .replace(/^帮我|^请帮我|^我想|^给我/, "")
-    .replace(/^(添加|新建|创建|录入|登记|加一个|加个)/, "")
+    .replace(/^(添加一个|添加|新建一个|新建|创建一个|创建|录入|登记|加一个|加个)/, "")
     .replace(/(消耗品|补货单|补货记录|管理项|吧|一下)$/g, "")
     .replace(/[，。,.!！?？]/g, "")
     .replace(/的/g, "")

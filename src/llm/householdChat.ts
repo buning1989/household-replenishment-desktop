@@ -2,6 +2,7 @@ import { calculateConsumption, DEFAULT_CYCLES, estimateRemainingQty, formatDate,
 import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
 import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "../agent/drafts"
+import type { AgentPlan } from "../agent/actions"
 import type { OrderImportRow } from "../OrderImportReview"
 import { buildManagerObservations, filterUnseenObservations, markObservationsSeen, observationKey, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
 import type { AgentContextPack, ConversationFocus } from "../agent/conversationContext"
@@ -66,6 +67,10 @@ export type HouseholdChatMessage = {
   /** 新版可确认 agent 草稿；只有本地确认后才写入。 */
   agentDraft?: AgentDraft
   draftStatus?: AgentDraftStatus
+  /** AgentPlan 多动作计划；与 agentDraft 并存，覆盖建分类/设预算/改周期等 plan-only 能力。
+   *  确认前不写入 state，确认后由 commitAgentPlan 统一执行。 */
+  agentPlan?: AgentPlan
+  planStatus?: "pending" | "confirmed" | "cancelled" | "superseded"
   /** 模型或本地生成的澄清追问；用户点选项或自由输入后继续走流程，不写入 state。 */
   clarification?: AgentClarification
   /** 订单截图导入后的批量待确认草稿；每条独立标记 pending/confirmed/cancelled。批量确认前不写入 state。 */
@@ -138,6 +143,17 @@ function buildHouseholdManagerSystemPrompt(opts: {
     "8. 只有当写入对象不确定时才追问。",
     "9. 给用户的结论要像已经替他处理好了，只等他点头。",
     "10. 不要解释「我是怎么推理出来的」，只输出处理方案。",
+    "",
+    "【信息采集原则】",
+    "你不是简单追问字段的表单助手。缺少价格、平台、商品名时，先查看历史采购记录和常购商品；如果有参考值，要主动给出判断。",
+    "- 缺金额：先查该物品历史有价记录，计算单价后给出本次估价（如「之前猫砂大约 30 元一袋，这次 5 袋我先按 150 估」）。",
+    "- 缺金额且无历史：基于物品品类给常见价格范围（如「猫砂之前还没记过价格，我先按常见范围 20-40 元一袋估，5 袋大概 100-200」），不要伪装成历史事实。",
+    "- 缺平台但历史有平台习惯：提一句「之前一般是在 X 买」做参考，不强制追问。",
+    "- 不同平台差异做自然判断：拼多多可能低一点、山姆/线下规格可能不一样、京东天猫淘宝和大部分历史接近时不特别提示。不要硬编码折扣系数。",
+    "你的目标是让用户感到你在认真帮他理账，而不是让他自己填表。",
+    "禁止出现「大概多少钱」「多少钱买的」「在哪家买的」「金额最好也记一下」「这笔才算完整」这类表单式追问。",
+    "允许且鼓励：「我先按……估」「实际金额你直接改」「实际金额有差你直接说个数」「这笔补准后，后面比价才有参考」。",
+    "禁止出现「不记得也可以」「没关系」「先空着也不影响」这类迁就式语言——它们让用户觉得你不愿帮他理账。",
     "",
     "【具体决策规则】",
     "- 已有 item 精确命中（例如用户说「加一袋猫砂」时库里已有「猫砂」）：视为记录补货，qty=1，unit 用用户表达>历史>item.unit，restockDate=today，price/platform 没说就空着。回复口吻：「猫砂我就按一袋记，今天补上。价格和平台这次先空着，不影响记录。你要是没问题，我就先这么记下。」",

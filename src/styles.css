@@ -5157,6 +5157,23 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 
 .chat-action-card.is-cancelled .chat-action-summary { text-decoration: line-through; }
 
+/* AgentPlanCard 动作列表 */
+.chat-plan-action-list {
+  list-style: decimal;
+  margin: 0;
+  padding: 2px 0 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.chat-plan-action-list li {
+  font-size: var(--text-small);
+  line-height: 1.55;
+  color: var(--ink);
+}
+.chat-action-card.is-cancelled .chat-plan-action-list,
+.chat-action-card.is-superseded .chat-plan-action-list { opacity: 0.55; }
+
 .chat-action-expand-toggle {
   width: fit-content;
   min-height: 28px;
