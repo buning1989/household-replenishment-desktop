@@ -864,7 +864,26 @@
 > 分支：feature/agent-plan-delete-actions
 > 关联文档：docs/agent-action-routing.md
 > 验证目标：4 个删除类动作（deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory）走 planProposal + high risk；高风险 plan 需二次确认（普通「确认」不执行，必须「确认删除」才执行）；删除分类仅支持空分类；删除失败时 state 不变。
-> 自动化测试覆盖：tests/agent-plan-delete-registry.test.mjs（22 个）、tests/agent-plan-delete-executor.test.mjs（17 个）、tests/agent-plan-delete-planner.test.mjs（23 个）、tests/agent-plan-second-confirm.test.mjs（14 个）。
+> 自动化测试覆盖：tests/agent-plan-delete-registry.test.mjs（22 个）、tests/agent-plan-delete-executor.test.mjs（17 个）、tests/agent-plan-delete-planner.test.mjs（23 个）、tests/agent-plan-second-confirm.test.mjs（18 个）。
+
+### 二次确认语义说明
+
+高风险删除类 plan 的二次确认状态机：
+
+```
+pending ──「确认」──> awaitingSecondConfirm ──「确认删除」──> confirmed（执行删除）
+   │                                                        │
+   └──────────────「确认删除」直接执行──────────────────────┘（跳过 awaitingSecondConfirm）
+```
+
+**关键语义**：
+- **pending 状态下输入「确认删除」类句式**：直接执行删除，不需要先进入 awaitingSecondConfirm。因为「确认删除」本身已包含明确删除语义，再要求一次二次确认是冗余的。
+- **pending 状态下输入普通「确认」「好的」「可以」**：进入 awaitingSecondConfirm，不执行删除。
+- **awaitingSecondConfirm 状态下输入普通「确认」**：返回 answer 提示"需要明确说「确认删除」"，不执行、不取消。
+- **awaitingSecondConfirm 状态下输入「确认删除」类句式**：执行删除。
+- **awaitingSecondConfirm 状态下输入新操作（如「帮我加一袋猫砂」）**：不走修订，走新操作流程（旧 plan 标记 superseded）。
+
+**isSecondConfirmMatch 命中句式**：「确认删除」「确定删除」「我确认删除」「确认删掉」「删除吧」「就删除」等。普通「确认」「好的」「可以」「嗯」不命中。
 
 ### 验证 C1：删除常购商品（deletePurchaseOption → 二次确认 → 写入）
 
@@ -948,8 +967,8 @@
 
 **预期**：
 - 第 1 步返回 `AgentPlanCard`（高风险）
-- 第 2/3/4 步：卡片进入 awaitingSecondConfirm 状态，**不执行删除**
-- 提示用户需要明确说「确认删除」
+- 第 2 步：卡片进入 awaitingSecondConfirm 状态，**不执行删除**
+- 第 3/4 步：在 awaitingSecondConfirm 状态下返回 answer 提示"需要明确说「确认删除」"，**不执行、不取消**
 - state 不变
 
 ### 验证 C7：「确认删除」才执行删除
@@ -963,6 +982,19 @@
 
 **预期**：
 - 三种表述都能触发 planSecondConfirm，执行删除
+- state 中"猫砂"被移除
+
+### 验证 C7b：pending 状态下直接输入「确认删除」可跳过 awaitingSecondConfirm
+
+**前置**：state 中已有"猫砂"。
+
+**步骤**：
+1. 输入 "删除猫砂"（生成 pendingPlan，状态为 pending）
+2. 直接输入 "确认删除"（不先输入普通"确认"）
+
+**预期**：
+- 第 2 步直接触发 planSecondConfirm，执行删除
+- 不需要先经过 awaitingSecondConfirm 状态
 - state 中"猫砂"被移除
 
 ### 验证 C8：取消删除

@@ -189,6 +189,62 @@ test("orchestrator: 「买了两袋猫砂」仍走旧 Draft 流程（proposal）
   assert.equal(decision.turn.kind, "proposal")
 })
 
+// ---------- pending 状态下直接输入「确认删除」可直接执行（跳过 awaitingSecondConfirm）----------
+// 这是上一轮修复的核心语义：二次确认句式包含明确删除语义，不需要再走 awaitingSecondConfirm
+
+test("orchestrator: high risk plan pending 状态下「确认删除」直接返回 planSecondConfirm command", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂")] })
+  const pendingPlan = createAgentPlan([{ type: "deleteItem", itemName: "猫砂" }], "删除猫砂")
+  // pendingPlan.status 保持默认 "pending"，不先进入 awaitingSecondConfirm
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({ text: "确认删除", state, itemViews: [], dateContext, pendingPlan })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "planSecondConfirm")
+})
+
+test("orchestrator: high risk plan pending 状态下「删除吧」直接返回 planSecondConfirm command", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂")] })
+  const pendingPlan = createAgentPlan([{ type: "deleteItem", itemName: "猫砂" }], "删除猫砂")
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({ text: "删除吧", state, itemViews: [], dateContext, pendingPlan })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "planSecondConfirm")
+})
+
+// ---------- awaitingSecondConfirm 状态下普通「确认」提示需要明确说「确认删除」 ----------
+
+test("orchestrator: awaitingSecondConfirm 下普通「确认」返回 answer（不执行，不取消）", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂")] })
+  const pendingPlan = createAgentPlan([{ type: "deleteItem", itemName: "猫砂" }], "删除猫砂")
+  pendingPlan.status = "awaitingSecondConfirm"
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({ text: "确认", state, itemViews: [], dateContext, pendingPlan })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "answer")
+  // 不应返回 planCommand，避免改变 pendingPlan 状态
+  assert.ok(!decision.turn.command, "不应有 command 字段")
+})
+
+// ---------- awaitingSecondConfirm 状态下新操作不走修订，返回 null 让外层处理 ----------
+// 修复 3：避免「帮我加一袋猫砂」因「袋」在 REVISE_KEYWORDS 中被误判为修订
+
+test("orchestrator: awaitingSecondConfirm 下「帮我加一袋猫砂」不走修订，走新操作", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂")] })
+  const pendingPlan = createAgentPlan([{ type: "deleteItem", itemName: "猫砂" }], "删除猫砂")
+  pendingPlan.status = "awaitingSecondConfirm"
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({ text: "帮我加一袋猫砂", state, itemViews: [], dateContext, pendingPlan })
+  // 不应返回 planCommand（不改变 pendingPlan 状态），也不应返回 answer（pending reminder）
+  // 应该走新操作流程：proposal（restock 草稿）或 needLlm
+  assert.ok(
+    decision.turn.kind === "proposal" || decision.kind === "needLlm",
+    `期望 proposal 或 needLlm，实际 ${decision.turn.kind} / ${decision.kind}`
+  )
+  assert.ok(!decision.turn.command, "不应有 command 字段")
+})
+
 // ---------- 普通 plan 不受二次确认影响 ----------
 
 test("orchestrator: 普通 plan（非 high risk）下「确认」直接执行，返回 planConfirm command", () => {

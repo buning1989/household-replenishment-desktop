@@ -4266,16 +4266,17 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 
 .order-import-trigger:hover { color: var(--ink); }
 
-/* 右侧工作侧栏：桌面端不使用强遮罩/blur，作为固定工作侧栏覆盖主内容右侧 */
+/* 右侧管家：用轻量磨砂层压低主页信息，避免聊天和主页混在一起 */
 .chat-overlay {
   z-index: 25;
   top: 40px;
-  left: 220px;
+  left: 0;
   right: 0;
   bottom: 0;
-  background: transparent;
-  backdrop-filter: none;
-  pointer-events: none;
+  background: rgba(248, 248, 248, .58);
+  -webkit-backdrop-filter: blur(10px) saturate(.96);
+  backdrop-filter: blur(10px) saturate(.96);
+  pointer-events: auto;
   justify-content: flex-end;
 }
 .chat-overlay > .chat-panel { pointer-events: auto; }
@@ -4287,20 +4288,22 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   display: flex;
   flex-direction: column;
   overflow: hidden;
-  border-left: 1px solid var(--line);
-  background: var(--paper);
+  border-left: 1px solid rgba(26, 26, 26, .1);
+  background: rgba(255, 255, 255, .9);
+  -webkit-backdrop-filter: blur(18px) saturate(.98);
+  backdrop-filter: blur(18px) saturate(.98);
   pointer-events: auto;
 }
 .chat-panel.is-expanded {
   width: min(720px, 70vw);
   max-width: 720px;
 }
-/* 小屏/窄窗：退化为覆盖式抽屉，恢复遮罩与点击关闭 */
+/* 小屏/窄窗：退化为覆盖式抽屉，加重一点磨砂遮罩 */
 @media (max-width: 1000px) {
   .chat-overlay {
-    background: rgba(26, 27, 24, .15);
-    backdrop-filter: blur(3px);
-    pointer-events: auto;
+    background: rgba(248, 248, 248, .68);
+    -webkit-backdrop-filter: blur(12px) saturate(.96);
+    backdrop-filter: blur(12px) saturate(.96);
   }
   .chat-panel,
   .chat-panel.is-expanded {
@@ -4323,6 +4326,8 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   min-height: 64px;
   padding: 14px 22px;
   gap: 12px;
+  border-bottom: 0;
+  background: transparent;
 }
 .chat-panel-header h2 {
   margin: 0;
@@ -4358,7 +4363,7 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 18px 22px 0;
+  padding: 14px 22px 0;
   overflow: hidden;
 }
 .chat-log {
@@ -4488,21 +4493,23 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   align-self: flex-end;
   text-align: right;
 }
-/* 跨日期分隔线：细线 + 居中日期，弱化处理 */
+/* 跨日期提示：用轻标签替代横向分割线，减少噪音 */
 .chat-date-divider {
-  display: flex;
+  align-self: center;
+  display: inline-flex;
   align-items: center;
-  gap: 12px;
-  margin: 16px 0 12px;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 8px;
+  margin: 6px 0 2px;
+  border-radius: 999px;
   color: var(--faint);
-  font-size: 12px;
+  background: rgba(255, 255, 255, .68);
+  font-size: 11px;
 }
 .chat-date-divider::before,
 .chat-date-divider::after {
-  content: '';
-  flex: 1;
-  height: 1px;
-  background: var(--line);
+  content: none;
 }
 .chat-date-divider > span {
   flex-shrink: 0;
@@ -4567,8 +4574,8 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   grid-template-columns: minmax(66px, max-content) minmax(0, 1fr);
   gap: 8px;
   align-items: baseline;
-  padding: 7px 0;
-  border-top: 1px solid var(--line);
+  padding: 2px 0;
+  border-top: 0;
   font-size: 13px;
   line-height: 1.55;
 }
@@ -4602,8 +4609,8 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-composer {
   flex: 0 0 auto;
   padding: 10px 22px 12px;
-  border-top: 1px solid var(--line);
-  background: var(--paper);
+  border-top: 0;
+  background: transparent;
 }
 .chat-input-row {
   position: relative;
