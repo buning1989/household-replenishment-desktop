@@ -525,6 +525,115 @@ function matchesDateHintLocal(at: number, hint: string): boolean {
   return false
 }
 
+// ---------- 第三期补丁：统一实体识别 ----------
+
+export type EntityMention =
+  | { kind: "category"; name: string; confidence: "exact" | "alias" | "substring" }
+  | { kind: "item"; itemId: string; name: string; confidence: "exact" | "synonym" | "substring" }
+  | { kind: "purchaseOption"; itemId: string; itemName: string; optionId: string; productName: string }
+  | { kind: "unknown"; raw: string }
+
+/**
+ * 统一实体识别：把候选名识别为 category / item / unknown。
+ * 各 delete parser 共用此函数，避免把"卫生间下/卫生间中"等方位表达当成物品名。
+ *
+ * 优先级：
+ *   1. 剥离尾部方位词（下/中/里）和结构词（消耗品/物品/分类）
+ *   2. state.categories 精确命中 → category
+ *   3. 分类与物品同名 → unknown（歧义，由调用方生成 clarification）
+ *   4. state.items 命中 → item
+ *   5. 无命中 → unknown
+ */
+export function resolveEntityMention(rawName: string, state: AppState): EntityMention {
+  const cleaned = cleanText(rawName)
+    .replace(/[下中里]的?$/, "")
+    .replace(/(这个消耗品|这个物品|这个分类|消耗品|物品|分类)$/, "")
+    .trim()
+
+  if (!cleaned) return { kind: "unknown", raw: rawName }
+
+  // 检查是否是分类
+  const categoryMatch = state.categories.find((c) => cleanText(c) === cleanText(cleaned))
+  if (categoryMatch) {
+    // 分类与物品同名 → 歧义
+    const sameNameItem = state.items.find((item) => cleanText(item.name) === cleanText(cleaned))
+    if (sameNameItem) {
+      return { kind: "unknown", raw: cleaned }
+    }
+    return { kind: "category", name: categoryMatch, confidence: "exact" }
+  }
+
+  // 检查是否是物品
+  const match = findItemMatch(state, cleaned)
+  if (match.item) {
+    if (match.confidence === "ambiguous" && match.candidates.length > 1) {
+      return { kind: "unknown", raw: cleaned }
+    }
+    return {
+      kind: "item",
+      itemId: match.item.id,
+      name: match.item.name,
+      confidence: match.confidence === "exact" ? "exact" : "synonym"
+    }
+  }
+
+  return { kind: "unknown", raw: cleaned }
+}
+
+// ---------- 第三期补丁：删除分类下全部消耗品 ----------
+
+/**
+ * 删除分类下全部消耗品：「删除卫生间下的消耗品」「清空卫生间分类」「把卫生间里的东西都删掉」
+ * 生成多个 deleteItem action（不用 deleteCategory，deleteCategory 仅删空分类）。
+ */
+function tryParseDeleteItemsInCategory(text: string, state: AppState): BuildAgentPlanResult {
+  const compact = cleanText(text)
+  if (!/(删除|删掉|去掉|移除|清空)/.test(compact)) return { kind: "noPlan" }
+
+  // 模式 1：「删除 X 下的消耗品」「删除 X 中的物品」「删除 X 里的东西」
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的下中里]+?)(?:下|中|里)的?(?:消耗品|物品|东西)/)
+  if (m1) {
+    return buildDeleteItemsInCategoryPlan(cleanName(m1[1]), state, text)
+  }
+
+  // 模式 2a：「清空 X 分类」
+  const m2a = compact.match(/清空([^\s，。,!.！？?把的下中里]+?)分类/)
+  if (m2a) {
+    return buildDeleteItemsInCategoryPlan(cleanName(m2a[1]), state, text)
+  }
+  // 模式 2b：「清空 X 下的物品」
+  const m2b = compact.match(/清空([^\s，。,!.！？?把的下中里]+?)(?:下|中|里)的?(?:消耗品|物品|东西)/)
+  if (m2b) {
+    return buildDeleteItemsInCategoryPlan(cleanName(m2b[1]), state, text)
+  }
+
+  // 模式 3：「把 X 里的东西都删掉」「把 X 下的消耗品删掉」
+  const m3 = compact.match(/(?:把)([^\s，。,!.！？?把的里下中]+?)(?:下|中|里)的?(?:东西|消耗品|物品)(?:都)?(?:删掉|删除|去掉|移除)/)
+  if (m3) {
+    return buildDeleteItemsInCategoryPlan(cleanName(m3[1]), state, text)
+  }
+
+  return { kind: "noPlan" }
+}
+
+function buildDeleteItemsInCategoryPlan(categoryName: string, state: AppState, sourceText: string): BuildAgentPlanResult {
+  if (!categoryName) return { kind: "noPlan" }
+  const exists = state.categories.some((c) => c === categoryName)
+  if (!exists) {
+    return { kind: "clarification", message: `分类「${categoryName}」不存在。` }
+  }
+  const itemsInCategory = state.items.filter((item) => item.category === categoryName)
+  if (itemsInCategory.length === 0) {
+    return { kind: "clarification", message: `分类「${categoryName}」下没有消耗品。` }
+  }
+  const actions: AgentAction[] = itemsInCategory.map((item) => ({
+    type: "deleteItem" as const,
+    itemId: item.id,
+    itemName: item.name
+  }))
+  return { kind: "plan", plan: createAgentPlan(actions, sourceText) }
+}
+
 /**
  * 删除消耗品：「删除猫砂」「把猫砂这个消耗品删掉」「不再管理猫砂」
  * 物品名匹配多个候选时返回 clarification。
@@ -538,16 +647,26 @@ function tryParseDeleteItem(text: string, state: AppState): BuildAgentPlanResult
     return buildDeleteItemPlan(cleanName(m0[1]), state, text)
   }
   // 「删除 X」「删掉 X」「去掉 X」
-  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉]+)/)
+  // 排除字符集加入"下中里"避免"卫生间下"被当成物品名
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉下中里]+)/)
   if (m1) {
     if (/(分类|补货记录|常购商品)/.test(m1[1])) return { kind: "noPlan" }
-    return buildDeleteItemPlan(cleanName(m1[1]), state, text)
+    const name = cleanName(m1[1])
+    // 如果 name 是已有分类名，不当作 item（由 tryParseDeleteCategory 处理）
+    if (name && state.categories.some((c) => cleanText(c) === cleanText(name))) {
+      return { kind: "noPlan" }
+    }
+    return buildDeleteItemPlan(name, state, text)
   }
   // 「把 X (这个消耗品) 删掉」
-  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉]+?)(?:这个消耗品|这个物品)?(?:删掉|删除|去掉|移除)/)
+  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的消耗品分类补货记录常购商品删掉下中里]+?)(?:这个消耗品|这个物品)?(?:删掉|删除|去掉|移除)/)
   if (m2) {
     if (/(分类|补货记录|常购商品)/.test(m2[1])) return { kind: "noPlan" }
-    return buildDeleteItemPlan(cleanName(m2[1]), state, text)
+    const name = cleanName(m2[1])
+    if (name && state.categories.some((c) => cleanText(c) === cleanText(name))) {
+      return { kind: "noPlan" }
+    }
+    return buildDeleteItemPlan(name, state, text)
   }
   return { kind: "noPlan" }
 }
@@ -572,34 +691,41 @@ function buildDeleteItemPlan(itemName: string, state: AppState, sourceText: stri
 }
 
 /**
- * 删除分类：「删除猫咪用品分类」「把猫咪用品分类删掉」
+ * 删除分类：「删除猫咪用品分类」「把猫咪用品分类删掉」「删除卫生间」（卫生间是分类时）
+ * 不要求文本必须含"分类"关键词——从 state.categories 匹配即可。
  * 非空分类 → clarification（不生成可确认 plan）。
+ * 分类与物品同名 → clarification（歧义）。
  */
 function tryParseDeleteCategory(text: string, state: AppState): BuildAgentPlanResult {
   const compact = cleanText(text)
-  if (!/分类/.test(compact) || !/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
+  if (!/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
+
+  // 「删除 X 下的消耗品/物品」由 tryParseDeleteItemsInCategory 处理，这里跳过
+  if (/(?:下|中|里)的?(?:消耗品|物品|东西)/.test(compact)) return { kind: "noPlan" }
 
   // 优先从 state.categories 中查找完整匹配（分类名可能含"分类"字，如"临时分类"）
   for (const cat of state.categories) {
     const catCompact = cleanText(cat)
-    // "删除临时分类" → 匹配 "删除" + "临时分类"
-    if (new RegExp(`(?:删除|删掉|去掉|移除)${catCompact}`).test(compact)) {
+    // "删除卫生间" / "删除卫生间分类" / "删除卫生间这个分类"
+    if (new RegExp(`(?:删除|删掉|去掉|移除)${catCompact}(?:这个分类|分类)?$`).test(compact)) {
       return buildDeleteCategoryPlan(cat, state, text)
     }
-    // "把临时分类删掉" / "把临时分类分类删掉"
-    if (new RegExp(`(?:把)${catCompact}(?:分类)?(?:删掉|删除|去掉|移除)`).test(compact)) {
+    // "把卫生间删掉" / "把卫生间分类删掉"
+    if (new RegExp(`(?:把)${catCompact}(?:这个分类|分类)?(?:删掉|删除|去掉|移除)`).test(compact)) {
       return buildDeleteCategoryPlan(cat, state, text)
     }
   }
 
-  // 回退到正则匹配（用于分类名不在 state.categories 中的情况，如打字错误）
-  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的删掉]+?)分类/)
-  if (m1) {
-    return buildDeleteCategoryPlan(cleanName(m1[1]), state, text)
-  }
-  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的删掉]+?)分类(?:删掉|删除|去掉|移除)/)
-  if (m2) {
-    return buildDeleteCategoryPlan(cleanName(m2[1]), state, text)
+  // 回退到正则匹配（文本含"分类"关键词时，用于分类名不在 state.categories 中的情况）
+  if (/分类/.test(compact)) {
+    const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的删掉]+?)分类/)
+    if (m1) {
+      return buildDeleteCategoryPlan(cleanName(m1[1]), state, text)
+    }
+    const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的删掉]+?)分类(?:删掉|删除|去掉|移除)/)
+    if (m2) {
+      return buildDeleteCategoryPlan(cleanName(m2[1]), state, text)
+    }
   }
   return { kind: "noPlan" }
 }
@@ -610,6 +736,17 @@ function buildDeleteCategoryPlan(categoryName: string, state: AppState, sourceTe
   if (!exists) {
     return { kind: "clarification", message: `分类「${categoryName}」不存在。` }
   }
+
+  // 分类与物品同名 → 歧义
+  const sameNameItem = state.items.find((item) => cleanText(item.name) === cleanText(categoryName))
+  if (sameNameItem) {
+    return {
+      kind: "clarification",
+      message: `「${categoryName}」既是分类也是消耗品。你是想删除分类「${categoryName}」还是消耗品「${categoryName}」？`,
+      options: [`删除分类「${categoryName}」`, `删除消耗品「${categoryName}」`]
+    }
+  }
+
   const itemCount = state.items.filter((item) => item.category === categoryName).length
   if (itemCount > 0) {
     return {
@@ -771,7 +908,11 @@ export function buildAgentPlan(input: BuildAgentPlanInput): BuildAgentPlanResult
 
   // 4c. 第三期删除类：删除分类、删除消耗品、删除常购商品、删除补货记录
   //     删除类返回 BuildAgentPlanResult（含 clarification），直接透传
-  //     顺序：分类 → 消耗品 → 常购商品 → 补货记录（先匹配带「分类」「常购商品」「补货记录」关键字的）
+  //     顺序：分类范围批量删除 → 删除分类 → 常购商品 → 补货记录 → 消耗品
+  //     "删除卫生间下的消耗品"比"删除卫生间"更具体，必须优先识别
+  const deleteItemsInCategoryResult = tryParseDeleteItemsInCategory(text, state)
+  if (deleteItemsInCategoryResult.kind !== "noPlan") return deleteItemsInCategoryResult
+
   const deleteCategoryResult = tryParseDeleteCategory(text, state)
   if (deleteCategoryResult.kind !== "noPlan") return deleteCategoryResult
 
@@ -823,6 +964,13 @@ function applyCycleDaysFromText(actions: AgentAction[], text: string): AgentActi
 /** 从 AgentPlan 生成管家口吻的处理方案文案。 */
 export function composePlanMessage(plan: AgentPlan, state: AppState): string {
   if (plan.actions.length === 0) return "我准备这样处理。"
+
+  // 批量删除消耗品的特殊文案（tryParseDeleteItemsInCategory 生成的 plan）
+  if (plan.actions.length > 1 && plan.actions.every((a) => a.type === "deleteItem")) {
+    const names = plan.actions.map((a) => a.itemName).join("、")
+    return `这个操作会删除以下 ${plan.actions.length} 个消耗品及它们的补货记录、常购商品和提醒状态，需要你二次确认：\n${names}\n你要是没问题，我就按这个来。`
+  }
+
   const lines = plan.actions.map((action, index) => {
     const summary = summarizeActionLocal(action, state)
     return `${index + 1}. ${summary}`
