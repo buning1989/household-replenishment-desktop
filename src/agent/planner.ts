@@ -479,7 +479,8 @@ function tryParseDeleteRestockRecord(text: string, state: AppState): BuildAgentP
     price = Number(priceMatch[1] || priceMatch[2])
   }
 
-  if (!dateHint && price === undefined) {
+  // 「最近一条」是位置提示而非日期匹配，不应走 matchesDateHintLocal 过滤（它会对全部记录返回 true，导致多匹配澄清）
+  if ((dateHint === "最近一条" || !dateHint) && price === undefined) {
     return { kind: "plan", plan: createAgentPlan([{
       type: "deleteRestockRecord",
       itemId: match.item.id,
@@ -488,7 +489,7 @@ function tryParseDeleteRestockRecord(text: string, state: AppState): BuildAgentP
     }], text) }
   }
   const matches = match.item.history.filter((e) => {
-    if (dateHint && !matchesDateHintLocal(e.at, dateHint)) return false
+    if (dateHint && dateHint !== "最近一条" && !matchesDateHintLocal(e.at, dateHint)) return false
     if (price !== undefined && (e.price ?? 0) !== price) return false
     return true
   })
@@ -577,11 +578,26 @@ function buildDeleteItemPlan(itemName: string, state: AppState, sourceText: stri
 function tryParseDeleteCategory(text: string, state: AppState): BuildAgentPlanResult {
   const compact = cleanText(text)
   if (!/分类/.test(compact) || !/(删除|删掉|去掉|移除)/.test(compact)) return { kind: "noPlan" }
-  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的分类删掉]+?)分类/)
+
+  // 优先从 state.categories 中查找完整匹配（分类名可能含"分类"字，如"临时分类"）
+  for (const cat of state.categories) {
+    const catCompact = cleanText(cat)
+    // "删除临时分类" → 匹配 "删除" + "临时分类"
+    if (new RegExp(`(?:删除|删掉|去掉|移除)${catCompact}`).test(compact)) {
+      return buildDeleteCategoryPlan(cat, state, text)
+    }
+    // "把临时分类删掉" / "把临时分类分类删掉"
+    if (new RegExp(`(?:把)${catCompact}(?:分类)?(?:删掉|删除|去掉|移除)`).test(compact)) {
+      return buildDeleteCategoryPlan(cat, state, text)
+    }
+  }
+
+  // 回退到正则匹配（用于分类名不在 state.categories 中的情况，如打字错误）
+  const m1 = compact.match(/(?:删除|删掉|去掉|移除)([^\s，。,!.！？?把的删掉]+?)分类/)
   if (m1) {
     return buildDeleteCategoryPlan(cleanName(m1[1]), state, text)
   }
-  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的分类删掉]+?)分类(?:删掉|删除|去掉|移除)/)
+  const m2 = compact.match(/(?:把)([^\s，。,!.！？?把的删掉]+?)分类(?:删掉|删除|去掉|移除)/)
   if (m2) {
     return buildDeleteCategoryPlan(cleanName(m2[1]), state, text)
   }

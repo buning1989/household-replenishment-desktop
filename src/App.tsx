@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react"
 import { AnimatedIcon as Icon } from "./AnimatedIcon"
 import catIcon from "./assets/cat-icon.png?inline"
 import managerAvatar from "./assets/manager-avatar.png"
@@ -385,7 +385,8 @@ function App() {
           role: "assistant",
           content: message,
           agentDraft: restockDraft,
-          draftStatus: "pending" as const
+          draftStatus: "pending" as const,
+          createdAt: Date.now()
         }])
       }
       setHouseholdChatOpen(true)
@@ -452,7 +453,8 @@ function App() {
       role: "assistant",
       content: intro,
       agentDraftBatch: drafts,
-      batchDraftStatuses: drafts.map(() => "pending" as const)
+      batchDraftStatuses: drafts.map(() => "pending" as const),
+      createdAt: Date.now()
     }])
     setHouseholdChatOpen(true)
     setRestockToast({ itemName: `${drafts.length} 条待确认草稿` })
@@ -469,14 +471,21 @@ function App() {
   }
 
   function openChatWithBriefing() {
+    // 欢迎语只在会话为空时出现；历史已有消息时不再自动追加，避免开合后重复简报。
+    if (householdChatMessages.length > 0) {
+      setHouseholdChatOpen(true)
+      return
+    }
     const dateContext = buildChatDateContext()
     const observations = buildManagerObservations(state, itemViews, dateContext)
     const briefing = buildManagerBriefing(observations, state.settings.lastChatSessionAt, dateContext, seenObservationKeysRef.current)
-
-    // 补丁：buildManagerBriefing 返回非 null 即插入（触发判断已在函数内部）。
-    // 历史非空时 append 到末尾，不再因 length===0 条件导致首次对话后简报永不出现。
     if (briefing) {
-      setHouseholdChatMessages((current) => [...current, { role: "assistant", content: briefing }])
+      setHouseholdChatMessages((current) => {
+        // 写入时去重：末条若已是相同内容的纯 assistant 消息，不再追加，防止重复回复。
+        const last = current[current.length - 1]
+        if (last && isPlainAssistantMessage(last) && last.content.trim() === briefing.trim()) return current
+        return [...current, { role: "assistant", content: briefing, createdAt: Date.now() }]
+      })
     }
     setHouseholdChatOpen(true)
   }
@@ -819,6 +828,8 @@ function App() {
           onRequestDeleteCategory={setPendingCategoryDelete}
           onCancelDeleteCategory={() => setPendingCategoryDelete(null)}
           onConfirmDeleteCategory={(name, options) => deleteCategory(name, options)}
+          onOpenChat={() => { if (!householdChatOpen) openChatWithBriefing() }}
+          isChatOpen={householdChatOpen}
         />
         <main className="work-area">
           {activeCategory ? (
@@ -871,7 +882,6 @@ function App() {
                 setCreatingCategory(state.categories[0] || null)
                 setIsItemCreatorOpen(true)
               }}
-              onOpenChat={() => openChatWithBriefing()}
               onOpenOrderImport={() => setOrderImportOpen(true)}
             />
           )}
@@ -1739,6 +1749,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   /** 响应节奏层：等待期间显示的场景化 loading 文案；为空时只显示轻微 typing 指示器 */
   const [loadingText, setLoadingText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /** 展开态：从右侧工作侧栏切换到更宽的对话面板，便于阅读长回复 */
+  const [expanded, setExpanded] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
@@ -1755,16 +1767,54 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     }
     return result
   }, [messages])
+
+  // —— 对话时间线：时间戳与跨日期分隔线（仅在渲染层计算，不写入 messages）——
+  /** 取消息时间，缺失时用当前时间兜底，保证旧数据不报错。 */
+  function messageTime(message: HouseholdChatMessage): number {
+    return typeof message.createdAt === "number" ? message.createdAt : Date.now()
+  }
+  /** 是否同一天（基于用户本地时区）。 */
+  function isSameLocalDay(a: number, b: number): boolean {
+    return startOfDay(a) === startOfDay(b)
+  }
+  /** 24 小时制时间，例如 09:32。 */
+  function formatClock(timestamp: number): string {
+    const date = new Date(timestamp)
+    const hh = String(date.getHours()).padStart(2, "0")
+    const mm = String(date.getMinutes()).padStart(2, "0")
+    return `${hh}:${mm}`
+  }
+  const WEEKDAY_LABELS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
+  /** 日期分隔线文案：今天 / 昨天 / 本年 M月D日 周X / 跨年 YYYY年M月D日 周X。 */
+  function formatDateDivider(timestamp: number): string {
+    const now = Date.now()
+    const target = new Date(timestamp)
+    if (isSameLocalDay(timestamp, now)) return "今天"
+    if (isSameLocalDay(timestamp, now - 86400000)) return "昨天"
+    const month = target.getMonth() + 1
+    const day = target.getDate()
+    const weekday = WEEKDAY_LABELS[target.getDay()]
+    if (target.getFullYear() === new Date(now).getFullYear()) {
+      return `${month}月${day}日 ${weekday}`
+    }
+    return `${target.getFullYear()}年${month}月${day}日 ${weekday}`
+  }
+  /** 相邻两条可见消息是否跨天（前一条缺失视为需要分隔）。 */
+  function shouldShowDateDivider(prev: HouseholdChatMessage | undefined, current: HouseholdChatMessage): boolean {
+    if (!prev) return true
+    return !isSameLocalDay(messageTime(prev), messageTime(current))
+  }
+
   // loading 重复修复：transient message 已经承担 loading 指示，
   // 此时若末条可见消息是 transient，不再追加额外的 loading 气泡，避免双气泡。
   const lastVisibleIsTransient = visibleMessages.length > 0
     ? Boolean(visibleMessages[visibleMessages.length - 1].message.isTransient)
     : false
 		  const quickQuestions = [
-	    "今天优先补什么？",
-	    "这周可能要补什么？",
-	    "哪些信息还缺？",
-	    "在京东买了两袋猫粮"
+	    "家里现在有哪些快用完了？",
+	    "洗衣液还能用多久？",
+	    "我刚买了 2 瓶洗衣液",
+	    "把猫粮提醒提前 3 天"
 	  ]
 	  function latestPendingDraftMessageIndex(list: HouseholdChatMessage[]): number {
 	    for (let index = list.length - 1; index >= 0; index -= 1) {
@@ -1799,7 +1849,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       ...baseMessages.map((current, index) => index === messageIndex
         ? { ...current, draftStatus: "confirmed" as const }
         : current),
-      { role: "assistant" as const, content, links: result.links }
+      { role: "assistant" as const, content, links: result.links, createdAt: Date.now() }
     ])
   }
 
@@ -1820,15 +1870,23 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       : result.summary
     onMessagesChange([
       ...baseMessages.map((current, index) => index === messageIndex
-        ? { ...current, planStatus: "confirmed" as const }
+        ? {
+            ...current,
+            planStatus: "confirmed" as const,
+            agentPlan: current.agentPlan ? { ...current.agentPlan, status: "confirmed" as const } : current.agentPlan
+          }
         : current),
-      { role: "assistant" as const, content, links: result.links }
+      { role: "assistant" as const, content, links: result.links, createdAt: Date.now() }
     ])
   }
 
   function cancelAgentPlan(messageIndex: number, baseMessages = messages) {
     onMessagesChange(baseMessages.map((message, index) => index === messageIndex
-      ? { ...message, planStatus: "cancelled" as const }
+      ? {
+          ...message,
+          planStatus: "cancelled" as const,
+          agentPlan: message.agentPlan ? { ...message.agentPlan, status: "cancelled" as const } : message.agentPlan
+        }
       : message))
   }
 
@@ -1836,7 +1894,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   // 不执行任何写入，只改状态，等待用户二次「确认删除」。
   function advancePlanToSecondConfirm(messageIndex: number, baseMessages = messages) {
     onMessagesChange(baseMessages.map((message, index) => index === messageIndex
-      ? { ...message, planStatus: "awaitingSecondConfirm" as const }
+      ? {
+          ...message,
+          planStatus: "awaitingSecondConfirm" as const,
+          agentPlan: message.agentPlan ? { ...message.agentPlan, status: "awaitingSecondConfirm" as const } : message.agentPlan
+        }
       : message))
   }
 
@@ -1881,7 +1943,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const draftsToCommit = message.agentDraftBatch.filter((_, i) => message.batchDraftStatuses?.[i] !== "cancelled")
     if (!draftsToCommit.length) {
       onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses: message.agentDraftBatch.map(() => "cancelled") }),
-        { role: "assistant", content: "批量草稿已全部取消，没有写入任何内容。" }])
+        { role: "assistant", content: "批量草稿已全部取消，没有写入任何内容。", createdAt: Date.now() }])
       return
     }
     const result = onConfirmBatch(draftsToCommit)
@@ -1893,7 +1955,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       : result.summary
     onMessagesChange([
       ...patchBatch(messageIndex, baseMessages, { statuses: finalStatuses, result: { summary: result.summary, links: result.links } }),
-      { role: "assistant", content, links: result.links }
+      { role: "assistant", content, links: result.links, createdAt: Date.now() }
     ])
   }
 
@@ -1902,7 +1964,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     if (!message?.agentDraftBatch) return
     const statuses: AgentDraftStatus[] = message.agentDraftBatch.map(() => "cancelled")
     onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses }),
-      { role: "assistant", content: "已取消全部待确认草稿，没有写入任何内容。" }])
+      { role: "assistant", content: "已取消全部待确认草稿，没有写入任何内容。", createdAt: Date.now() }])
   }
 
   function cancelBatchIndex(messageIndex: number, index: number, baseMessages: HouseholdChatMessage[]) {
@@ -1917,7 +1979,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       : draft.kind === "restock" ? draft.itemName
       : draft.item.itemName
     onMessagesChange([...patchBatch(messageIndex, baseMessages, { statuses }),
-      { role: "assistant", content: `已跳过第 ${index + 1} 条「${label}」。` }])
+      { role: "assistant", content: `已跳过第 ${index + 1} 条「${label}」。`, createdAt: Date.now() }])
   }
 
   // ---------- 订单截图导入（对话模式：复用 buildAgentDraftsFromOrderRows + commitAgentDraftBatch） ----------
@@ -1943,14 +2005,14 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const confirmedRows = orderImportRowsToConfirmed(message.orderImportRows)
     if (confirmedRows.length === 0) {
       onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
-        { role: "assistant", content: "没有要记的内容，我先不动。" }])
+        { role: "assistant", content: "没有要记的内容，我先不动。", createdAt: Date.now() }])
       return
     }
     // 复用 buildAgentDraftsFromOrderRows：与弹窗同一转换路径
     const drafts = buildAgentDraftsFromOrderRows(confirmedRows, state, Date.now())
     if (drafts.length === 0) {
       onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
-        { role: "assistant", content: "没有要记的内容，我先不动。" }])
+        { role: "assistant", content: "没有要记的内容，我先不动。", createdAt: Date.now() }])
       return
     }
     // 复用 commitAgentDraftBatch：与弹窗同一写入路径
@@ -1961,13 +2023,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       : result.summary
     onMessagesChange([
       ...patchOrderImport(messageIndex, baseMessages, { status: "confirmed", result: { summary: result.summary, links: result.links } }),
-      { role: "assistant", content, links: result.links }
+      { role: "assistant", content, links: result.links, createdAt: Date.now() }
     ])
   }
 
   function cancelOrderImport(messageIndex: number, baseMessages: HouseholdChatMessage[]) {
     onMessagesChange([...patchOrderImport(messageIndex, baseMessages, { status: "cancelled" }),
-      { role: "assistant", content: "好，先不记。需要的时候再告诉我。" }])
+      { role: "assistant", content: "好，先不记。需要的时候再告诉我。", createdAt: Date.now() }])
   }
 
   function reviseBatchIndex(messageIndex: number, index: number, text: string, baseMessages: HouseholdChatMessage[]) {
@@ -1977,12 +2039,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     if (message.batchDraftStatuses[index] !== "pending") return
     const revised = reviseAgentDraft(message.agentDraftBatch[index], text, state)
     if (!revised) {
-      onMessagesChange([...baseMessages, { role: "assistant", content: `没能从这句话里解析出第 ${index + 1} 条的修订内容，请换一种说法。` }])
+      onMessagesChange([...baseMessages, { role: "assistant", content: `没能从这句话里解析出第 ${index + 1} 条的修订内容，请换一种说法。`, createdAt: Date.now() }])
       return
     }
     const drafts = message.agentDraftBatch.map((draft, i) => i === index ? revised : draft)
     onMessagesChange([...patchBatch(messageIndex, baseMessages, { drafts }),
-      { role: "assistant", content: `已更新第 ${index + 1} 条草稿。` }])
+      { role: "assistant", content: `已更新第 ${index + 1} 条草稿。`, createdAt: Date.now() }])
   }
 
   function reviseBatchAll(messageIndex: number, text: string, baseMessages: HouseholdChatMessage[]) {
@@ -1996,11 +2058,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       return draft
     })
     if (!anyRevise) {
-      onMessagesChange([...baseMessages, { role: "assistant", content: "没能从这句话里解析出修订内容，请换一种说法。" }])
+      onMessagesChange([...baseMessages, { role: "assistant", content: "没能从这句话里解析出修订内容，请换一种说法。", createdAt: Date.now() }])
       return
     }
     onMessagesChange([...patchBatch(messageIndex, baseMessages, { drafts }),
-      { role: "assistant", content: "已更新全部待确认草稿。" }])
+      { role: "assistant", content: "已更新全部待确认草稿。", createdAt: Date.now() }])
   }
 
   // ---------- 订单截图上传（对话内复用 orderImport + mapOrderLinesToDrafts） ----------
@@ -2038,13 +2100,15 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       {
         role: "user",
         content: userContent,
-        imageAttachments: [{ name: file.name, dataUrl }]
+        imageAttachments: [{ name: file.name, dataUrl }],
+        createdAt: Date.now()
       }
     ]
     const transient: HouseholdChatMessage = {
       role: "assistant",
       content: composeOrderRecognizingMessage(),
-      isTransient: true
+      isTransient: true,
+      createdAt: Date.now()
     }
     onMessagesChange([...userMessages, transient])
     setLoading(true)
@@ -2064,12 +2128,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     setLoadingText(null)
     // 用最终消息替换 transient：base 用 userMessages（不含 transient）
     if (!result.ok) {
-      onMessagesChange([...userMessages, { role: "assistant", content: result.error }])
+      onMessagesChange([...userMessages, { role: "assistant", content: result.error, createdAt: Date.now() }])
       return
     }
     const rows = buildOrderImportRowsFromExtract(result.order, state.items, state.categories, 0)
     if (rows.length === 0) {
-      onMessagesChange([...userMessages, { role: "assistant", content: "我看了下这张订单，暂时没识别到需要管理的消耗品。" }])
+      onMessagesChange([...userMessages, { role: "assistant", content: "我看了下这张订单，暂时没识别到需要管理的消耗品。", createdAt: Date.now() }])
       return
     }
     // 管家口吻总结：识别到几样，命中已有的有哪些，准备新建的有哪些
@@ -2082,7 +2146,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         role: "assistant",
         content: message,
         orderImportRows: rows,
-        orderImportStatus: "pending"
+        orderImportStatus: "pending",
+        createdAt: Date.now()
       }
     ])
   }
@@ -2102,7 +2167,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const el = inputRef.current
     if (!el) return
     const lineHeight = 20
-    const verticalPadding = 16
+    const verticalPadding = 12
     const maxHeight = lineHeight * 3 + verticalPadding
     el.style.height = "auto"
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`
@@ -2120,7 +2185,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	      inputRef.current?.focus()
 	      return
 	    }
-	    const nextMessages: HouseholdChatMessage[] = [...messages, { role: "user", content: text }]
+	    const nextMessages: HouseholdChatMessage[] = [...messages, { role: "user", content: text, createdAt: Date.now() }]
     onMessagesChange(nextMessages)
     onQuestionSent(text)
     setDraft("")
@@ -2170,7 +2235,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       if (isBatchIntentMarker(turn)) {
         // 仍走节奏，避免秒回
         await waitWithTransient(nextMessages, timing)
-        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
+        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer"), createdAt: Date.now() }])
         return
       }
       // AgentPlan 命令（planConfirm / planAwaitingSecondConfirm / planSecondConfirm / planCancel）：
@@ -2197,7 +2262,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         }
         // 其他 typed command（batch 类）走到这里说明 batch 已失效，给个兜底
         await waitWithTransient(nextMessages, timing)
-        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer") }])
+        onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer"), createdAt: Date.now() }])
         return
       }
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft === pendingDraft) {
@@ -2219,7 +2284,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
             ? { ...message, planStatus: "superseded" as const }
             : message)
           : nextMessages
-        onMessagesChange([...base, { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const }])
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const, createdAt: Date.now() }])
         return
       }
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft !== pendingDraft) {
@@ -2227,10 +2292,20 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         const base = nextMessages.map((message, index) => index === pendingMessageIndex
           ? { ...message, draftStatus: "superseded" as const }
           : message)
-        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }])
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
         return
       }
-      // answer / clarification / 普通 proposal：直接转消息
+      if (turn.kind === "proposal") {
+        // 普通 proposal（新操作，非修订）：如果有 pendingPlan，标记 superseded
+        const base = pendingPlanMessageIndex >= 0
+          ? nextMessages.map((message, index) => index === pendingPlanMessageIndex
+            ? { ...message, planStatus: "superseded" as const }
+            : message)
+          : nextMessages
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
+        return
+      }
+      // answer / clarification：直接转消息（不打断 pending plan）
       onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
       return
     }
@@ -2245,7 +2320,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     // 3. 实际耗时小于 minDelayMs 时补足
     // 4. 用最终 assistant message 替换 transient
     const transient: HouseholdChatMessage | null = timing.showLoading
-      ? { role: "assistant", content: timing.loadingText ?? "", isTransient: true }
+      ? { role: "assistant", content: timing.loadingText ?? "", isTransient: true, createdAt: Date.now() }
       : null
     if (transient) {
       onMessagesChange([...nextMessages, transient])
@@ -2285,7 +2360,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const fallback = pendingDraft
 	          ? composeFallbackMessage("no-draft")
 	          : composeBoundaryAnswer(classifyConversationBoundary(text), text)
-	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback }])
+	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback, createdAt: Date.now() }])
 	        return
 	      }
 	      if (turn.kind === "proposal" && pendingDraft) {
@@ -2293,7 +2368,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const base = baseWithoutTransient.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
-	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }])
+	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
 	        return
 	      }
 	      onMessagesChange([...baseWithoutTransient, agentTurnToMessage(turn)])
@@ -2301,12 +2376,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       // 任务四 A：LLM 失败/超时时用 answerHouseholdQuickly 作为兜底回答
       const fallbackAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext, seenObservationKeys)
       if (fallbackAnswer) {
-        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallbackAnswer }])
+        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallbackAnswer, createdAt: Date.now() }])
         return
       }
       // answerHouseholdQuickly 未命中：按对话边界给自然回应，不再统一 setError
       const boundaryFallback = composeBoundaryAnswer(classifyConversationBoundary(text), text)
-      onMessagesChange([...baseWithoutTransient, { role: "assistant", content: boundaryFallback }])
+      onMessagesChange([...baseWithoutTransient, { role: "assistant", content: boundaryFallback, createdAt: Date.now() }])
     }
   }
 
@@ -2324,7 +2399,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const transient: HouseholdChatMessage = {
       role: "assistant",
       content: timing.loadingText ?? "",
-      isTransient: true
+      isTransient: true,
+      createdAt: Date.now()
     }
     onMessagesChange([...baseMessages, transient])
     setLoading(true) // 禁用发送按钮，避免重复提交
@@ -2342,23 +2418,25 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 
   /** 把 AgentTurn 映射成 HouseholdChatMessage。UI 只读 message + 附带字段，不直接读 executableDraft 字段表。 */
   function agentTurnToMessage(turn: AgentTurn): HouseholdChatMessage {
+    const createdAt = Date.now()
     if (turn.kind === "answer") {
-      return { role: "assistant", content: turn.message }
+      return { role: "assistant", content: turn.message, createdAt }
     }
     if (turn.kind === "proposal") {
-      return { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const }
+      return { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt }
     }
     if (turn.kind === "planProposal") {
-      return { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const }
+      return { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const, createdAt }
     }
     if (turn.kind === "clarification") {
       return {
         role: "assistant",
         content: turn.message,
-        clarification: { question: turn.message, options: turn.options, provisional: turn.provisional }
+        clarification: { question: turn.message, options: turn.options, provisional: turn.provisional },
+        createdAt
       }
     }
-    return { role: "assistant", content: turn.message }
+    return { role: "assistant", content: turn.message, createdAt }
   }
 
 	  function submit(event: FormEvent) {
@@ -2367,29 +2445,58 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   }
 
   return (
-    <div className={`overlay chat-overlay ${isClosing ? "is-closing" : ""}`}>
-      <aside className={`panel chat-panel ${isClosing ? "is-closing" : ""}`} role="dialog" aria-modal="true" aria-labelledby="household-chat-title">
+    <div
+      className={`overlay chat-overlay ${isClosing ? "is-closing" : ""}`}
+      onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
+    >
+      <aside className={`panel chat-panel ${isClosing ? "is-closing" : ""}${expanded ? " is-expanded" : ""}`} role="dialog" aria-modal="true" aria-labelledby="household-chat-title">
         <div className="panel-header chat-panel-header">
           <div className="panel-header-info">
             <h2 id="household-chat-title">403管家</h2>
           </div>
-          <button className="icon-button close-btn" aria-label="关闭家庭问答" onClick={onClose}><Icon name="close" size={16} /></button>
+          <div className="chat-panel-actions">
+            <button
+              type="button"
+              className="icon-button chat-expand-btn"
+              aria-label={expanded ? "收起为侧栏" : "展开对话"}
+              aria-pressed={expanded}
+              title={expanded ? "收起为侧栏" : "展开对话"}
+              onClick={() => setExpanded((value) => !value)}
+            >
+              {expanded ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 21 3 15 9 9" /><polyline points="15 3 21 9 15 15" /></svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
+              )}
+            </button>
+            <button className="icon-button close-btn" aria-label="关闭家庭问答" onClick={onClose}><Icon name="close" size={16} /></button>
+          </div>
         </div>
 
         <div className="chat-panel-body">
           <div className="chat-log" ref={logRef} aria-live="polite">
             {messages.length === 0 ? (
               <div className="chat-empty">
-                <strong>{starter}</strong>
+                <strong>你可以直接问我家里还缺什么，也可以告诉我刚买了什么、什么快用完了。</strong>
+                {starter ? <span className="chat-empty-hint">{starter}</span> : null}
                 <div className="chat-suggestions">
                   {quickQuestions.map((question) => (
                     <button key={question} type="button" onClick={() => void sendMessage(question)} disabled={loading}>{question}</button>
                   ))}
                 </div>
               </div>
-	            ) : (
-	              visibleMessages.map(({ message, index }) => (
-                <div key={`${message.role}-${index}`} className={`chat-message ${message.role}${message.isTransient ? " is-transient" : ""}`}>
+            ) : (
+	              visibleMessages.map(({ message, index }, visibleIndex) => {
+                const prevVisible = visibleIndex > 0 ? visibleMessages[visibleIndex - 1].message : undefined
+                const showDivider = shouldShowDateDivider(prevVisible, message)
+                return (
+                  <Fragment key={message.createdAt ? `${message.role}-${message.createdAt}-${index}` : `${message.role}-${index}`}>
+                    {showDivider && (
+                      <div className="chat-date-divider" role="separator" aria-label={formatDateDivider(messageTime(message))}>
+                        <span>{formatDateDivider(messageTime(message))}</span>
+                      </div>
+                    )}
+                    <div className={`chat-message ${message.role}${message.isTransient ? " is-transient" : ""}`}>
                   {message.role === "assistant" ? (
                     <>
                       <ManagerAvatar />
@@ -2498,6 +2605,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	                    )}
                           </>
                         )}
+                            <div className="chat-message-time">{formatClock(messageTime(message))}</div>
                       </div>
                     </>
                   ) : (
@@ -2515,10 +2623,13 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                           ))}
                         </div>
                       )}
+                      <div className="chat-message-time">{formatClock(messageTime(message))}</div>
                     </>
-	                  )}
-	                </div>
-	              ))
+                  )}
+                    </div>
+                  </Fragment>
+                )
+              })
             )}
             {loading && !lastVisibleIsTransient && (
               <div className="chat-message assistant is-loading">
@@ -2549,7 +2660,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                 id="household-chat-input"
                 ref={inputRef}
                 value={draft}
-                rows={2}
+                rows={1}
                 onChange={(event) => setDraft(event.target.value)}
                 onKeyDown={(event) => {
                   if (event.key === "Enter" && !event.shiftKey) {
@@ -2573,7 +2684,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                     <polyline points="17 8 12 3 7 8" />
                     <line x1="12" y1="3" x2="12" y2="15" />
                   </svg>
-                  <span>上传订单截图</span>
+                  <span>订单截图</span>
                 </button>
                 <button type="submit" className="primary-button chat-send-button" disabled={loading}>
                   {loading && <span className="chat-send-spinner" aria-hidden="true" />}
@@ -2754,7 +2865,7 @@ function TaskActions({ item, onRestock, onDismiss, isExpanded }: {
   )
 }
 
-function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem, onOpenChat, onOpenOrderImport }: {
+function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onApplySuggestion, onDismissSuggestion, onOpenItem, onAddItem, onOpenOrderImport }: {
   items: ItemView[]
   snoozedItems: ItemView[]
   allItems: ItemView[]
@@ -2764,25 +2875,18 @@ function CurrentTasks({ items, snoozedItems, allItems, onRestock, onSnooze, onAp
   onDismissSuggestion: (item: ReplenishmentItem) => void
   onOpenItem: (item: ReplenishmentItem) => void
   onAddItem: () => void
-  onOpenChat: () => void
   onOpenOrderImport: () => void
 }) {
   const hasCurrentTasks = items.length > 0
   const hasSnoozedTasks = snoozedItems.length > 0
   const hasAnyTasks = hasCurrentTasks || hasSnoozedTasks
   const hasNoItemsAtAll = allItems.length === 0
-  const quickActions = (
+  const quickActions = hasNoItemsAtAll ? null : (
     <div className="home-quick-actions" aria-label="首页快捷操作">
-      <button type="button" className="quiet-button home-chat-trigger" onClick={onOpenChat}>
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.6 8.6 0 0 1-7.7 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.5A8.4 8.4 0 0 1 4 11.6 8.6 8.6 0 0 1 12.6 3 8.4 8.4 0 0 1 21 11.5Z" /><path d="M8.5 10.5h7" /><path d="M8.5 14h4.5" /></svg>
-        问问家里现在情况
+      <button type="button" className="quiet-button order-import-trigger" onClick={onOpenOrderImport}>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>
+        从订单截图导入
       </button>
-      {!hasNoItemsAtAll && (
-        <button type="button" className="quiet-button order-import-trigger" onClick={onOpenOrderImport}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>
-          从订单截图导入
-        </button>
-      )}
     </div>
   )
 
@@ -5881,7 +5985,7 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
   )
 }
 
-function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, pendingDelete, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onRequestDeleteCategory, onCancelDeleteCategory, onConfirmDeleteCategory }: {
+function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, pendingDelete, onSelectCategory, onCreateCategory, onOpenSettings, onRenameCategory, onRequestDeleteCategory, onCancelDeleteCategory, onConfirmDeleteCategory, onOpenChat, isChatOpen }: {
   dueCount: number
   categorySummaries: Array<{ category: string; views: ItemView[]; urgent: number; warning: number }>
   allItems: ReplenishmentItem[]
@@ -5895,6 +5999,8 @@ function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, p
   onRequestDeleteCategory: (name: string) => void
   onCancelDeleteCategory: () => void
   onConfirmDeleteCategory: (name: string, options?: DeleteCategoryOptions) => void
+  onOpenChat: () => void
+  isChatOpen: boolean
 }) {
   const [editingCategory, setEditingCategory] = useState<string | null>(null)
   const [editName, setEditName] = useState("")
@@ -5922,6 +6028,21 @@ function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, p
         </span>
         <span className="sidebar-home-label">
           {dueCount > 0 ? `${dueCount} 项待处理` : "今天不用补货"}
+        </span>
+      </button>
+
+      <button
+        type="button"
+        className={`sidebar-assistant ${isChatOpen ? "is-active" : ""}`}
+        onClick={onOpenChat}
+        aria-pressed={isChatOpen}
+      >
+        <span className="sidebar-assistant-icon" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.6 8.6 0 0 1-7.7 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.5A8.4 8.4 0 0 1 4 11.6 8.6 8.6 0 0 1 12.6 3 8.4 8.4 0 0 1 21 11.5Z" /><path d="M8.5 10.5h7" /><path d="M8.5 14h4.5" /></svg>
+        </span>
+        <span className="sidebar-assistant-text">
+          <span className="sidebar-assistant-title">问问管家</span>
+          <span className="sidebar-assistant-sub">查询、记录、补货都可以问</span>
         </span>
       </button>
 

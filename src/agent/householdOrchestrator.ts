@@ -99,7 +99,12 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   //    设计原则：AgentDraft 和 AgentPlan 并存。
   //    - 单条草稿场景（restock/createItem）继续走旧 proposal 流程，保持 confirm/cancel/revise 不变
   //    - 新能力（createCategory/setMonthlyBudget/updateItem）和多动作组合走 planProposal
-  const intent = classifyAgentIntent(text, Boolean(pendingDraft || pendingPlan))
+  // 注意：hasPendingDraft 只传 pendingDraft，不传 pendingPlan。
+  //   handlePendingPlanIntent 已经在上面处理了 plan 的 confirm/cancel/revise/status。
+  //   走到这里说明本轮不是针对 pendingPlan 的这些意图。
+  //   如果传 pendingPlan，"帮我加一袋猫砂" 会因"袋"在 REVISE_KEYWORDS 中被误判为 reviseDraft，
+  //   导致新写入请求走 needLlm 而非 writeDraft。
+  const intent = classifyAgentIntent(text, Boolean(pendingDraft))
   if (intent === "writeDraft") {
     // 4a. 先检查重复创建/歧义
     const clarification = buildLocalClarification(text, state)
@@ -233,26 +238,25 @@ function handlePendingPlanIntent(
         message: "正在等待你的二次确认。这是高风险删除操作，请明确说「确认删除」执行，或「取消」放弃。"
       }
     }
-    // 5. 修订 → 生成新 planProposal（旧 plan 由调用方标 superseded）
-    if (cancelIntent === "reviseDraft") {
-      const reviseResult = buildAgentPlan({ text, state, dateContext: _dateContext, pendingPlan })
-      if (reviseResult.kind === "plan") {
-        return {
-          kind: "planProposal" as const,
-          message: `${composeRevisedMessage()}\n${composePlanMessage(reviseResult.plan, state)}`,
-          plan: reviseResult.plan
-        }
-      }
-      return {
-        kind: "answer" as const,
-        message: "正在等待你的二次确认。这是高风险删除操作，请明确说「确认删除」执行，或「取消」放弃。"
-      }
-    }
-    // 6. 其他输入（查询/新操作）→ 不打断，返回 null 让外层处理
+    // 5. awaitingSecondConfirm 状态下不允许修订：
+    //    高风险删除操作不应被"修订"，用户应先取消再重新输入。
+    //    把"修订"意图（可能因 REVISE_KEYWORDS 误命中，如"帮我加一袋猫砂"中的"袋"）
+    //    当作新操作，返回 null 让外层处理。
     return null
   }
 
   // ---------- pending 状态：第一次确认 ----------
+
+  // 如果用户在 pending 状态直接输入「确认删除」类句式，直接执行删除。
+  // 二次确认句式包含明确的删除语义，不需要再走 awaitingSecondConfirm。
+  if (isHighRisk && isSecondConfirmMatch(text)) {
+    return {
+      kind: "planCommand" as const,
+      message: composePlanMessage(pendingPlan, state),
+      command: { command: "planSecondConfirm" as const }
+    }
+  }
+
   const intent = classifyAgentIntent(text, true)
 
   // 1. 确认

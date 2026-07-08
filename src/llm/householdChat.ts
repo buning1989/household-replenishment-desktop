@@ -58,6 +58,8 @@ export type ChatMessageLink = {
 export type HouseholdChatMessage = {
   role: "user" | "assistant"
   content: string
+  /** 消息创建时间戳（ms）。旧消息可能缺失，渲染层用当前时间兜底。仅用于展示，不参与业务判断。 */
+  createdAt?: number
   /** 该条管家消息附带的创建提案；undefined 表示纯文本消息 */
   actions?: ChatProposedAction[]
   /** pending：等待确认；confirmed / cancelled：已处理；superseded：被修订后的新清单替代 */
