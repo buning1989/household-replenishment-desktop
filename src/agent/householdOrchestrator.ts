@@ -31,6 +31,7 @@ import {
 } from "./responseComposer"
 import { classifyConversationBoundary } from "./conversationBoundary"
 import { buildRecordSuggestions, type InferenceItemView } from "./recordInference"
+import { buildRecordInsights, composeInsightLine } from "./recordInsight"
 import { buildAgentPlan, composePlanMessage, type BuildAgentPlanResult } from "./planner"
 import type { AgentPlan } from "./actions"
 import type {
@@ -392,13 +393,34 @@ function draftToProposal(
   draft: AgentDraft,
   state: import("../types").AppState,
   itemViews: InferenceItemView[],
-  options?: { fromCollection?: boolean; qualityMissing?: string[] }
+  options?: {
+    fromCollection?: boolean
+    qualityMissing?: string[]
+    dateContext?: import("../llm/householdChat").ChatDateContext
+  }
 ): AgentTurn {
   if (options?.fromCollection) {
     const message = composeReadyToConfirmMessage(draft, options.qualityMissing || [])
+    // 采集态转 proposal 且价格已填时：追加 1 条轻量判断（价格划算/偏贵）
+    let insightLine = ""
+    if (options.dateContext) {
+      const { insights } = buildRecordInsights({
+        draft,
+        state,
+        itemViews: itemViews as unknown as import("../llm/householdChat").HouseholdChatItemView[],
+        dateContext: options.dateContext
+      })
+      // proposal 前只追加价格类判断（budgetImpact 等 commit 后再给更准的）
+      const priceInsight = insights.find(
+        (i) => i.type === "priceLowerThanUsual" || i.type === "priceHigherThanUsual"
+      )
+      if (priceInsight) {
+        insightLine = " " + composeInsightLine([priceInsight], 1)
+      }
+    }
     return {
       kind: "proposal",
-      message,
+      message: message + insightLine,
       executableDraft: draft,
       status: "pending"
     }
@@ -457,14 +479,14 @@ function handlePendingCollectionIntent(
     // 用户要求直接保存：用最新草稿转 proposal，质量字段仍缺则带「未补全」标记
     const draft = result.draft
     const qualityMissing = hasMissingQuality(collection) ? collection.qualityMissingSlots : []
-    return draftToProposal(draft, state, itemViews, { fromCollection: true, qualityMissing })
+    return draftToProposal(draft, state, itemViews, { fromCollection: true, qualityMissing, dateContext })
   }
 
   if (result.status === "supplemented") {
     const next = result.collection
     if (next.completeness === "readyToConfirm") {
       // 字段补齐 → 转 proposal，走原 confirm → commit 链路
-      return draftToProposal(next.draft, state, itemViews, { fromCollection: true })
+      return draftToProposal(next.draft, state, itemViews, { fromCollection: true, dateContext })
     }
     // 检测本轮刚补上的是哪个字段，用于文案开场（如「平台记拼多多。」）
     const justFilled = detectJustFilled(prevMissing, next.qualityMissingSlots, collection.draft, next.draft)

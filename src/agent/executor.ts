@@ -4,7 +4,8 @@ import { fuzzyMatchItem, type ExtractedOrder, type ExtractedOrderLine } from "..
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import { createItemDraftFromName, findItemMatch, type AgentDraft, type CreateItemDraft, type OrderRow, type RestockDraftDetails } from "./drafts"
 import { buildPostCommitObservation } from "./observations"
-import type { ChatDateContext } from "../llm/householdChat"
+import { buildPostCommitInsights, composeInsightLine, pickTopInsights } from "./recordInsight"
+import type { ChatDateContext, HouseholdChatItemView } from "../llm/householdChat"
 import type { AgentAction, AgentPlan } from "./actions"
 
 export type AgentMessageLink = {
@@ -21,6 +22,11 @@ export type AgentCommitResult = {
    * 无命中时为 undefined。调用方拼接到结果消息末尾。
    */
   observation?: string
+  /**
+   * 主动判断洞察：commit 成功后基于新 state 生成的价格/预算/周期/常购等判断。
+   * 无命中时为 undefined。调用方拼接到结果消息末尾（在 observation 之后）。
+   */
+  insight?: string
 }
 
 /**
@@ -305,11 +311,15 @@ export function commitAgentDraft(
   // 任务四：写入后观察——针对本次写入的物品运行三类判定
   const observation = runPostCommitObservation(draft, work.items, now, dateContext, seenObservationKeys)
 
+  // 主动判断洞察：commit 后基于新 state 生成价格/预算/周期/常购等判断
+  const insight = runPostCommitInsight(draft, nextState, now, dateContext)
+
   return {
     state: nextState,
     summary,
     links,
-    observation
+    observation,
+    insight
   }
 }
 
@@ -345,11 +355,23 @@ export function commitAgentDraftBatch(
     }
   }
 
+  // 主动判断洞察：对最后一条 restock 类草稿生成洞察（避免批量场景洞察过多）
+  let insight: string | undefined
+  if (dateContext) {
+    const lastRestockDraft = [...drafts].reverse().find(
+      (draft) => draft.kind === "restock" || draft.kind === "createItemWithRestock"
+    )
+    if (lastRestockDraft) {
+      insight = runPostCommitInsight(lastRestockDraft, nextState, now, dateContext)
+    }
+  }
+
   return {
     state: nextState,
     summary: summaries.join("\n"),
     links,
-    observation
+    observation,
+    insight
   }
 }
 
@@ -381,6 +403,34 @@ function runPostCommitObservation(
 
   const observation = buildPostCommitObservation(targetItem, dateContext, seenObservationKeys)
   return observation?.text
+}
+
+/**
+ * 主动判断洞察：commit 后基于新 state（已包含本次补货）生成价格/预算/周期/常购判断。
+ *
+ * 与 runPostCommitObservation 的差异：
+ *   - observation 复用 observations.ts 的价格异常/周期漂移/负面评价三类判定
+ *   - insight 复用 recordInsight.ts 的价格划算/偏贵/预算影响/常购候选等判断
+ *   - 两者互补：observation 偏「异常提醒」，insight 偏「管家建议」
+ *
+ * 文案策略：每次最多展示 1-2 条判断，优先级 priceAnomaly > budgetImpact > cycle > favorite。
+ */
+function runPostCommitInsight(
+  draft: AgentDraft,
+  nextState: AppState,
+  _now: number,
+  dateContext?: ChatDateContext
+): string | undefined {
+  if (!dateContext) return undefined
+  // 仅 restock / createItemWithRestock 草稿需要洞察
+  if (draft.kind !== "restock" && draft.kind !== "createItemWithRestock") return undefined
+
+  const result = buildPostCommitInsights(draft, nextState, [], dateContext)
+  if (result.insights.length === 0) return undefined
+
+  // 取前 2 条洞察拼成一句话
+  const top = pickTopInsights(result.insights, 2)
+  return composeInsightLine(top, 2)
 }
 
 // ---------- 订单截图自动映射（对话上传截图用） ----------
@@ -1086,7 +1136,8 @@ export function commitAgentPlan(
       state,
       summary: summaries.join("\n"),
       links,
-      observation: undefined
+      observation: undefined,
+      insight: undefined
     }
   }
 
@@ -1100,6 +1151,7 @@ export function commitAgentPlan(
 
   // 写入后观察：对涉及补货的 action 运行判定，取第一条命中
   let observation: string | undefined
+  let insight: string | undefined
   if (dateContext) {
     for (const action of plan.actions) {
       if (action.type !== "recordRestock" && action.type !== "createItem") continue
@@ -1112,12 +1164,29 @@ export function commitAgentPlan(
         break
       }
     }
+
+    // 主动判断洞察：对最后一条 recordRestock action 生成洞察
+    const lastRestockAction = [...plan.actions].reverse().find((action) => action.type === "recordRestock")
+    if (lastRestockAction && lastRestockAction.type === "recordRestock") {
+      // 构造临时 restock draft 用于洞察生成
+      const tempDraft: AgentDraft = {
+        kind: "restock",
+        itemName: lastRestockAction.itemName,
+        qty: lastRestockAction.qty,
+        unit: lastRestockAction.unit,
+        price: lastRestockAction.price,
+        platform: lastRestockAction.platform,
+        restockDate: now
+      }
+      insight = runPostCommitInsight(tempDraft, nextState, now, dateContext)
+    }
   }
 
   return {
     state: nextState,
     summary: summaries.join("\n"),
     links,
-    observation
+    observation,
+    insight
   }
 }
