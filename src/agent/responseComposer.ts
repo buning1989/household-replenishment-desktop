@@ -10,10 +10,12 @@
  */
 
 import { describeAgentDraft, type AgentDraft, type OrderRow } from "./drafts"
+import type { DraftCollection } from "./draftCollection"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { OrderImportRow } from "../OrderImportReview"
 import type { ConversationBoundary } from "./conversationBoundary"
 import type { AppState } from "../types"
+import { startOfDay, formatDate } from "../domain"
 import { buildRecordSuggestions, findSuggestionByField, type FieldSuggestion, type InferenceItemView } from "./recordInference"
 
 /**
@@ -272,6 +274,198 @@ function buildPlatformGuidanceLine(suggestion: FieldSuggestion): string {
     return `${suggestion.reason}，没特别说就先按这个记。`
   }
   return ""
+}
+
+// ---------- 采集态（DraftCollection）文案 ----------
+
+/** 从 restock 类草稿里取出展示需要的字段。 */
+function getRestockDisplayFields(draft: AgentDraft): {
+  itemName: string
+  qty: number
+  unit: string
+  restockDate?: number
+  platform?: string
+  price?: number
+} {
+  const fallback = { itemName: "", qty: 1, unit: "件" }
+  if (draft.kind === "restock") {
+    return {
+      itemName: draft.itemName,
+      qty: draft.qty && draft.qty > 0 ? draft.qty : 1,
+      unit: draft.unit || "件",
+      restockDate: draft.restockDate,
+      platform: draft.platform,
+      price: draft.price
+    }
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return {
+      itemName: draft.item.itemName,
+      qty: draft.restock.qty && draft.restock.qty > 0 ? draft.restock.qty : 1,
+      unit: draft.restock.unit || draft.item.unit || "件",
+      restockDate: draft.restock.restockDate,
+      platform: draft.restock.platform,
+      price: draft.restock.price
+    }
+  }
+  return fallback
+}
+
+/** 把 restockDate 格式化成口语日期标签：今天 / 昨天 / X月X日。 */
+function relativeDateLabel(restockDate: number | undefined, now: number): string {
+  if (!restockDate || !Number.isFinite(restockDate)) return "今天"
+  const todayStart = startOfDay(now)
+  if (restockDate === todayStart) return "今天"
+  if (restockDate === todayStart - 24 * 60 * 60 * 1000) return "昨天"
+  return formatDate(restockDate)
+}
+
+/**
+ * 采集态主文案：基于历史/常识给参考，用自然语言整理当前这条补货记录。
+ *
+ * 不展示确认卡、不说「确认后保存」类卡片话术、不机械追问「多少钱」。
+ * 每轮只问一个核心问题：平台缺问平台，金额缺问金额。
+ *
+ * justFilled 用于补充轮的开场（如「平台记拼多多。」），首轮传 null。
+ */
+export function composeCollectionMessage(
+  collection: DraftCollection,
+  state: AppState,
+  itemViews: InferenceItemView[],
+  options?: { justFilled?: "platform" | "price" | "review" | "date" | "qty" | null }
+): string {
+  const { draft } = collection
+  const fields = getRestockDisplayFields(draft)
+  const { itemName, qty, unit, restockDate, platform, price } = fields
+  const now = collection.updatedAt
+  const dateLabel = relativeDateLabel(restockDate, now)
+  const justFilled = options?.justFilled ?? null
+
+  // 价格建议（仅在 price 缺失时才有）
+  const suggestions = buildRecordSuggestions(draft, state, itemViews)
+  const priceSuggestion = findSuggestionByField(suggestions, "price")
+
+  const lines: string[] = []
+
+  // 1. 开场：按 justFilled 决定
+  if (justFilled === "platform" && platform) {
+    lines.push(`平台记${platform}。`)
+  } else if (justFilled === "review") {
+    lines.push("评价记下了。")
+  } else {
+    // 首轮或其它：先把已知的物品/数量/日期说清楚
+    lines.push(`${itemName} ${qty}${unit}，日期按${dateLabel}。`)
+  }
+
+  // 2. 价格参考（price 缺失时给参考，不直接问「多少钱」）
+  if (price === undefined || price === null) {
+    if (priceSuggestion) {
+      lines.push(buildCollectionPriceStatement(itemName, qty, unit, platform, priceSuggestion))
+    }
+  }
+
+  // 3. 平台差异提示（用户已说平台且与历史不同时）
+  if (platform && priceSuggestion && (price === undefined || price === null)) {
+    const diff = buildPlatformDifferentialHint(platform, priceSuggestion)
+    if (diff) lines.push(diff)
+  }
+
+  // 4. 一个核心问题：平台缺问平台，否则问金额
+  if (!platform || !platform.trim()) {
+    if (price === undefined || price === null) {
+      lines.push("你这次在哪个平台买的？如果金额不是这个数，直接说一个数我改准。")
+    } else {
+      lines.push("你这次在哪个平台买的？")
+    }
+  } else if (price === undefined || price === null) {
+    lines.push("实际金额是多少？")
+  }
+
+  return lines.filter(Boolean).join(" ")
+}
+
+/** 采集态价格参考陈述句（不含问句，由调用方追加问题）。 */
+function buildCollectionPriceStatement(
+  itemName: string,
+  qty: number,
+  unit: string,
+  _platformSaid: string | undefined,
+  suggestion: FieldSuggestion
+): string {
+  const perWhat = unit
+  if (suggestion.source === "itemHistory") {
+    if (suggestion.range) {
+      const unitMin = Math.round(suggestion.range.min / qty)
+      const unitMax = Math.round(suggestion.range.max / qty)
+      return `之前${itemName}单价在 ¥${unitMin}~¥${unitMax}/${perWhat}，这次 ${qty}${unit} 我先按 ¥${suggestion.range.min}~¥${suggestion.range.max} 估着。`
+    }
+    const unitPrice = typeof suggestion.value === "number" ? Math.round(suggestion.value / qty) : null
+    if (unitPrice !== null) {
+      return `之前${itemName}大概 ¥${unitPrice}/${perWhat}，这次 ${qty}${unit} 我先按 ¥${suggestion.value} 附近估着。`
+    }
+    return `之前${itemName}的价格我可以参考一下，这次 ${qty}${unit} 我先估一版。`
+  }
+  if (suggestion.source === "purchaseOption") {
+    if (suggestion.range) {
+      return `按常购商品估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。`
+    }
+    return `按常购商品价格估，${qty}${unit} 我先按 ¥${suggestion.value} 记。`
+  }
+  if (suggestion.source === "categoryHistory") {
+    if (suggestion.range) {
+      return `同分类其他物品大概这个价，${qty}${unit} 我先按 ¥${suggestion.range.min}~¥${suggestion.range.max} 估着（只是参考）。`
+    }
+    return `同分类其他物品我参考了一下，${qty}${unit} 我先按 ¥${suggestion.value} 估着。`
+  }
+  // llmPrior / template：必须说「常见」，不伪装历史
+  if (suggestion.range) {
+    return `${itemName}之前还没记过价格。按常见价格范围估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。`
+  }
+  return `${itemName}之前还没记过价格。按常见范围估，${qty}${unit} 大概 ¥${suggestion.value}。`
+}
+
+/**
+ * 把单条 FieldSuggestion 渲染成一行可读文案（供调试 / 卡片次要展示）。
+ * 用户可见文案以 composeCollectionMessage 为准，本函数仅供辅助场景。
+ */
+export function composeSuggestionLine(suggestion: FieldSuggestion): string {
+  const valueText = suggestion.range
+    ? `¥${suggestion.range.min}~¥${suggestion.range.max}`
+    : suggestion.value !== undefined ? `¥${suggestion.value}` : ""
+  const confidenceText = suggestion.confidence === "high" ? "高" : suggestion.confidence === "medium" ? "中" : "低"
+  return `${suggestion.field}：${valueText}（置信度${confidenceText}，${suggestion.reason}）`
+}
+
+/**
+ * 采集态转 proposal 时的文案：信息够了，确认后我再写入。
+ * 质量字段仍缺失时附带「未补全记录」提示，不说「没关系 / 先空着也不影响」。
+ */
+export function composeReadyToConfirmMessage(draft: AgentDraft, qualityMissing: string[]): string {
+  const fields = getRestockDisplayFields(draft)
+  const { itemName, qty, unit, platform, price } = fields
+  const parts: string[] = []
+  if (price !== undefined && price !== null) {
+    parts.push(`¥${price}`)
+  }
+  if (platform) parts.push(platform)
+  parts.push(`${qty}${unit}`)
+  const summary = `${itemName}，${parts.join("，")}，今天买`
+  const lines: string[] = []
+  if (price !== undefined && price !== null) {
+    lines.push(`好，这笔按 ¥${price} 记。现在这条记录信息够了：${summary}。你确认后我再写入。`)
+  } else {
+    lines.push(`好，这条就按现有信息整理完了：${summary}。你确认后我再写入。`)
+  }
+  if (qualityMissing.length > 0) {
+    const labels = qualityMissing.map((slot) => (slot === "price" ? "金额" : slot === "platform" ? "平台" : slot))
+    lines.push(`这条先按未补全记录保存（${labels.join("、")} 后面看到订单可以再补）。`)
+  }
+  return lines.join(" ")
+}
+
+/** 采集态取消文案：用户说「算了」时。不说「已取消草稿」。 */
+export function composeCollectionCancelledMessage(): string {
+  return "行，这条我先不记。下次你说了我再来。"
 }
 
 /**

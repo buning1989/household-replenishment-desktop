@@ -22,6 +22,7 @@
  */
 
 import type { AgentClarification, AgentDraft, AgentDraftStatus, OrderRow } from "./drafts"
+import type { DraftCollection } from "./draftCollection"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { AppState } from "../types"
 import type { AgentPlan } from "./actions"
@@ -61,6 +62,26 @@ export type AgentTurnClarification = {
 export type AgentTurnCancelled = {
   kind: "cancelled"
   message: string
+}
+
+/**
+ * 补货记录采集态。
+ *
+ * 用户说「今天买了 5 袋猫砂」但 price/platform 等字段还没补齐时，先进入采集态：
+ * 管家用自然语言基于历史/常识给参考，继续整理这条临时记录，不展示确认卡。
+ *
+ * - UI 只渲染普通 assistant 气泡（用 message），不渲染 AgentDraftCard / AgentPlanCard
+ * - collection 内部的 draft 不直接写入 state
+ * - 当 completeness = readyToConfirm 或用户明确要求保存时，转为 proposal turn
+ *
+ * 旧 collection 消息不需要变成卡片；转 proposal 时新增一条 proposal 消息即可。
+ */
+export type AgentTurnCollection = {
+  kind: "collection"
+  /** 给用户看的采集态文案，由 responseComposer.composeCollectionMessage 生成 */
+  message: string
+  /** 内部整理态草稿；UI 不直接渲染其字段，也不允许确认写入 */
+  collection: DraftCollection
 }
 
 /** 用户确认 proposal 后已写入 state。 */
@@ -153,6 +174,7 @@ export type AgentTurnPlanCommand = {
 export type AgentTurn =
   | AgentTurnAnswer
   | AgentTurnProposal
+  | AgentTurnCollection
   | AgentTurnClarification
   | AgentTurnCancelled
   | AgentTurnCommitted
@@ -171,6 +193,8 @@ export type OrchestrateInput = {
   itemViews: import("../llm/householdChat").HouseholdChatItemView[]
   /** 当前是否有 pending proposal（上一轮生成的待确认草稿） */
   pendingDraft?: AgentDraft
+  /** 当前是否有 pending 采集态（补货记录整理中，字段未补齐）；存在时优先按补充/取消/保存处理 */
+  pendingCollection?: DraftCollection
   /** 当前是否有 pending 批量草稿（订单导入） */
   pendingBatch?: AgentDraft[]
   /** 当前是否有 pending AgentPlan（多动作计划）；存在时优先按修订/确认/取消处理 */
@@ -192,13 +216,15 @@ export type OrchestrateDecision =
  *   2. pending plan + 用户取消 → 返回 cancelled turn
  *   3. pending plan + 用户修订 → 生成新 planProposal，旧 plan 标记 superseded
  *   4. pending plan + 用户询问状态 → answer
- *   5. pending proposal（旧 AgentDraft）+ 用户确认/取消/修订 → 沿用旧 proposal 流程
- *   6. pending batch + 批量意图 → 批量处理（typed command）
- *   7. 新写入意图 + 本地 planner 可解析 → planProposal
- *   8. 新写入意图 + 本地 drafts 可解析 → proposal 或 clarification
- *   9. 查询意图 + 本地可回答 → answer
- *   10. 对话边界（identity/realtime/casual）→ 本地自然回应
- *   11. 其他 → needLlm（交给 LLM fallback）
+ *   5. pending collection + 用户补充/取消/保存 → 更新 collection / cancelled / 转 proposal
+ *   6. pending proposal（旧 AgentDraft）+ 用户确认/取消/修订 → 沿用旧 proposal 流程
+ *   7. pending batch + 批量意图 → 批量处理（typed command）
+ *   8. 新写入意图 + 本地 planner 可解析 → planProposal
+ *   9. 新写入意图 + 补货类草稿字段未齐 → collection（采集态）
+ *   10. 新写入意图 + 本地 drafts 可解析 → proposal 或 clarification
+ *   11. 查询意图 + 本地可回答 → answer
+ *   12. 对话边界（identity/realtime/casual）→ 本地自然回应
+ *   13. 其他 → needLlm（交给 LLM fallback）
  *
  * 注意：本函数是纯函数，不调用 LLM，不修改 state。
  * 调用方拿到 needLlm 时自行调用 askHouseholdAssistant，再把结果传给 normalizeLlmResponse。

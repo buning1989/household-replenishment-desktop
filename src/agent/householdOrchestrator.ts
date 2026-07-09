@@ -6,11 +6,21 @@
  */
 
 import { buildLocalClarification, buildLocalDraftFromText, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
+import {
+  createDraftCollection,
+  reviseDraftCollection,
+  shouldEnterCollection,
+  hasMissingQuality,
+  type DraftCollection
+} from "./draftCollection"
 import { classifyAgentIntent, classifyBatchIntent, isSecondConfirmMatch, type BatchLocalIntent } from "./intent"
 import {
   composeClarificationMessage,
   composeFallbackMessage,
   composeCollectionGuidance,
+  composeCollectionMessage,
+  composeCollectionCancelledMessage,
+  composeReadyToConfirmMessage,
   composePendingReminder,
   composeProposalMessage,
   composeRevisedMessage,
@@ -20,7 +30,7 @@ import {
   composeBoundaryAnswer
 } from "./responseComposer"
 import { classifyConversationBoundary } from "./conversationBoundary"
-import type { InferenceItemView } from "./recordInference"
+import { buildRecordSuggestions, type InferenceItemView } from "./recordInference"
 import { buildAgentPlan, composePlanMessage, type BuildAgentPlanResult } from "./planner"
 import type { AgentPlan } from "./actions"
 import type {
@@ -45,7 +55,7 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
 
 /** 同步决策：本地能处理就返回 sync turn，否则返回 needLlm。 */
 function decideSync(input: OrchestrateInput): OrchestrateDecision {
-  const { text, state, itemViews, pendingDraft, pendingBatch, pendingPlan, dateContext } = input
+  const { text, state, itemViews, pendingDraft, pendingCollection, pendingBatch, pendingPlan, dateContext } = input
 
   // 1. pending plan 优先（多动作计划状态机：confirm / cancel / revise / status）
   //    第三期：high risk plan 有 awaitingSecondConfirm 状态，需要二次「确认删除」
@@ -56,14 +66,23 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     // 落到下面：可能是新操作请求（生成新 plan，旧 plan 标 superseded）或查询/闲聊
   }
 
-  // 2. pending batch（订单导入后的批量修正）
+  // 2. pending collection（补货记录采集态）：补充字段 / 取消 / 直接保存 / 转 proposal
+  //    collection 是 proposal 的前驱态：字段未齐时先整理，齐了再转 proposal 走 confirm 链路
+  if (pendingCollection) {
+    const collectionTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
+    if (collectionTurn) return { kind: "sync", turn: collectionTurn }
+    // collectionTurn === null 表示本轮没命中 collection 信号（如纯查询或新操作请求）
+    // 落到下面：新 writeDraft 会生成新 collection/proposal，旧 collection 由调用方标 superseded
+  }
+
+  // 3. pending batch（订单导入后的批量修正）
   if (pendingBatch && pendingBatch.length > 0) {
     const batchTurn = handleBatchIntent(text, pendingBatch, state)
     if (batchTurn) return { kind: "sync", turn: batchTurn }
     // 批量意图没命中，落到下面单草稿/查询/LLM 流程
   }
 
-  // 3. pending proposal（旧 AgentDraft 状态机）：confirm / cancel / revise / pendingStatus
+  // 4. pending proposal（旧 AgentDraft 状态机）：confirm / cancel / revise / pendingStatus
   if (pendingDraft) {
     const intent = classifyAgentIntent(text, true)
     if (intent === "confirmDraft") {
@@ -151,6 +170,12 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     // 4c. 回退到旧 AgentDraft 流程
     const localDraft = buildLocalDraftFromText(text, state)
     if (localDraft) {
+      // 补货类草稿字段未齐时，先进采集态（DraftCollection），
+      // 用自然语言基于历史/常识帮用户整理，而不是立刻甩确认卡或机械追问「多少钱」。
+      // 字段已齐（readyToConfirm）或用户明确要求保存时，仍直接走 proposal。
+      if (shouldEnterCollection(localDraft, text)) {
+        return { kind: "sync", turn: draftToCollection(localDraft, state, itemViews, dateContext) }
+      }
       return { kind: "sync", turn: draftToProposal(localDraft, state, itemViews) }
     }
     // 4d. 本地解析失败 → 交给 LLM
@@ -358,8 +383,26 @@ function clarifyToTurn(clarification: AgentClarification): AgentTurn {
  *  草稿首次产出时，若 price/platform 缺失，调用 composeCollectionGuidance
  *  基于历史价格/常识给参考判断，而不是机械追问「多少钱」。
  *  revise/confirm 路径不走这里，保证不重复采集。
+ *
+ *  fromCollection = true 时表示从采集态转来（字段已补齐或用户要求直接保存），
+ *  改用 composeReadyToConfirmMessage 生成「信息够了，你确认后我再写入」的文案，
+ *  并在质量字段仍缺失时附带「未补全记录」提示，不再追加采集式追问。
  */
-function draftToProposal(draft: AgentDraft, state: import("../types").AppState, itemViews: InferenceItemView[]): AgentTurn {
+function draftToProposal(
+  draft: AgentDraft,
+  state: import("../types").AppState,
+  itemViews: InferenceItemView[],
+  options?: { fromCollection?: boolean; qualityMissing?: string[] }
+): AgentTurn {
+  if (options?.fromCollection) {
+    const message = composeReadyToConfirmMessage(draft, options.qualityMissing || [])
+    return {
+      kind: "proposal",
+      message,
+      executableDraft: draft,
+      status: "pending"
+    }
+  }
   const baseMessage = composeProposalMessage(draft)
   const guidance = composeCollectionGuidance(draft, state, itemViews)
   const message = guidance ? `${baseMessage} ${guidance}` : baseMessage
@@ -369,6 +412,88 @@ function draftToProposal(draft: AgentDraft, state: import("../types").AppState, 
     executableDraft: draft,
     status: "pending"
   }
+}
+
+/** 把补货类草稿转成 AgentTurnCollection（采集态首次产出）。 */
+function draftToCollection(
+  draft: AgentDraft,
+  state: import("../types").AppState,
+  itemViews: InferenceItemView[],
+  dateContext: import("../llm/householdChat").ChatDateContext
+): AgentTurn {
+  const suggestions = buildRecordSuggestions(draft, state, itemViews)
+  const collection = createDraftCollection(draft, suggestions, dateContext.now)
+  const message = composeCollectionMessage(collection, state, itemViews, { justFilled: null })
+  return { kind: "collection", message, collection }
+}
+
+/**
+ * 处理 pendingCollection 的用户输入。
+ * 返回 null 表示本轮没命中 collection 信号（纯查询或新操作请求），由外层继续判断。
+ *
+ * 状态机：
+ *   - 取消信号（算了/不记了）→ cancelled
+ *   - 强制保存信号（就这样/先保存/直接记下）→ 转 proposal（带未补全标记）
+ *   - 字段补充（平台/金额/评价/日期/数量）→ 更新 collection
+ *     - 补完后 completeness = readyToConfirm → 转 proposal
+ *     - 否则 → 继续 collection，问下一个核心问题
+ *   - 输入未命中任何字段 → null（外层按查询/新操作处理，collection 仍保留）
+ */
+function handlePendingCollectionIntent(
+  text: string,
+  collection: DraftCollection,
+  state: import("../types").AppState,
+  itemViews: InferenceItemView[],
+  dateContext: import("../llm/householdChat").ChatDateContext
+): AgentTurn | null {
+  const prevMissing = collection.qualityMissingSlots
+  const result = reviseDraftCollection(collection, text, state, dateContext.now)
+
+  if (result.status === "cancelled") {
+    return { kind: "cancelled", message: composeCollectionCancelledMessage() }
+  }
+
+  if (result.status === "forceProposal") {
+    // 用户要求直接保存：用最新草稿转 proposal，质量字段仍缺则带「未补全」标记
+    const draft = result.draft
+    const qualityMissing = hasMissingQuality(collection) ? collection.qualityMissingSlots : []
+    return draftToProposal(draft, state, itemViews, { fromCollection: true, qualityMissing })
+  }
+
+  if (result.status === "supplemented") {
+    const next = result.collection
+    if (next.completeness === "readyToConfirm") {
+      // 字段补齐 → 转 proposal，走原 confirm → commit 链路
+      return draftToProposal(next.draft, state, itemViews, { fromCollection: true })
+    }
+    // 检测本轮刚补上的是哪个字段，用于文案开场（如「平台记拼多多。」）
+    const justFilled = detectJustFilled(prevMissing, next.qualityMissingSlots, collection.draft, next.draft)
+    const message = composeCollectionMessage(next, state, itemViews, { justFilled })
+    return { kind: "collection", message, collection: next }
+  }
+
+  // noChange：输入没命中任何字段。返回 null 让外层判断（查询或新操作）。
+  // 这样纯查询能被正常回答，新操作能生成新 collection/proposal，旧 collection 由调用方标 superseded。
+  return null
+}
+
+/** 检测本轮补充后刚填上的字段，用于 collection 文案开场。 */
+function detectJustFilled(
+  prevQualityMissing: string[],
+  nextQualityMissing: string[],
+  prevDraft: AgentDraft,
+  nextDraft: AgentDraft
+): "platform" | "price" | "review" | "date" | "qty" | null {
+  // platform 刚补上
+  if (prevQualityMissing.includes("platform") && !nextQualityMissing.includes("platform")) return "platform"
+  // price 刚补上（一般会触发 readyToConfirm，这里仅兜底）
+  if (prevQualityMissing.includes("price") && !nextQualityMissing.includes("price")) return "price"
+  // review 刚补上（review 不在 qualityMissingSlots 里，用 draft 字段对比）
+  const prevReview = prevDraft.kind === "restock" ? prevDraft.review : prevDraft.kind === "createItemWithRestock" ? prevDraft.restock.review : undefined
+  const nextReview = nextDraft.kind === "restock" ? nextDraft.review : nextDraft.kind === "createItemWithRestock" ? nextDraft.restock.review : undefined
+  if (!prevReview && nextReview) return "review"
+  // 日期/数量变化（少见于采集态，但兜底）
+  return null
 }
 
 /** 处理批量意图（订单导入）。返回 null 表示不是批量意图。
@@ -423,6 +548,10 @@ function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | nul
   if (parsed.kind === "draft") {
     // 关键：不直接采用 LLM 的 message，由 composer 重新生成
     // 这样保证 LLM 即使文案漂移，最终用户看到的仍是统一管家口吻
+    // 补货类草稿字段未齐时同样进采集态，避免 LLM 绕过 collection 直接甩确认卡
+    if (shouldEnterCollection(parsed.draft, input.text)) {
+      return draftToCollection(parsed.draft, input.state, input.itemViews, input.dateContext)
+    }
     return draftToProposal(parsed.draft, input.state, input.itemViews)
   }
   return null

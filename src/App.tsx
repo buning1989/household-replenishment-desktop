@@ -27,7 +27,7 @@ import { buildManagerBriefing, buildManagerObservations } from "./agent/observat
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent, classifyAgentIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, commitAgentPlan, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
-import { buildAgentContextPack, supersedeOldPendingDraft } from "./agent/conversationContext"
+import { buildAgentContextPack, supersedeOldPendingDraft, supersedeOldPendingCollection } from "./agent/conversationContext"
 import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
 import { computeRemainingDelay, getResponseTiming } from "./agent/responsePacing"
@@ -1142,6 +1142,7 @@ function ManagerAvatar() {
 function isPlainAssistantMessage(message: HouseholdChatMessage) {
   return message.role === "assistant" &&
     !message.agentDraft &&
+    !message.agentCollection &&
     !message.agentDraftBatch &&
     !message.orderImportRows &&
     !message.clarification &&
@@ -1823,6 +1824,15 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	    return -1
 	  }
 
+  // 采集态（DraftCollection）：找到最近一条 collectionStatus === "pending" 的 agentCollection 消息。
+  // collection 是 proposal 的前驱态，优先级高于 pendingDraft。
+  function latestPendingCollectionMessageIndex(list: HouseholdChatMessage[]): number {
+    for (let index = list.length - 1; index >= 0; index -= 1) {
+      if (list[index].role === "assistant" && list[index].collectionStatus === "pending" && list[index].agentCollection) return index
+    }
+    return -1
+  }
+
   // AgentPlan 状态机：找到最近一条 planStatus 为 "pending" 或 "awaitingSecondConfirm" 的 agentPlan 消息。
   // 第三期：高风险 plan 第一次确认后进入 awaitingSecondConfirm，仍属于「待处理」。
   function latestPendingPlanMessageIndex(list: HouseholdChatMessage[]): number {
@@ -2205,6 +2215,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     }
     const pendingMessageIndex = latestPendingDraftMessageIndex(messages)
     const pendingDraft = pendingMessageIndex >= 0 ? messages[pendingMessageIndex].agentDraft : undefined
+    const pendingCollectionMessageIndex = latestPendingCollectionMessageIndex(messages)
+    const pendingCollection = pendingCollectionMessageIndex >= 0 ? messages[pendingCollectionMessageIndex].agentCollection : undefined
     const pendingPlanMessageIndex = latestPendingPlanMessageIndex(messages)
     const pendingPlan = pendingPlanMessageIndex >= 0 ? messages[pendingPlanMessageIndex].agentPlan : undefined
     const dateContext = buildChatDateContext()
@@ -2215,6 +2227,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       state,
       itemViews,
       pendingDraft,
+      pendingCollection,
       pendingPlan,
       dateContext
     })
@@ -2265,6 +2278,26 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer"), createdAt: Date.now() }])
         return
       }
+      // 采集态 collection turn：新采集或补充采集，渲染为普通气泡（不展示确认卡）
+      // 旧 pending collection 标 superseded，新 collection 标 pending
+      if (turn.kind === "collection") {
+        await waitWithTransient(nextMessages, timing)
+        const base = pendingCollectionMessageIndex >= 0
+          ? supersedeOldPendingCollection(nextMessages)
+          : nextMessages
+        onMessagesChange([...base, { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt: Date.now() }])
+        return
+      }
+      // 采集态取消：用户说「算了」取消当前 collection，不写入 state
+      if (turn.kind === "cancelled" && pendingCollection && !pendingDraft) {
+        const base = pendingCollectionMessageIndex >= 0
+          ? nextMessages.map((message, index) => index === pendingCollectionMessageIndex
+            ? { ...message, collectionStatus: "cancelled" as const }
+            : message)
+          : nextMessages
+        onMessagesChange([...base, { role: "assistant", content: turn.message, createdAt: Date.now() }])
+        return
+      }
       if (turn.kind === "proposal" && pendingDraft && turn.executableDraft === pendingDraft) {
         // confirmDraft：立即反馈，不显示思考
         confirmAgentDraft(pendingMessageIndex, nextMessages)
@@ -2275,15 +2308,19 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         cancelAgentDraft(pendingMessageIndex, nextMessages)
         return
       }
-      // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal / planProposal）：走节奏
+      // 其他 sync 路径（answer / clarification / 修订 / 普通 proposal / planProposal / collection）：走节奏
       await waitWithTransient(nextMessages, timing)
       if (turn.kind === "planProposal") {
-        // 旧 pendingPlan（若有）标 superseded，新 plan 标 pending
-        const base = pendingPlanMessageIndex >= 0
-          ? nextMessages.map((message, index) => index === pendingPlanMessageIndex
+        // 旧 pendingPlan（若有）标 superseded，旧 pending collection（若有）标 superseded
+        let base = nextMessages
+        if (pendingPlanMessageIndex >= 0) {
+          base = base.map((message, index) => index === pendingPlanMessageIndex
             ? { ...message, planStatus: "superseded" as const }
             : message)
-          : nextMessages
+        }
+        if (pendingCollectionMessageIndex >= 0) {
+          base = supersedeOldPendingCollection(base)
+        }
         onMessagesChange([...base, { role: "assistant", content: turn.message, agentPlan: turn.plan, planStatus: "pending" as const, createdAt: Date.now() }])
         return
       }
@@ -2296,12 +2333,17 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         return
       }
       if (turn.kind === "proposal") {
-        // 普通 proposal（新操作，非修订）：如果有 pendingPlan，标记 superseded
-        const base = pendingPlanMessageIndex >= 0
-          ? nextMessages.map((message, index) => index === pendingPlanMessageIndex
+        // 普通 proposal（新操作或 collection 转 proposal）：
+        // 旧 pendingPlan（若有）标 superseded，旧 pending collection（若有）标 superseded
+        let base = nextMessages
+        if (pendingPlanMessageIndex >= 0) {
+          base = base.map((message, index) => index === pendingPlanMessageIndex
             ? { ...message, planStatus: "superseded" as const }
             : message)
-          : nextMessages
+        }
+        if (pendingCollectionMessageIndex >= 0) {
+          base = supersedeOldPendingCollection(base)
+        }
         onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
         return
       }
@@ -2352,7 +2394,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const baseWithoutTransient = nextMessages
 	    if (result.ok) {
 	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
-	        text, state, itemViews, pendingDraft, dateContext
+	        text, state, itemViews, pendingDraft, pendingCollection, dateContext
 	      })
 	      if (!turn) {
 	        // 非管家问题不再统一机械拒绝：按对话边界给自然回应。
@@ -2363,11 +2405,40 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback, createdAt: Date.now() }])
 	        return
 	      }
+	      if (turn.kind === "collection") {
+	        // LLM 返回 collection：旧 pending collection 标 superseded
+	        const base = pendingCollectionMessageIndex >= 0
+	          ? supersedeOldPendingCollection(baseWithoutTransient)
+	          : baseWithoutTransient
+	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt: Date.now() }])
+	        return
+	      }
+	      if (turn.kind === "cancelled" && pendingCollection && !pendingDraft) {
+	        // LLM 返回采集态取消
+	        const base = pendingCollectionMessageIndex >= 0
+	          ? baseWithoutTransient.map((message, index) => index === pendingCollectionMessageIndex
+	            ? { ...message, collectionStatus: "cancelled" as const }
+	            : message)
+	          : baseWithoutTransient
+	        onMessagesChange([...base, { role: "assistant", content: turn.message, createdAt: Date.now() }])
+	        return
+	      }
 	      if (turn.kind === "proposal" && pendingDraft) {
-	        // LLM 返回新 draft：旧 pending 标 superseded
-	        const base = baseWithoutTransient.map((message, index) => index === pendingMessageIndex
+	        // LLM 返回新 draft：旧 pending 标 superseded，旧 pending collection 标 superseded
+	        let base = baseWithoutTransient.map((message, index) => index === pendingMessageIndex
 	          ? { ...message, draftStatus: "superseded" as const }
 	          : message)
+	        if (pendingCollectionMessageIndex >= 0) {
+	          base = supersedeOldPendingCollection(base)
+	        }
+	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
+	        return
+	      }
+	      if (turn.kind === "proposal" && pendingCollection && !pendingDraft) {
+	        // LLM 返回 collection 转 proposal：旧 pending collection 标 superseded
+	        const base = pendingCollectionMessageIndex >= 0
+	          ? supersedeOldPendingCollection(baseWithoutTransient)
+	          : baseWithoutTransient
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
 	        return
 	      }
@@ -2421,6 +2492,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const createdAt = Date.now()
     if (turn.kind === "answer") {
       return { role: "assistant", content: turn.message, createdAt }
+    }
+    if (turn.kind === "collection") {
+      // 采集态：渲染为普通气泡（agentCollection 只供内部状态用，不展示卡片）
+      return { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt }
     }
     if (turn.kind === "proposal") {
       return { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt }

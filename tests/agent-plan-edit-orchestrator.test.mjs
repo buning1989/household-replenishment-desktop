@@ -189,20 +189,20 @@ test("orchestrator: pendingPlan + 查询句式不影响 pendingPlan", () => {
 
 // ---------- 旧 Draft 流程不受影响 ----------
 
-test("orchestrator: 「帮我加一袋猫砂」仍走旧 AgentDraft proposal（不生成 planProposal）", () => {
+test("orchestrator: 「帮我加一袋猫砂」仍走旧 AgentDraft 采集态（不生成 planProposal）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "帮我加一袋猫砂", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal", "restock 应走旧 AgentDraft proposal")
-  assert.equal(decision.turn.executableDraft.kind, "restock")
+  assert.equal(decision.turn.kind, "collection", "restock 应走采集态 collection")
+  assert.equal(decision.turn.collection.draft.kind, "restock")
 })
 
-test("orchestrator: 「帮我加一袋猫砂」（无此物品）仍走旧 AgentDraft proposal", () => {
+test("orchestrator: 「帮我加一袋猫砂」（无此物品）仍走旧 AgentDraft 采集态", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "帮我加一袋猫砂", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal", "createItem 应走旧 AgentDraft proposal")
-  assert.equal(decision.turn.executableDraft.kind, "createItemWithRestock")
+  assert.equal(decision.turn.kind, "collection", "createItem 应走采集态 collection")
+  assert.equal(decision.turn.collection.draft.kind, "createItemWithRestock")
 })

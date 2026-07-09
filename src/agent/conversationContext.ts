@@ -17,6 +17,7 @@
 import { formatDate, formatPrice } from "../domain"
 import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AgentClarification, AgentDraft } from "./drafts"
+import type { DraftCollection } from "./draftCollection"
 import type { OrderImportRow } from "../orderImportRows"
 import type { AppState, ReplenishmentItem } from "../types"
 import type {
@@ -37,6 +38,7 @@ import { buildManagedItemsLine, buildQueryFacts } from "../llm/householdChat"
 // ---------- ConversationFocus ----------
 
 export type ConversationFocus =
+  | { kind: "draftCollection"; collection: DraftCollection; messageId: string; updatedAt: number }
   | { kind: "pendingDraft"; draft: AgentDraft; messageId: string; updatedAt: number }
   | { kind: "orderImport"; rows: OrderImportRow[]; messageId: string; updatedAt: number }
   | { kind: "clarification"; clarification: AgentClarification; updatedAt: number }
@@ -69,6 +71,8 @@ export type AgentContextPack = {
   relevantAppFacts: string
   /** 当前 pending 的可执行草稿（仅 pendingDraft 焦点时存在） */
   pendingExecutable?: AgentDraft
+  /** 当前 pending 的采集态（仅 draftCollection 焦点时存在） */
+  pendingCollection?: DraftCollection
   /** 允许 LLM 输出的动作类型 */
   allowedActions: AllowedAction[]
 }
@@ -87,13 +91,14 @@ const DEFAULT_RECENT_LIMIT = 6
  * 从 messages 推断当前 active focus。
  *
  * 优先级：
- *   1. 最新 pending draft（draftStatus === "pending"）
- *   2. 最新 pending orderImport（orderImportStatus === "pending"）
- *   3. 最新 clarification（assistant 发起，且之后没有用户消化）
- *   4. 用户当前输入命中的 queryTopic
- *   5. none
+ *   1. 最新 pending collection（collectionStatus === "pending"）—— 采集态优先于 proposal
+ *   2. 最新 pending draft（draftStatus === "pending"）
+ *   3. 最新 pending orderImport（orderImportStatus === "pending"）
+ *   4. 最新 clarification（assistant 发起，且之后没有用户消化）
+ *   5. 用户当前输入命中的 queryTopic
+ *   6. none
  *
- * 注意：superseded/confirmed/cancelled 的旧 draft 不再作为 focus。
+ * 注意：superseded/confirmed/cancelled 的旧 draft/collection 不再作为 focus。
  */
 export function inferActiveFocus(
   messages: HouseholdChatMessage[],
@@ -102,7 +107,20 @@ export function inferActiveFocus(
 ): ConversationFocus {
   const now = dateContext.now
 
-  // 1. 最新 pending draft
+  // 1. 最新 pending collection（采集态优先于 proposal）
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.role === "assistant" && msg.agentCollection && msg.collectionStatus === "pending") {
+      return {
+        kind: "draftCollection",
+        collection: msg.agentCollection,
+        messageId: String(i),
+        updatedAt: now
+      }
+    }
+  }
+
+  // 2. 最新 pending draft
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.role === "assistant" && msg.agentDraft && msg.draftStatus === "pending") {
@@ -115,7 +133,7 @@ export function inferActiveFocus(
     }
   }
 
-  // 2. 最新 pending orderImport
+  // 3. 最新 pending orderImport
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.role === "assistant" && msg.orderImportRows && msg.orderImportStatus === "pending") {
@@ -128,7 +146,7 @@ export function inferActiveFocus(
     }
   }
 
-  // 3. 最新 clarification：最后一条 assistant 消息带 clarification 即视为 active
+  // 4. 最新 clarification：最后一条 assistant 消息带 clarification 即视为 active
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i]
     if (msg.role === "assistant" && msg.clarification) {
@@ -140,7 +158,7 @@ export function inferActiveFocus(
     }
   }
 
-  // 4. 用户当前输入命中的 queryTopic
+  // 5. 用户当前输入命中的 queryTopic
   const topic = detectQueryTopicFromText(currentUserText)
   if (topic) {
     return { kind: "queryTopic", topic, updatedAt: now }
@@ -208,6 +226,11 @@ export function compactRecentMessages(
       continue
     }
 
+    // 跳过 superseded/cancelled 的旧 collection 卡片（不再作为上下文）
+    if (msg.agentCollection && msg.collectionStatus && msg.collectionStatus !== "pending") {
+      continue
+    }
+
     // 跳过已确认/取消的订单导入卡片（不再作为上下文）
     if (msg.orderImportRows && msg.orderImportStatus && msg.orderImportStatus !== "pending") {
       continue
@@ -218,6 +241,15 @@ export function compactRecentMessages(
       compacted.push({
         role: "assistant",
         content: "（当前待确认草稿，详见上下文 focus 段）"
+      })
+      continue
+    }
+
+    // pending collection 卡片：从 activeFocus 读，历史里只留简短标记
+    if (msg.agentCollection && msg.collectionStatus === "pending") {
+      compacted.push({
+        role: "assistant",
+        content: "（当前正在整理的补货记录，详见上下文 focus 段）"
       })
       continue
     }
@@ -277,7 +309,18 @@ export function buildRelevantAppFacts(
   }
 
   // 4. focus 特定事实
-  if (focus.kind === "pendingDraft") {
+  if (focus.kind === "draftCollection") {
+    // 采集态：只给当前 collection 相关物品的历史记录和常购商品
+    const relatedItems = findRelatedItemsForDraft(focus.collection.draft, state)
+    if (relatedItems.length) {
+      lines.push("【当前正在整理的补货记录相关物品】")
+      for (const item of relatedItems) {
+        lines.push(serializeItemForContext(item))
+      }
+    } else {
+      lines.push("【当前正在整理的补货记录相关物品】无（新建物品）")
+    }
+  } else if (focus.kind === "pendingDraft") {
     const relatedItems = findRelatedItemsForDraft(focus.draft, state)
     if (relatedItems.length) {
       lines.push("【当前草稿相关物品】")
@@ -443,6 +486,7 @@ export function buildAgentContextPack(params: {
     seenObservationKeys
   )
   const pendingExecutable = activeFocus.kind === "pendingDraft" ? activeFocus.draft : undefined
+  const pendingCollection = activeFocus.kind === "draftCollection" ? activeFocus.collection : undefined
   const allowedActions = computeAllowedActions(activeFocus)
 
   return {
@@ -452,12 +496,17 @@ export function buildAgentContextPack(params: {
     recentMessages,
     relevantAppFacts,
     pendingExecutable,
+    pendingCollection,
     allowedActions
   }
 }
 
 /** 根据 focus 类型计算允许 LLM 输出的动作 */
 function computeAllowedActions(focus: ConversationFocus): AllowedAction[] {
+  if (focus.kind === "draftCollection") {
+    // 采集态：允许补充字段、转 proposal（draft）、取消、offTopic
+    return ["draft", "cancel", "offTopic"]
+  }
   if (focus.kind === "pendingDraft") {
     return ["confirm", "cancel", "revise", "offTopic"]
   }
@@ -515,6 +564,20 @@ export function supersedeOldPendingDraft(
   return messages.map((msg) =>
     msg.role === "assistant" && msg.agentDraft && msg.draftStatus === "pending"
       ? { ...msg, draftStatus: "superseded" as const }
+      : msg
+  )
+}
+
+/**
+ * 生成新的 collection 或 proposal 时，把旧 pending collection 标记为 superseded。
+ * 返回新的 messages 数组（不可变）。
+ */
+export function supersedeOldPendingCollection(
+  messages: HouseholdChatMessage[]
+): HouseholdChatMessage[] {
+  return messages.map((msg) =>
+    msg.role === "assistant" && msg.agentCollection && msg.collectionStatus === "pending"
+      ? { ...msg, collectionStatus: "superseded" as const }
       : msg
   )
 }

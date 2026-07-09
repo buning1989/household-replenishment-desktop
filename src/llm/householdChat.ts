@@ -3,6 +3,7 @@ import { calculateMonthlySpend } from "../pure-logic.mjs"
 import type { AppState, ItemComputed, ReplenishmentItem } from "../types"
 import { describeAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "../agent/drafts"
 import type { AgentPlan } from "../agent/actions"
+import type { DraftCollection } from "../agent/draftCollection"
 import type { OrderImportRow } from "../OrderImportReview"
 import { buildManagerObservations, filterUnseenObservations, markObservationsSeen, observationKey, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
 import type { AgentContextPack, ConversationFocus } from "../agent/conversationContext"
@@ -69,6 +70,14 @@ export type HouseholdChatMessage = {
   /** 新版可确认 agent 草稿；只有本地确认后才写入。 */
   agentDraft?: AgentDraft
   draftStatus?: AgentDraftStatus
+  /**
+   * 补货记录采集态（DraftCollection）：proposal 的前驱态。
+   * 字段未齐时先用自然语言整理，不展示确认卡；齐了或用户明确要求保存时转 proposal。
+   * collection 消息只渲染为普通 assistant 气泡，不允许确认写入。
+   * pending：仍在采集；superseded：被新 collection/proposal 取代；cancelled：用户说「算了」取消。
+   */
+  agentCollection?: DraftCollection
+  collectionStatus?: "pending" | "superseded" | "cancelled"
   /** AgentPlan 多动作计划；与 agentDraft 并存，覆盖建分类/设预算/改周期等 plan-only 能力。
    *  确认前不写入 state，确认后由 commitAgentPlan 统一执行。 */
   agentPlan?: AgentPlan

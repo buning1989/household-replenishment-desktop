@@ -464,6 +464,50 @@ export function parseReview(text: string): string | undefined {
   return undefined
 }
 
+/** 判断文本是否含评价信号词（任意 REVIEW_PHRASES 关键词）。 */
+export function containsReviewSignal(text: string): boolean {
+  const compacted = cleanText(text)
+  return REVIEW_PHRASES.some(({ keys }) => keys.some((key) => compacted.includes(key)))
+}
+
+/**
+ * 在 DraftCollection 采集态场景下，从用户输入中提取保留原文的评价文本。
+ *
+ * 与 parseReview 不同，本函数保留用户原始表达（含多条「，」分隔的评价点），
+ * 例如「这款猫砂品质不错，不起灰」→「品质不错，不起灰」。
+ *
+ * 规则：
+ *   1. 必须含评价信号词，否则返回 undefined
+ *   2. 去除开头的物品指示词：「这款/这个/那个/这/那/此款/此」
+ *   3. 去除开头的物品名（若调用方传入 itemName）
+ *   4. 去除首尾标点和「是/的」之类连接词
+ *   5. 保留剩余原文，包括「，」分隔的多个评价点
+ *
+ * 注意：本函数不修改全局 parseReview 行为，仅在 collection supplement 场景使用。
+ */
+export function extractReviewText(text: string, itemName?: string): string | undefined {
+  const compacted = cleanText(text)
+  if (!containsReviewSignal(compacted)) return undefined
+
+  let stripped = compacted
+  // 去除开头的指示词
+  stripped = stripped.replace(/^(这款|这个|那个|这|那|此款|此|本款|本)/, "")
+  // 去除开头的物品名
+  if (itemName) {
+    const cleanName = cleanText(itemName)
+    if (cleanName && stripped.startsWith(cleanName)) {
+      stripped = stripped.slice(cleanName.length)
+    }
+  }
+  // 去除开头剩余的「的/是/品质/质量」之类连接词，但保留实际评价词
+  // 注意：「品质不错」中的「品质」是评价主语，不应去除；只去除纯粹连接用的「的/是」
+  stripped = stripped.replace(/^[是的，。,.\s]+/, "")
+  // 去除首尾标点
+  stripped = stripped.replace(/^[，。,.\s]+/, "").replace(/[，。,.\s]+$/, "")
+
+  return stripped || undefined
+}
+
 /** 解析单件商品含量规格：500ml / 2kg / 100抽 / 24片 / 24卷 → {amount, unit}。 */
 const SPEC_UNIT_PATTERN = "(ml|毫升|L|升|kg|公斤|千克|g|克|抽|片|卷)"
 

@@ -43,7 +43,7 @@ function catItem(id, name, category = "宠物用品") {
 
 // ---------- 1. orchestrator.decide 统一入口 ----------
 
-test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 proposal turn（沿用旧 AgentDraft 流程）", () => {
+test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 collection turn（补货采集态）", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({
@@ -53,17 +53,16 @@ test("orchestrator: 无 pending 时「帮我加一袋猫砂」生成 proposal tu
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
-  // restock/createItem 沿用旧 proposal 流程，保持 confirm/cancel/revise 不变
-  assert.equal(decision.turn.kind, "proposal")
-  assert.equal(decision.turn.executableDraft.kind, "createItemWithRestock")
-  assert.equal(decision.turn.executableDraft.item.itemName, "猫砂")
+  // restock/createItem 缺金额/平台时先进采集态（collection），不立刻甩确认卡
+  assert.equal(decision.turn.kind, "collection")
+  assert.equal(decision.turn.collection.draft.kind, "createItemWithRestock")
+  assert.equal(decision.turn.collection.draft.item.itemName, "猫砂")
   // message 由 composer 生成，不暴露 AgentDraft 字段表
-  assert.ok(decision.turn.message.includes("我先把「猫砂」加进来"))
   assert.ok(!decision.turn.message.includes("待确认草稿"))
-  assert.equal(findForbiddenPhrase(decision.turn.message), null, "proposal message 不应含禁用词")
+  assert.equal(findForbiddenPhrase(decision.turn.message), null, "collection message 不应含禁用词")
 })
 
-test("orchestrator: 有猫砂时「帮我加一袋猫砂」生成 restock proposal，不重复创建", () => {
+test("orchestrator: 有猫砂时「帮我加一袋猫砂」生成 restock collection，不重复创建", () => {
   const state = makeState({ items: [catItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({
@@ -73,9 +72,9 @@ test("orchestrator: 有猫砂时「帮我加一袋猫砂」生成 restock propos
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal")
-  assert.equal(decision.turn.executableDraft.kind, "restock")
-  assert.equal(decision.turn.executableDraft.itemId, "i1")
+  assert.equal(decision.turn.kind, "collection")
+  assert.equal(decision.turn.collection.draft.kind, "restock")
+  assert.equal(decision.turn.collection.draft.itemId, "i1")
 })
 
 // ---------- 1b. AgentPlan 新能力（planProposal）----------
