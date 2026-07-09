@@ -97,8 +97,11 @@ function getItemNameFromDraft(draft: AgentDraft): string | undefined {
 /**
  * 在 collection 采集态场景下，应用用户补充输入到草稿。
  *
- * 与 reviseAgentDraft 的差异：评价字段使用 extractReviewText 保留用户原文，
- * 而非 parseReview 压缩成短评关键词。其他字段沿用 reviseAgentDraft 逻辑。
+ * 与 reviseAgentDraft 的差异：
+ *   1. 评价字段使用 extractReviewText 保留用户原文，而非 parseReview 压缩成短评关键词。
+ *   2. 当 reviseAgentDraft 返回 null（无字段命中）但 extractReviewText 命中时，
+ *      仍应用 review 到草稿——这覆盖「不起灰」「味道小」等扩展评价短句。
+ *      全局 parseReview 不认识这些短句，但在采集态场景必须收进去。
  */
 function applyCollectionRevision(
   draft: AgentDraft,
@@ -106,20 +109,32 @@ function applyCollectionRevision(
   state: AppState
 ): AgentDraft | null {
   const revised = reviseAgentDraft(draft, text, state)
-  if (!revised) return null
 
-  // 评价字段：用 extractReviewText 覆盖，保留原文
-  const itemName = getItemNameFromDraft(revised)
+  // 评价字段：用 extractReviewText 提取原文
+  const itemName = getItemNameFromDraft(draft)
   const reviewText = extractReviewText(text, itemName)
-  if (reviewText) {
+  if (!reviewText) return revised
+
+  // 如果 reviseAgentDraft 已变更其他字段，在 revised 上叠加 review
+  if (revised) {
     if (revised.kind === "restock") {
       return { ...revised, review: reviewText }
     }
     if (revised.kind === "createItemWithRestock") {
       return { ...revised, restock: { ...revised.restock, review: reviewText } }
     }
+    return revised
   }
-  return revised
+
+  // reviseAgentDraft 返回 null（无其他字段命中）但 review 命中：
+  // 在原 draft 上单独应用 review，避免「不起灰」被当作无意义输入丢弃
+  if (draft.kind === "restock") {
+    return { ...draft, review: reviewText }
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return { ...draft, restock: { ...draft.restock, review: reviewText } }
+  }
+  return null
 }
 
 /** 判断 restock 类草稿是否涉及采集（只有补货类才进采集态）。 */

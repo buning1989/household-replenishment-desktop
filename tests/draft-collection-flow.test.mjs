@@ -210,6 +210,76 @@ test("5. 用户补评价「这款猫砂品质不错，不起灰」→ draft.revi
   assert.ok(d2.turn.message.length > 5, `message 不应为空, 实际：${d2.turn.message}`)
 })
 
+// ---------- 5b. 用户补短评价「不起灰」 ----------
+
+test("5b. active collection 下输入「不起灰」→ draft.review = 不起灰，不返回 fallback", () => {
+  const item = catItem("i1", "猫砂", {
+    history: [restockEvent(30, 1, "京东", 30)]
+  })
+  const state = makeState({ items: [item] })
+  const itemViews = [{ item }]
+  const orch = createHouseholdOrchestrator()
+  const dateContext = buildChatDateContext(Date.UTC(2026, 6, 4))
+
+  // 首轮产出 collection
+  const d1 = orch.decide({ text: "今天买了 5 袋猫砂", state, itemViews, dateContext })
+  const pendingCollection = d1.turn.collection
+
+  // 用户补短评价「不起灰」
+  const d2 = orch.decide({ text: "不起灰", state, itemViews, pendingCollection, dateContext })
+  assert.equal(d2.kind, "sync")
+  // 不应返回 fallback / offTopic，应继续在 collection 采集态
+  assert.ok(
+    d2.turn.kind === "collection" || d2.turn.kind === "proposal",
+    `期望 collection 或 proposal, 实际: ${d2.turn.kind}`
+  )
+  const draft = d2.turn.kind === "collection" ? d2.turn.collection.draft : d2.turn.executableDraft
+  assert.ok(draft.review, `应设置 review, 实际：${draft.review}`)
+  assert.equal(
+    draft.review, "不起灰",
+    `短评价「不起灰」应原样保留为 review, 实际：${draft.review}`
+  )
+  // message 不应是空或「我没听懂」类 fallback
+  assert.ok(d2.turn.message.length > 5, `message 不应为空, 实际：${d2.turn.message}`)
+  assert.ok(
+    !d2.turn.message.includes("没听懂") && !d2.turn.message.includes("不清楚"),
+    `不应返回 fallback 文案, 实际：${d2.turn.message}`
+  )
+})
+
+// ---------- 5c. 用户补多条短评价「味道小，不粘底」 ----------
+
+test("5c. active collection 下输入「味道小，不粘底」→ review 至少保留「味道小」和「不粘底」", () => {
+  const item = catItem("i1", "猫砂", {
+    history: [restockEvent(30, 1, "京东", 30)]
+  })
+  const state = makeState({ items: [item] })
+  const itemViews = [{ item }]
+  const orch = createHouseholdOrchestrator()
+  const dateContext = buildChatDateContext(Date.UTC(2026, 6, 4))
+
+  // 首轮产出 collection
+  const d1 = orch.decide({ text: "今天买了 5 袋猫砂", state, itemViews, dateContext })
+  const pendingCollection = d1.turn.collection
+
+  // 用户补多条短评价
+  const d2 = orch.decide({ text: "味道小，不粘底", state, itemViews, pendingCollection, dateContext })
+  assert.equal(d2.kind, "sync")
+  assert.ok(
+    d2.turn.kind === "collection" || d2.turn.kind === "proposal",
+    `期望 collection 或 proposal, 实际: ${d2.turn.kind}`
+  )
+  const draft = d2.turn.kind === "collection" ? d2.turn.collection.draft : d2.turn.executableDraft
+  assert.ok(draft.review, `应设置 review, 实际：${draft.review}`)
+  // 应至少保留「味道小」和「不粘底」两个评价点
+  assert.ok(
+    draft.review.includes("味道小") && draft.review.includes("不粘底"),
+    `review 应保留「味道小」和「不粘底」, 实际：${draft.review}`
+  )
+  // message 不应是空或 fallback
+  assert.ok(d2.turn.message.length > 5, `message 不应为空, 实际：${d2.turn.message}`)
+})
+
 // ---------- 6. 用户说「就这样」→ proposal 标记 missingQualityFields ----------
 
 test("6. 用户说「就这样」（quality 缺 price）→ proposal 标记 missingQualityFields，含「未补全记录」", () => {

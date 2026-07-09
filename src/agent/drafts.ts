@@ -471,13 +471,63 @@ export function containsReviewSignal(text: string): boolean {
 }
 
 /**
+ * DraftCollection 采集态专用的扩展 review 信号词。
+ *
+ * 这些短句在真实补货对话中常见（如「不起灰」「味道小」「结团好」），
+ * 但不在全局 REVIEW_PHRASES 中（避免污染 parseReview 的短评映射）。
+ * 仅在 extractReviewText 中用于「是否含评价信号」判断，不参与短评映射。
+ */
+const COLLECTION_REVIEW_SIGNALS: string[] = [
+  // 猫砂/猫粮相关
+  "不起灰",
+  "灰小",
+  "粉尘少",
+  "粉尘大",
+  "结团好",
+  "结团差",
+  "结团快",
+  "不粘底",
+  "粘底",
+  "除臭好",
+  "除味好",
+  "味道小",
+  "味道大",
+  // 通用评价
+  "好用",
+  "不好用",
+  "会回购",
+  "不回购",
+  "回购",
+  "不错",
+  "挺不错",
+  "品质不错",
+  "质量不错",
+  "性价比高",
+  "性价比低",
+  "划算",
+  "不划算",
+  "下次不买",
+  "下次别买",
+  "不会再买"
+]
+
+/** DraftCollection 采集态专用：判断文本是否含扩展评价信号。 */
+function containsCollectionReviewSignal(text: string): boolean {
+  const compacted = cleanText(text)
+  // 先看全局 REVIEW_PHRASES
+  if (REVIEW_PHRASES.some(({ keys }) => keys.some((key) => compacted.includes(key)))) return true
+  // 再看采集态扩展词
+  return COLLECTION_REVIEW_SIGNALS.some((key) => compacted.includes(key))
+}
+
+/**
  * 在 DraftCollection 采集态场景下，从用户输入中提取保留原文的评价文本。
  *
  * 与 parseReview 不同，本函数保留用户原始表达（含多条「，」分隔的评价点），
  * 例如「这款猫砂品质不错，不起灰」→「品质不错，不起灰」。
  *
  * 规则：
- *   1. 必须含评价信号词，否则返回 undefined
+ *   1. 必须含评价信号词（含采集态扩展词如「不起灰」「味道小」），否则返回 undefined
  *   2. 去除开头的物品指示词：「这款/这个/那个/这/那/此款/此」
  *   3. 去除开头的物品名（若调用方传入 itemName）
  *   4. 去除首尾标点和「是/的」之类连接词
@@ -487,7 +537,7 @@ export function containsReviewSignal(text: string): boolean {
  */
 export function extractReviewText(text: string, itemName?: string): string | undefined {
   const compacted = cleanText(text)
-  if (!containsReviewSignal(compacted)) return undefined
+  if (!containsCollectionReviewSignal(compacted)) return undefined
 
   let stripped = compacted
   // 去除开头的指示词
@@ -499,7 +549,7 @@ export function extractReviewText(text: string, itemName?: string): string | und
       stripped = stripped.slice(cleanName.length)
     }
   }
-  // 去除开头剩余的「的/是/品质/质量」之类连接词，但保留实际评价词
+  // 去除开头剩余的「的/是」连接词，保留实际评价词
   // 注意：「品质不错」中的「品质」是评价主语，不应去除；只去除纯粹连接用的「的/是」
   stripped = stripped.replace(/^[是的，。,.\s]+/, "")
   // 去除首尾标点
