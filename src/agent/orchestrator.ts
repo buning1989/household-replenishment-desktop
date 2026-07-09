@@ -207,6 +207,12 @@ export type OrchestrateInput = {
 export type OrchestrateDecision =
   | { kind: "sync"; turn: AgentTurn }
   | { kind: "needLlm"; reason: string }
+  /**
+   * 阶段 2C：pendingCollection 下本地低置信解释，需要调用 LLM Turn Interpreter
+   * 重新做结构化理解。调用方应调用 orchestrator.interpretAndRoute(input) 走异步路径。
+   * reason 说明为什么需要 LLM 兜底。
+   */
+  | { kind: "needTurnInterpreterLlm"; reason: string }
 
 /**
  * AgentOrchestrator 同步入口：根据用户输入和当前上下文，决定这一轮输出什么 AgentTurn。
@@ -230,8 +236,23 @@ export type OrchestrateDecision =
  * 调用方拿到 needLlm 时自行调用 askHouseholdAssistant，再把结果传给 normalizeLlmResponse。
  */
 export type AgentOrchestrator = {
-  /** 同步决策：本地能处理就返回 sync turn，否则返回 needLlm */
+  /** 同步决策：本地能处理就返回 sync turn，否则返回 needLlm / needTurnInterpreterLlm */
   decide(input: OrchestrateInput): OrchestrateDecision
   /** 把 LLM 返回的原始内容规范化为 AgentTurn（经过本地 normalize + responseComposer） */
   normalizeLlmResponse(content: string, input: OrchestrateInput): AgentTurn | null
+  /**
+   * 阶段 2C：pendingCollection 下本地低置信时，调用 LLM Turn Interpreter 重新做结构化理解，
+   * 再用 resolveConversationFocus 二次路由，返回最终 OrchestrateDecision。
+   *
+   * - LLM 解释成功且置信 → 重新走 collection 处理或 start_new_collection，返回 { kind: "sync" }
+   * - LLM 解释失败 / 低置信 / unknown → 返回 { kind: "sync", turn: clarification }，
+   *   询问用户是否补当前记录，禁止回复「超出家务范围」
+   * - 调用方也可以直接拿 needLlm 落到常规 LLM answer 兜底
+   *
+   * clientOverride 供单测注入 mock client；真实运行时内部构造 desktop bridge client。
+   */
+  interpretAndRoute(
+    input: OrchestrateInput,
+    clientOverride?: import("./turnInterpreterLlm").TurnInterpreterLlmClient
+  ): Promise<OrchestrateDecision>
 }

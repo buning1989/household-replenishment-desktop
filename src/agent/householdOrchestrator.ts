@@ -14,8 +14,9 @@ import {
   type DraftCollection
 } from "./draftCollection"
 import { classifyAgentIntent, classifyBatchIntent, isSecondConfirmMatch, type BatchLocalIntent } from "./intent"
-import { interpretUserTurn } from "./turnInterpretation"
+import { interpretUserTurn, type TurnInterpretation } from "./turnInterpretation"
 import { resolveConversationFocus } from "./focusResolver"
+import { askTurnInterpreterLlm, type TurnInterpreterLlmClient } from "./turnInterpreterLlm"
 import {
   composeClarificationMessage,
   composeFallbackMessage,
@@ -52,6 +53,9 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
     },
     normalizeLlmResponse(content, input) {
       return normalizeLlm(content, input)
+    },
+    async interpretAndRoute(input, clientOverride) {
+      return interpretAndRouteSync(input, clientOverride)
     }
   }
 }
@@ -300,7 +304,10 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // （focusResolver 的短句识别覆盖面比 reviseDraftCollection 窄，需兜底）。
       const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
       if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
-      return { kind: "needLlm", reason: focus.reason }
+      // 旧逻辑也抽不出字段（如「拼夕夕/pdd/上次那个平台」这类平台别名或指代）：
+      // 阶段 2C 不再直接回 needLlm → 「超出家务范围」，而是交给 LLM Turn Interpreter
+      // 结合当前 pendingCollection 重新做结构化理解。
+      return { kind: "needTurnInterpreterLlm", reason: focus.reason }
     }
 
     default:
@@ -309,6 +316,149 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 兜底交回 decideSync 后续流程处理。
       return null
   }
+}
+
+/**
+ * 阶段 2C：pendingCollection 下本地低置信（route_to_llm）时，调用 LLM Turn Interpreter
+ * 重新做结构化理解，再用 resolveConversationFocus 二次路由。
+ *
+ * 决策契约：
+ *   - LLM 解释成功且高/中置信 → 复用 handlePendingCollectionIntent（用合成输入）走 collection 流程
+ *   - LLM 解释失败 / 低置信 / unknown → 返回 clarification，询问是否补当前记录，
+ *     禁止回复「超出家务范围」
+ *   - LLM 判定为 query / smalltalk → 返回 needLlm，交常规 answer LLM 兜底
+ *
+ * clientOverride 供单测注入 mock；真实运行时内部构造 desktop bridge client。
+ */
+async function interpretAndRouteSync(
+  input: OrchestrateInput,
+  clientOverride?: TurnInterpreterLlmClient
+): Promise<OrchestrateDecision> {
+  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
+  if (!pendingCollection) {
+    // 无 pendingCollection 不应进入此路径；兜底交常规 LLM
+    return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection" }
+  }
+
+  const llmInterpretation = await askTurnInterpreterLlm({
+    text,
+    pendingCollection,
+    pendingDraft,
+    pendingPlan,
+    state,
+    itemViews,
+    dateContext,
+    client: clientOverride
+  })
+
+  // LLM 失败 / 低置信 / unknown → clarification（不回复「超出家务范围」）
+  if (!llmInterpretation) {
+    return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+  }
+
+  const focus = resolveConversationFocus({
+    interpretation: llmInterpretation,
+    pendingCollection,
+    pendingPlan,
+    pendingDraft,
+    pendingBatch
+  })
+
+  switch (focus.focus) {
+    case "continue_pending_collection":
+    case "correct_pending_collection": {
+      // 用 LLM 解释出的 fields 合成等价用户输入，复用旧 collection 处理逻辑抽取/写入字段
+      const synthText = synthesizeInputFromInterpretation(llmInterpretation, pendingCollection)
+      const collectionTurn = handlePendingCollectionIntent(synthText, pendingCollection, state, itemViews, dateContext)
+      if (collectionTurn) return { kind: "sync", turn: collectionTurn }
+      // 合成输入仍抽不出字段 → clarification
+      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+    }
+
+    case "start_new_collection": {
+      // LLM 判定为新物品补货记录（itemName 与当前 collection 不同）：走 writeDraft 流程
+      const writeDraftDecision = handleWriteDraftIntent(input)
+      if (writeDraftDecision) return writeDraftDecision
+      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+    }
+
+    case "route_to_query":
+      // LLM 判定为查询：不打断 collection，交常规 answer LLM 回答查询
+      return { kind: "needLlm", reason: "llm interpreted as query, defer to answer llm" }
+
+    case "route_to_smalltalk": {
+      const boundary = classifyConversationBoundary(text)
+      if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+        return {
+          kind: "sync",
+          turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
+        }
+      }
+      return { kind: "needLlm", reason: "llm interpreted as smalltalk" }
+    }
+
+    default:
+      // route_to_llm / 其他：clarification 兜底
+      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+  }
+}
+
+/**
+ * 把 LLM 解释出的 fields 合成等价用户输入，供 handlePendingCollectionIntent 复用旧抽取逻辑。
+ * 例如 { platform: "拼多多" } → "拼多多"；{ price: 36 } → "36元"。
+ */
+function synthesizeInputFromInterpretation(
+  interpretation: TurnInterpretation,
+  collection: DraftCollection
+): string {
+  const f = interpretation.fields
+  if (interpretation.intent === "correct_current_collection" && f.itemName) {
+    const currentName = extractCollectionItemName(collection) ?? ""
+    return `不是${currentName}，是${f.itemName}`
+  }
+  if (interpretation.intent === "confirm_current_task") return "确认"
+  if (interpretation.intent === "cancel_current_task") return "算了"
+  // supplement：拼接可用字段，优先 platform/price/review/quantity
+  const parts: string[] = []
+  if (f.platform) parts.push(f.platform)
+  if (f.price !== undefined) parts.push(`${f.price}元`)
+  if (f.review) parts.push(f.review)
+  if (f.quantity !== undefined) parts.push(`${f.quantity}${f.unit ?? ""}`)
+  if (f.date !== undefined) parts.push(String(f.date))
+  return parts.length > 0 ? parts.join("，") : ""
+}
+
+/** 取当前 collection 草稿的物品名。 */
+function extractCollectionItemName(collection: DraftCollection): string | undefined {
+  const draft = collection.draft
+  if (draft.kind === "restock") return draft.itemName
+  if (draft.kind === "createItemWithRestock") return draft.item.itemName
+  return undefined
+}
+
+/**
+ * 构造采集态 clarification turn：询问用户是否补当前记录，禁止回复「超出家务范围」。
+ */
+function composeCollectionClarificationTurn(collection: DraftCollection): AgentTurn {
+  const itemName = extractCollectionItemName(collection)
+  const f = describeCollectionDraftForClarification(collection)
+  const hints: string[] = []
+  if (!f.platform) hints.push("如果是平台，可以说「拼多多」")
+  if (f.price === undefined) hints.push("如果是金额，可以说「36 元」")
+  const hint = hints.length > 0 ? `；${hints.join("；")}` : ""
+  const message = `你是想把这个补到刚才那条「${itemName ?? "记录"}」里吗？${hint}。如果不打算记了，可以说「算了」。`
+  return { kind: "clarification", message, options: [] }
+}
+
+/** 取 collection 草稿中已填字段，供 clarification 文案判断缺什么。 */
+function describeCollectionDraftForClarification(collection: DraftCollection): {
+  platform?: string
+  price?: number
+} {
+  const draft = collection.draft
+  if (draft.kind === "restock") return { platform: draft.platform, price: draft.price }
+  if (draft.kind === "createItemWithRestock") return { platform: draft.restock.platform, price: draft.restock.price }
+  return {}
 }
 
 /**

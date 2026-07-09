@@ -116,6 +116,32 @@ test("3. 「128」 → supplement_current_collection，price=128", () => {
   assert.equal(result.signals.hasOnlyShortField, true)
 })
 
+test("3a. 「45块」 → supplement_current_collection，price=45（本地高置信，不走 LLM）", () => {
+  const result = interpret("45块")
+  assert.equal(result.intent, "supplement_current_collection")
+  assert.equal(result.fields.price, 45)
+  assert.equal(result.signals.hasOnlyShortField, true)
+  assert.equal(result.confidence, "high")
+})
+
+test("3b. 「36元」 → supplement_current_collection，price=36", () => {
+  const result = interpret("36元")
+  assert.equal(result.intent, "supplement_current_collection")
+  assert.equal(result.fields.price, 36)
+})
+
+test("3c. 「128块钱」 → supplement_current_collection，price=128", () => {
+  const result = interpret("128块钱")
+  assert.equal(result.intent, "supplement_current_collection")
+  assert.equal(result.fields.price, 128)
+})
+
+test("3d. 「45.5元」 → supplement_current_collection，price=45.5", () => {
+  const result = interpret("45.5元")
+  assert.equal(result.intent, "supplement_current_collection")
+  assert.equal(result.fields.price, 45.5)
+})
+
 // ---------- 4. 短句评价 ----------
 
 test("4. 「不起灰」 → supplement_current_collection，review=不起灰（保留原文）", () => {

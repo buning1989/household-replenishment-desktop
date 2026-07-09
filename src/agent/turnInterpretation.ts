@@ -401,6 +401,18 @@ function detectShortField(
     }
   }
 
+  // 带币种单位的价格短句（如「45块」「36元」「128块钱」「45.5元」）
+  // 注意：用 raw 而非 normalized 匹配——compact 会把小数点「.」当作标点删除，
+  // 导致「45.5元」被压成「455元」。此处对 raw 做兼容全角数字后正则匹配。
+  const priceWithUnit = raw.trim().replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+  const priceUnitMatch = /^(\d+(?:\.\d+)?)\s*(?:块钱?|元)$/.exec(priceWithUnit)
+  if (priceUnitMatch) {
+    const price = Number(priceUnitMatch[1])
+    if (Number.isFinite(price)) {
+      return { fields: { price }, reason: `带币种的价格短句「${raw}」，归一为 price=${price}` }
+    }
+  }
+
   // 平台短句
   const platform = parsePlatform(normalized)
   if (platform && normalized.length <= 4) {

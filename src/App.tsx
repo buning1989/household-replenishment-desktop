@@ -2227,7 +2227,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const dateContext = buildChatDateContext()
 
     // 统一管家决策层：所有路径都先经过 orchestrator.decide
-    const decision = orchestrator.decide({
+    let decision = orchestrator.decide({
       text,
       state,
       itemViews,
@@ -2236,6 +2236,37 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       pendingPlan,
       dateContext
     })
+
+    // 阶段 2C：pendingCollection 下本地低置信（route_to_llm）时，先调用 LLM Turn Interpreter
+    // 重新做结构化理解，再用 resolveConversationFocus 二次路由。
+    // - 解释成功（sync）→ 替换 decision，走下面正常 sync 渲染
+    // - 解释失败 / 低置信 → 降级为 needLlm，走下面常规 LLM answer 路径
+    // 不改 UI 渲染逻辑，不改 executor，不直接写 state。
+    if (decision.kind === "needTurnInterpreterLlm") {
+      if (!state.settings.aiApiKey?.trim()) {
+        setError("还没有设置 AI API Key。这个问题需要模型分析，设置后就可以继续问。")
+        inputRef.current?.focus()
+        return
+      }
+      // 短暂 loading：interpreter 调用通常很快，只禁用输入避免重复提交
+      setLoading(true)
+      const llmDecision = await orchestrator.interpretAndRoute({
+        text,
+        state,
+        itemViews,
+        pendingDraft,
+        pendingCollection,
+        pendingPlan,
+        dateContext
+      })
+      setLoading(false)
+      if (llmDecision.kind === "sync") {
+        decision = llmDecision
+      } else {
+        // needLlm 或再次 needTurnInterpreterLlm：降级为常规 LLM answer 兜底
+        decision = { kind: "needLlm", reason: llmDecision.reason }
+      }
+    }
 
     // 响应节奏层：根据意图/turn/上下文决定这一轮的最小延迟和 loading 文案。
     // 用 transient assistant message 显示过程态，让用户看到「管家正在处理」。
