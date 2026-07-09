@@ -284,3 +284,118 @@ test("回归：删除空分类仍走 deleteCategory（含'分类'关键词）", 
   assert.equal(result.kind, "plan")
   assert.equal(result.plan.actions[0].type, "deleteCategory")
 })
+
+// ---------- P0：分类名含正则元字符不崩溃 ----------
+
+test("P0：分类名含括号「零食(待整理)」删除时不抛异常", () => {
+  const state = makeState({ categories: ["零食(待整理)"], items: [] })
+  const result = buildAgentPlan({ text: "删除零食(待整理)分类", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions[0].type, "deleteCategory")
+  assert.equal(result.plan.actions[0].categoryName, "零食(待整理)")
+})
+
+test("P0：分类名含括号「把零食(待整理)删掉」不抛异常", () => {
+  const state = makeState({ categories: ["零食(待整理)"], items: [] })
+  const result = buildAgentPlan({ text: "把零食(待整理)删掉", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions[0].type, "deleteCategory")
+})
+
+// ---------- P1：分类名以「分类」结尾不被误剥 ----------
+
+test("P1：删除「临时分类」下的消耗品——分类名以「分类」结尾不误剥", () => {
+  const state = makeState({
+    categories: ["临时分类"],
+    items: [
+      makeItem("i1", "杂物A", "临时分类"),
+      makeItem("i2", "杂物B", "临时分类")
+    ]
+  })
+  const result = buildAgentPlan({ text: "删除临时分类下的消耗品", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions.length, 2)
+  assert.ok(result.plan.actions.every((a) => a.type === "deleteItem"))
+  // 不应出现「分类「临时」不存在」
+  assert.ok(!result.message || !result.message.includes("「临时」"))
+})
+
+// ---------- P1：无方位词「删除 X 的消耗品」 ----------
+
+test("P1：删除卫生间的消耗品（无方位词）→ 多个 deleteItem", () => {
+  const state = makeState({
+    items: [
+      makeItem("i1", "卫生纸"),
+      makeItem("i2", "擦手巾"),
+      makeItem("i3", "纸抽")
+    ]
+  })
+  const result = buildAgentPlan({ text: "删除卫生间的消耗品", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions.length, 3)
+  assert.ok(result.plan.actions.every((a) => a.type === "deleteItem"))
+  // 不应返回"找不到消耗品「卫生间」"
+  assert.ok(!result.message || !result.message.includes("找不到消耗品"))
+})
+
+test("P1：清空卫生间的物品（无方位词）→ 多个 deleteItem", () => {
+  const state = makeState({
+    items: [
+      makeItem("i1", "卫生纸"),
+      makeItem("i2", "擦手巾")
+    ]
+  })
+  const result = buildAgentPlan({ text: "清空卫生间的物品", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions.length, 2)
+  assert.ok(result.plan.actions.every((a) => a.type === "deleteItem"))
+})
+
+// ---------- P1：不再管理分类 ----------
+
+test("P1：不再管理卫生间（空分类）→ deleteCategory plan", () => {
+  const state = makeState() // 卫生间是空分类
+  const result = buildAgentPlan({ text: "不再管理卫生间", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions[0].type, "deleteCategory")
+  // 不应返回"找不到消耗品「卫生间」"
+  assert.ok(!result.message || !result.message.includes("找不到消耗品"))
+})
+
+test("P1：不再管理卫生间（非空分类）→ clarification", () => {
+  const state = makeState({
+    items: [makeItem("i1", "卫生纸")]
+  })
+  const result = buildAgentPlan({ text: "不再管理卫生间", state, dateContext })
+  assert.equal(result.kind, "clarification")
+  assert.ok(result.message.includes("3 个消耗品") || result.message.includes("1 个消耗品"),
+    `message 应提示分类下有消耗品，实际：${result.message}`)
+})
+
+// ---------- P1：分类名含「下/中/里」不被截断 ----------
+
+test("P1：清空「楼下超市」分类——分类名含「下」不截断", () => {
+  const state = makeState({
+    categories: ["楼下超市"],
+    items: [makeItem("i1", "矿泉水", "楼下超市")]
+  })
+  const result = buildAgentPlan({ text: "清空楼下超市分类", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions.length, 1)
+  assert.equal(result.plan.actions[0].type, "deleteItem")
+  assert.equal(result.plan.actions[0].itemName, "矿泉水")
+})
+
+test("P1：删除「车里备货」下的消耗品——分类名含「里」不截断", () => {
+  const state = makeState({
+    categories: ["车里备货"],
+    items: [
+      makeItem("i1", "车载纸巾", "车里备货"),
+      makeItem("i2", "车载垃圾袋", "车里备货")
+    ]
+  })
+  const result = buildAgentPlan({ text: "删除车里备货下的消耗品", state, dateContext })
+  assert.equal(result.kind, "plan")
+  assert.equal(result.plan.actions.length, 2)
+  assert.ok(result.plan.actions.every((a) => a.type === "deleteItem"))
+})
