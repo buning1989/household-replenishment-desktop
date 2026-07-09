@@ -856,3 +856,208 @@
 | --- | --- | --- | --- |
 | AgentPlanCard 摘要缺失 6 个编辑类 action 分支 | src/App.tsx | `summarizeActionForCard` 之前对 `renameCategory`/`moveItem`/`updateItemUnit`/`updateItemReminder`/`updatePurchaseOption`/`setDefaultPurchaseOption` 落入 `default` 分支显示「（未实现的动作）」。补全 6 个 case 分支，与 executor.ts 的 commit summary 文案对齐 | typecheck 通过，537/537 测试全通过，S1-S6 真实 UI smoke test 全部通过 |
 
+---
+
+## AgentPlan 第三阶段验证：删除类动作 + 二次确认
+
+> 日期：2026-07-07
+> 分支：feature/agent-plan-delete-actions
+> 关联文档：docs/agent-action-routing.md
+> 验证目标：4 个删除类动作（deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory）走 planProposal + high risk；高风险 plan 需二次确认（普通「确认」不执行，必须「确认删除」才执行）；删除分类仅支持空分类；删除失败时 state 不变。
+> 自动化测试覆盖：tests/agent-plan-delete-registry.test.mjs（22 个）、tests/agent-plan-delete-executor.test.mjs（17 个）、tests/agent-plan-delete-planner.test.mjs（23 个）、tests/agent-plan-second-confirm.test.mjs（18 个）。
+
+### 二次确认语义说明
+
+高风险删除类 plan 的二次确认状态机：
+
+```
+pending ──「确认」──> awaitingSecondConfirm ──「确认删除」──> confirmed（执行删除）
+   │                                                        │
+   └──────────────「确认删除」直接执行──────────────────────┘（跳过 awaitingSecondConfirm）
+```
+
+**关键语义**：
+- **pending 状态下输入「确认删除」类句式**：直接执行删除，不需要先进入 awaitingSecondConfirm。因为「确认删除」本身已包含明确删除语义，再要求一次二次确认是冗余的。
+- **pending 状态下输入普通「确认」「好的」「可以」**：进入 awaitingSecondConfirm，不执行删除。
+- **awaitingSecondConfirm 状态下输入普通「确认」**：返回 answer 提示"需要明确说「确认删除」"，不执行、不取消。
+- **awaitingSecondConfirm 状态下输入「确认删除」类句式**：执行删除。
+- **awaitingSecondConfirm 状态下输入新操作（如「帮我加一袋猫砂」）**：不走修订，走新操作流程（旧 plan 标记 superseded）。
+
+**isSecondConfirmMatch 命中句式**：「确认删除」「确定删除」「我确认删除」「确认删掉」「删除吧」「就删除」等。普通「确认」「好的」「可以」「嗯」不命中。
+
+### 验证 C1：删除常购商品（deletePurchaseOption → 二次确认 → 写入）
+
+**前置**：state 中已有"猫砂"，其下有常购商品「pidan 豆腐猫砂」和「怡亲」。
+
+**步骤**：
+1. 输入 "删除猫砂的 pidan 豆腐猫砂常购商品"
+2. 检查 `AgentPlanCard`（应显示高风险标识）
+3. 输入 "确认"（第一次确认，不执行）
+4. 检查卡片状态（应进入 awaitingSecondConfirm）
+5. 输入 "确认删除"（第二次确认，执行）
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`，标题含"高风险 · 准备处理"，列 1 条动作"删除常购商品：「猫砂」·「pidan 豆腐猫砂」"
+- 第 3 步后：卡片标题变为"高风险 · 等待二次确认"，按钮变为「取消」和「确认删除」（红色）
+- 第 5 步后：卡片标题变为"已执行"，常购商品「pidan 豆腐猫砂」被删除，「怡亲」保留
+
+### 验证 C2：删除补货记录（deleteRestockRecord → 二次确认 → 写入）
+
+**前置**：state 中已有"猫砂"，其下有 2 条补货记录。
+
+**步骤**：
+1. 输入 "删除猫砂最近一条补货记录"
+2. 检查 `AgentPlanCard`
+3. 输入 "确认" → 进入 awaitingSecondConfirm
+4. 输入 "确认删除"
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`，标题含"高风险 · 准备处理"，列"删除补货记录：「猫砂」· 最近一条的补货记录"
+- 第 4 步后：最近一条补货记录被删除，另一条保留
+
+### 验证 C3：删除消耗品（deleteItem → 二次确认 → 写入）
+
+**前置**：state 中已有"猫砂"（含常购商品和补货记录）。
+
+**步骤**：
+1. 输入 "删除猫砂"
+2. 检查 `AgentPlanCard`
+3. 输入 "确认" → 进入 awaitingSecondConfirm
+4. 输入 "确认删除"
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`，标题含"高风险 · 准备处理"，列"删除消耗品「猫砂」（含历史记录、常购商品、提醒状态）"
+- 第 4 步后：猫砂从 items 中完全移除（连带 history/options）
+
+### 验证 C4：删除空分类（deleteCategory → 二次确认 → 写入）
+
+**前置**：state 中有分类「宠物用品」且其下无物品。
+
+**步骤**：
+1. 输入 "删除宠物用品分类"
+2. 检查 `AgentPlanCard`
+3. 输入 "确认" → 进入 awaitingSecondConfirm
+4. 输入 "确认删除"
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`，标题含"高风险 · 准备处理"，列"删除分类「宠物用品」"
+- 第 4 步后：分类「宠物用品」从 categories 中移除
+
+### 验证 C5：删除非空分类（返回 clarification，不生成 plan）
+
+**前置**：state 中有分类「宠物用品」且其下有"猫砂"。
+
+**步骤**：
+1. 输入 "删除宠物用品分类"
+
+**预期**：
+- 返回 clarification："分类「宠物用品」下还有 1 个消耗品，请先移动或删除这些消耗品。"
+- 不生成 `AgentPlanCard`
+- state 不变
+
+### 验证 C6：普通「确认」不执行删除
+
+**前置**：state 中已有"猫砂"。
+
+**步骤**：
+1. 输入 "删除猫砂"
+2. 输入 "确认"
+3. 输入 "好的"
+4. 输入 "可以"
+
+**预期**：
+- 第 1 步返回 `AgentPlanCard`（高风险）
+- 第 2 步：卡片进入 awaitingSecondConfirm 状态，**不执行删除**
+- 第 3/4 步：在 awaitingSecondConfirm 状态下返回 answer 提示"需要明确说「确认删除」"，**不执行、不取消**
+- state 不变
+
+### 验证 C7：「确认删除」才执行删除
+
+**前置**：state 中已有"猫砂"，已生成 pendingPlan 并进入 awaitingSecondConfirm。
+
+**步骤**：
+1. 输入 "确认删除"
+2. 输入 "确定删除"
+3. 输入 "删除吧"
+
+**预期**：
+- 三种表述都能触发 planSecondConfirm，执行删除
+- state 中"猫砂"被移除
+
+### 验证 C7b：pending 状态下直接输入「确认删除」可跳过 awaitingSecondConfirm
+
+**前置**：state 中已有"猫砂"。
+
+**步骤**：
+1. 输入 "删除猫砂"（生成 pendingPlan，状态为 pending）
+2. 直接输入 "确认删除"（不先输入普通"确认"）
+
+**预期**：
+- 第 2 步直接触发 planSecondConfirm，执行删除
+- 不需要先经过 awaitingSecondConfirm 状态
+- state 中"猫砂"被移除
+
+### 验证 C8：取消删除
+
+**前置**：state 中已有"猫砂"，已生成 pendingPlan。
+
+**步骤**：
+1. 输入 "删除猫砂"
+2. 输入 "取消"
+
+**预期**：
+- 卡片标题变为"已取消"
+- state 不变
+- "猫砂"仍保留
+
+### 验证 C9：查询不打断 pending delete plan
+
+**前置**：state 中已有"猫砂"。
+
+**步骤**：
+1. 输入 "删除猫砂"（生成 pendingPlan）
+2. 输入 "猫砂还剩多少"
+
+**预期**：
+- 第 2 步返回 answer（query 路径），不返回 planCommand
+- 原 pendingPlan 卡片状态不变（仍是 pending，可继续确认）
+
+### 验证 C10：旧 Draft 流程不受影响
+
+**前置**：state 中已有"猫砂"。
+
+**步骤**：
+1. 输入 "帮我加一袋猫砂"
+2. 输入 "确认"
+
+**预期**：
+- 第 1 步返回 `AgentDraftCard`（旧卡片，非 `AgentPlanCard`）
+- 第 2 步后：补货记录写入
+- 删除类改动不影响旧 Draft 流程
+
+### 第三阶段执行结果汇总
+
+| 用例 | 状态 | 是否写入 state | UI 是否异常 | 是否需要修复 |
+| --- | --- | --- | --- | --- |
+| C1 删除常购商品 | 通过（端到端模拟） | 是（二次确认后） | 待人工验证 | 无 |
+| C2 删除补货记录 | 通过（端到端模拟） | 是（二次确认后） | 待人工验证 | 无 |
+| C3 删除消耗品 | 通过（端到端模拟） | 是（二次确认后） | 待人工验证 | 无 |
+| C4 删除空分类 | 通过（端到端模拟） | 是（二次确认后） | 待人工验证 | 无 |
+| C5 删除非空分类 | 通过（端到端模拟） | 否（clarification） | 待人工验证 | 无 |
+| C6 普通确认不执行 | 通过（端到端模拟） | 否 | 待人工验证 | 无 |
+| C7 确认删除才执行 | 通过（端到端模拟） | 是（二次确认后） | 待人工验证 | 无 |
+| C8 取消删除 | 通过（端到端模拟） | 否 | 待人工验证 | 无 |
+| C9 查询不打断 | 通过（端到端模拟） | 否 | 待人工验证 | 无 |
+| C10 旧 Draft 不变 | 通过（端到端模拟） | 是（确认后） | 待人工验证 | 无 |
+
+### 待人工验证的视觉 UI 检查点
+
+以下检查点需在真实 Electron 会话中人工验证（端到端模拟无法覆盖）：
+
+1. AgentPlanCard 在 high risk pending 状态显示红色边框和"高风险 · 准备处理"标题
+2. AgentPlanCard 在 awaitingSecondConfirm 状态显示"高风险 · 等待二次确认"标题
+3. awaitingSecondConfirm 状态下按钮为「取消」和「确认删除」（红色）
+4. 普通 plan 不受二次确认影响（仍显示「先不处理」和「就这么执行」）
+5. 删除 action 摘要展示影响范围（如"含历史记录、常购商品、提醒状态"）
+6. 删除后卡片标题变为"已执行"，不残留可点击按钮
+

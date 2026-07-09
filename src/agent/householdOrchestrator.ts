@@ -6,7 +6,7 @@
  */
 
 import { buildLocalClarification, buildLocalDraftFromText, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
-import { classifyAgentIntent, classifyBatchIntent, type BatchLocalIntent } from "./intent"
+import { classifyAgentIntent, classifyBatchIntent, isSecondConfirmMatch, type BatchLocalIntent } from "./intent"
 import {
   composeClarificationMessage,
   composeFallbackMessage,
@@ -48,7 +48,8 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   const { text, state, itemViews, pendingDraft, pendingBatch, pendingPlan, dateContext } = input
 
   // 1. pending plan 优先（多动作计划状态机：confirm / cancel / revise / status）
-  if (pendingPlan && pendingPlan.status === "pending") {
+  //    第三期：high risk plan 有 awaitingSecondConfirm 状态，需要二次「确认删除」
+  if (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm")) {
     const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext)
     if (planTurn) return { kind: "sync", turn: planTurn }
     // planTurn === null 表示本轮不是针对 pendingPlan 的 confirm/cancel/revise/status
@@ -98,7 +99,12 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   //    设计原则：AgentDraft 和 AgentPlan 并存。
   //    - 单条草稿场景（restock/createItem）继续走旧 proposal 流程，保持 confirm/cancel/revise 不变
   //    - 新能力（createCategory/setMonthlyBudget/updateItem）和多动作组合走 planProposal
-  const intent = classifyAgentIntent(text, Boolean(pendingDraft || pendingPlan))
+  // 注意：hasPendingDraft 只传 pendingDraft，不传 pendingPlan。
+  //   handlePendingPlanIntent 已经在上面处理了 plan 的 confirm/cancel/revise/status。
+  //   走到这里说明本轮不是针对 pendingPlan 的这些意图。
+  //   如果传 pendingPlan，"帮我加一袋猫砂" 会因"袋"在 REVISE_KEYWORDS 中被误判为 reviseDraft，
+  //   导致新写入请求走 needLlm 而非 writeDraft。
+  const intent = classifyAgentIntent(text, Boolean(pendingDraft))
   if (intent === "writeDraft") {
     // 4a. 先检查重复创建/歧义
     const clarification = buildLocalClarification(text, state)
@@ -114,6 +120,7 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
       //   第一期：createCategory / setMonthlyBudget / updateItem
       //   第二期：renameCategory / moveItem / updateItemUnit / updateItemReminder /
       //           updatePurchaseOption / setDefaultPurchaseOption
+      //   第三期：deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory
       const isPlanOnly = plan.actions.some(
         (a) => a.type === "createCategory"
           || a.type === "setMonthlyBudget"
@@ -124,6 +131,10 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
           || a.type === "updateItemReminder"
           || a.type === "updatePurchaseOption"
           || a.type === "setDefaultPurchaseOption"
+          || a.type === "deletePurchaseOption"
+          || a.type === "deleteRestockRecord"
+          || a.type === "deleteItem"
+          || a.type === "deleteCategory"
       )
       if (isPlanOnly) {
         return {
@@ -166,6 +177,24 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
 /**
  * 处理 pendingPlan 的用户输入。
  * 返回 null 表示本轮不是针对 pendingPlan 的意图（可能是新操作或查询），由外层继续判断。
+ *
+ * 第三期二次确认状态机：
+ *   - pendingPlan.status === "awaitingSecondConfirm"（高风险 plan 第一次确认后）：
+ *     - 「确认删除」类句式 → planSecondConfirm command（调用方执行 commitAgentPlan）
+ *     - 普通「确认」 → answer（提示需要说「确认删除」）
+ *     - 「取消」 → planCancel command
+ *     - 修订 → 新 planProposal
+ *     - 查询 → 不打断（返回 null）
+ *   - pendingPlan.status === "pending" + requiresSecondConfirm（高风险 plan）：
+ *     - 「确认」 → planAwaitingSecondConfirm command（调用方推进状态，不执行写入）
+ *     - 「取消」 → planCancel command
+ *     - 修订 → 新 planProposal
+ *     - 查询 → 不打断（返回 null）
+ *   - pendingPlan.status === "pending" + 普通 plan：
+ *     - 「确认」 → planConfirm command（调用方执行 commitAgentPlan）
+ *     - 「取消」 → planCancel command
+ *     - 修订 → 新 planProposal
+ *     - 查询 → 不打断（返回 null）
  */
 function handlePendingPlanIntent(
   text: string,
@@ -174,10 +203,73 @@ function handlePendingPlanIntent(
   _itemViews: InferenceItemView[],
   _dateContext: import("../llm/householdChat").ChatDateContext
 ): AgentTurn | null {
+  const isHighRisk = pendingPlan.requiresSecondConfirm === true || pendingPlan.risk === "high"
+
+  // ---------- awaitingSecondConfirm 状态：只接受「确认删除」 ----------
+  if (pendingPlan.status === "awaitingSecondConfirm") {
+    // 1. 二次确认删除 → planSecondConfirm command
+    if (isSecondConfirmMatch(text)) {
+      return {
+        kind: "planCommand" as const,
+        message: composePlanMessage(pendingPlan, state),
+        command: { command: "planSecondConfirm" as const }
+      }
+    }
+    // 2. 取消 → planCancel command
+    const cancelIntent = classifyAgentIntent(text, true)
+    if (cancelIntent === "cancelDraft") {
+      return {
+        kind: "planCommand" as const,
+        message: composeCancelledMessage(),
+        command: { command: "planCancel" as const }
+      }
+    }
+    // 3. 普通「确认」「好的」「可以」 → answer（提示需要说「确认删除」）
+    if (cancelIntent === "confirmDraft") {
+      return {
+        kind: "answer" as const,
+        message: "这是高风险删除操作，需要你明确说「确认删除」才能执行。输入「取消」可以放弃。"
+      }
+    }
+    // 4. 询问状态 → answer
+    if (cancelIntent === "pendingStatus") {
+      return {
+        kind: "answer" as const,
+        message: "正在等待你的二次确认。这是高风险删除操作，请明确说「确认删除」执行，或「取消」放弃。"
+      }
+    }
+    // 5. awaitingSecondConfirm 状态下不允许修订：
+    //    高风险删除操作不应被"修订"，用户应先取消再重新输入。
+    //    把"修订"意图（可能因 REVISE_KEYWORDS 误命中，如"帮我加一袋猫砂"中的"袋"）
+    //    当作新操作，返回 null 让外层处理。
+    return null
+  }
+
+  // ---------- pending 状态：第一次确认 ----------
+
+  // 如果用户在 pending 状态直接输入「确认删除」类句式，直接执行删除。
+  // 二次确认句式包含明确的删除语义，不需要再走 awaitingSecondConfirm。
+  if (isHighRisk && isSecondConfirmMatch(text)) {
+    return {
+      kind: "planCommand" as const,
+      message: composePlanMessage(pendingPlan, state),
+      command: { command: "planSecondConfirm" as const }
+    }
+  }
+
   const intent = classifyAgentIntent(text, true)
 
-  // 1. 确认 → 返回 planConfirm command，调用方执行 commitAgentPlan
+  // 1. 确认
   if (intent === "confirmDraft") {
+    if (isHighRisk) {
+      // 高风险 plan → 进入 awaitingSecondConfirm，不执行写入
+      return {
+        kind: "planCommand" as const,
+        message: composePlanMessage(pendingPlan, state),
+        command: { command: "planAwaitingSecondConfirm" as const }
+      }
+    }
+    // 普通 plan → 直接执行
     return {
       kind: "planCommand" as const,
       message: composePlanMessage(pendingPlan, state),
@@ -197,9 +289,10 @@ function handlePendingPlanIntent(
   // 3. 询问状态 → answer（提示还没写入）
   if (intent === "pendingStatus") {
     const lines = pendingPlan.actions.map((action, index) => `${index + 1}. ${shortActionHint(action)}`)
+    const riskHint = isHighRisk ? "注意：这是高风险删除操作，确认后还需要二次「确认删除」才能执行。\n" : ""
     return {
       kind: "answer" as const,
-      message: `还没真正写入，需要你确认一下。\n当前准备处理：\n${lines.join("\n")}\n你可以点卡片里的「确认执行」，或直接输入「确认吧」。`
+      message: `还没真正写入，需要你确认一下。\n当前准备处理：\n${lines.join("\n")}\n${riskHint}你可以点卡片里的「确认执行」，或直接输入「确认吧」。`
     }
   }
 
@@ -241,6 +334,10 @@ function shortActionHint(action: import("./actions").AgentAction): string {
     case "updateItemReminder": return `改提醒「${action.itemName || action.itemId}」提前${action.bufferDays}天`
     case "updatePurchaseOption": return `改常购商品「${action.productName || action.optionId}」`
     case "setDefaultPurchaseOption": return `设默认「${action.productName || action.optionId}」`
+    case "deletePurchaseOption": return `删除常购商品「${action.productName || action.optionId}」`
+    case "deleteRestockRecord": return `删除补货记录「${action.itemName}」`
+    case "deleteItem": return `删除消耗品「${action.itemName}」`
+    case "deleteCategory": return `删除分类「${action.categoryName}」`
     default: return "（未实现）"
   }
 }

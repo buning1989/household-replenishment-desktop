@@ -70,8 +70,29 @@ const WRITE_SIGNALS = [
   // 第二期编辑类：重命名、移动、改单位、改提醒、常购商品改、设默认
   "改成", "改为", "改名为", "改叫", "重命名", "移到", "归到", "归入", "放到",
   "单位改", "单位设", "按包记", "按瓶记", "按袋记", "提前", "快用完前",
-  "默认商品设", "设为默认", "设成默认"
+  "默认商品设", "设为默认", "设成默认",
+  // 第三期删除类：删除、删掉、不再管理
+  "删除", "删掉", "不再管理", "不再管"
 ]
+
+// 二次确认删除：高风险 plan 第一次确认后，用户必须再次明确说「确认删除」类句式才能执行。
+// 普通「确认」「好的」「可以」不能执行高风险删除。
+const SECOND_CONFIRM_PHRASES = [
+  "确认删除", "确定删除", "我确认删除", "我确定删除",
+  "确认删掉", "确定删掉", "我确认删掉",
+  "删除吧", "删掉吧", "就删除", "就删掉"
+]
+
+/**
+ * 判断用户输入是否为「二次确认删除」。
+ * 仅在 pendingPlan.status === "awaitingSecondConfirm" 时由 orchestrator 调用。
+ * 普通「确认」「好的」「可以」不会命中。
+ */
+export function isSecondConfirmMatch(text: string): boolean {
+  const normalized = compact(text)
+  if (!normalized) return false
+  return includesAny(normalized, SECOND_CONFIRM_PHRASES)
+}
 
 // 修订信号：用户想改当前 pending 草稿的某个字段。
 const REVISE_KEYWORDS = [

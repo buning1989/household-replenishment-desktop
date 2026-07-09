@@ -181,6 +181,47 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
   display: grid; place-items: center; padding: 0 4px;
 }
 
+/* 问问管家：全局对话入口，层级略高于普通分类项，但低于待处理提醒 */
+.sidebar-assistant {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 8px 10px;
+  margin-top: 4px;
+  border-radius: var(--radius-small);
+  border: 1px solid var(--line);
+  background: var(--paper);
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+  color: var(--ink);
+  transition: background .12s, border-color .12s, color .12s;
+}
+.sidebar-assistant:hover { background: var(--hover); }
+.sidebar-assistant-icon {
+  width: 20px; height: 20px;
+  display: grid; place-items: center;
+  flex-shrink: 0;
+  color: var(--muted);
+  transition: color .12s;
+}
+.sidebar-assistant-text {
+  display: flex; flex-direction: column; gap: 1px;
+  min-width: 0;
+}
+.sidebar-assistant-title { font-size: 12.5px; font-weight: 600; line-height: 1.3; }
+.sidebar-assistant-sub {
+  font-size: 10.5px; color: var(--faint); line-height: 1.3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.sidebar-assistant.is-active {
+  background: rgba(58, 125, 84, .08);
+  border-color: rgba(58, 125, 84, .35);
+  color: var(--green);
+}
+.sidebar-assistant.is-active .sidebar-assistant-icon { color: var(--green); }
+
 .sidebar-divider { height: 1px; background: var(--line); margin: 6px 2px; flex-shrink: 0; }
 .sidebar-section-heading {
   display: flex;
@@ -4216,7 +4257,6 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   margin-bottom: 12px;
 }
 
-.home-chat-trigger,
 .order-import-trigger {
   min-height: 36px;
   padding: 0 14px;
@@ -4224,30 +4264,106 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   color: var(--muted);
 }
 
-.home-chat-trigger:hover,
 .order-import-trigger:hover { color: var(--ink); }
 
-.chat-overlay { z-index: 25; }
+/* 右侧管家：用轻量磨砂层压低主页信息，避免聊天和主页混在一起 */
+.chat-overlay {
+  z-index: 25;
+  top: 40px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(248, 248, 248, .58);
+  -webkit-backdrop-filter: blur(10px) saturate(.96);
+  backdrop-filter: blur(10px) saturate(.96);
+  pointer-events: auto;
+  justify-content: flex-end;
+}
+.chat-overlay > .chat-panel { pointer-events: auto; }
 .chat-panel {
-  width: min(560px, 100%);
+  width: min(600px, max(440px, 42vw));
+  max-width: 600px;
+  min-width: 440px;
+  height: 100%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  border-left: 1px solid rgba(26, 26, 26, .1);
+  background: rgba(255, 255, 255, .9);
+  -webkit-backdrop-filter: blur(18px) saturate(.98);
+  backdrop-filter: blur(18px) saturate(.98);
+  pointer-events: auto;
+}
+.chat-panel.is-expanded {
+  width: min(720px, 70vw);
+  max-width: 720px;
+}
+/* 小屏/窄窗：退化为覆盖式抽屉，加重一点磨砂遮罩 */
+@media (max-width: 1000px) {
+  .chat-overlay {
+    background: rgba(248, 248, 248, .68);
+    -webkit-backdrop-filter: blur(12px) saturate(.96);
+    backdrop-filter: blur(12px) saturate(.96);
+  }
+  .chat-panel,
+  .chat-panel.is-expanded {
+    width: min(440px, 100%);
+    min-width: 0;
+    max-width: 100%;
+  }
+}
+@media (max-width: 720px) {
+  .chat-overlay { left: 0; }
+  .chat-panel,
+  .chat-panel.is-expanded {
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+  }
 }
 .chat-panel-header {
   flex: 0 0 auto;
-  padding: 22px 28px 18px;
+  min-height: 64px;
+  padding: 14px 22px;
+  gap: 12px;
+  border-bottom: 0;
+  background: transparent;
 }
 .chat-panel-header h2 {
   margin: 0;
   font-size: var(--text-title);
 }
+.chat-panel-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.chat-expand-btn {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-small);
+  background: transparent;
+  color: var(--muted);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.chat-expand-btn:hover { background: var(--hover); color: var(--ink); }
+.chat-expand-btn:focus-visible { outline: 2px solid rgba(26, 26, 26, .12); outline-offset: 1px; }
+.chat-expand-btn[aria-pressed="true"] { color: var(--ink); background: var(--hover); }
+.chat-panel-header .close-btn { border: 0; background: transparent; }
 .chat-panel-body {
   min-height: 0;
   flex: 1;
   display: flex;
   flex-direction: column;
-  padding: 18px 22px 0;
+  padding: 14px 22px 0;
   overflow: hidden;
 }
 .chat-log {
@@ -4270,6 +4386,11 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-empty > strong {
   color: var(--ink);
   font-size: var(--text-body);
+  line-height: 1.5;
+}
+.chat-empty-hint {
+  color: var(--muted);
+  font-size: var(--text-small);
   line-height: 1.5;
 }
 .chat-suggestions {
@@ -4361,6 +4482,38 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-message.is-transient .chat-message-content.muted {
   color: var(--muted);
 }
+/* 消息时间戳：弱灰色、小于正文、不抢占注意力 */
+.chat-message-time {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--faint);
+  line-height: 1.2;
+}
+.chat-message.user .chat-message-time {
+  align-self: flex-end;
+  text-align: right;
+}
+/* 跨日期提示：用轻标签替代横向分割线，减少噪音 */
+.chat-date-divider {
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  padding: 0 8px;
+  margin: 6px 0 2px;
+  border-radius: 999px;
+  color: var(--faint);
+  background: rgba(255, 255, 255, .68);
+  font-size: 11px;
+}
+.chat-date-divider::before,
+.chat-date-divider::after {
+  content: none;
+}
+.chat-date-divider > span {
+  flex-shrink: 0;
+}
 /* typing dots：三个小点循环动画 */
 .typing-dots {
   display: inline-flex;
@@ -4421,8 +4574,8 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   grid-template-columns: minmax(66px, max-content) minmax(0, 1fr);
   gap: 8px;
   align-items: baseline;
-  padding: 7px 0;
-  border-top: 1px solid var(--line);
+  padding: 2px 0;
+  border-top: 0;
   font-size: 13px;
   line-height: 1.55;
 }
@@ -4455,15 +4608,15 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 }
 .chat-composer {
   flex: 0 0 auto;
-  padding: 12px 22px 18px;
-  border-top: 1px solid var(--line);
-  background: var(--paper);
+  padding: 10px 22px 12px;
+  border-top: 0;
+  background: transparent;
 }
 .chat-input-row {
   position: relative;
 }
 .chat-input-shell {
-  min-height: 78px;
+  min-height: 64px;
   max-height: none;
   display: flex;
   flex-direction: column;
@@ -4484,11 +4637,11 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-input-textarea,
 .chat-input-shell textarea {
   width: 100%;
-  min-height: 40px;
-  max-height: calc(20px * 3 + 18px);
+  min-height: 32px;
+  max-height: calc(20px * 3 + 12px);
   resize: none;
-  overflow-y: hidden;
-  padding: 10px 14px 6px;
+  overflow-y: auto;
+  padding: 8px 14px 4px;
   border: 0;
   outline: 0;
   background: transparent;
@@ -4505,15 +4658,15 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   background: #d8dad2;
 }
 .chat-input-tools {
-  min-height: 42px;
+  min-height: 34px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 8px 8px;
+  padding: 0 8px 6px;
 }
 .chat-attach-button {
-  height: 32px;
+  height: 30px;
   padding: 0 8px;
   border: 0;
   border-radius: var(--radius-small);
@@ -4543,9 +4696,9 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 }
 .chat-send-button {
   position: static;
-  min-width: 66px;
-  min-height: 34px;
-  height: 34px;
+  min-width: 60px;
+  min-height: 30px;
+  height: 30px;
   padding: 0 13px;
 }
 .chat-send-spinner {
@@ -5205,6 +5358,20 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
   gap: 8px;
   padding-top: 3px;
 }
+
+/* 第三期：高风险删除 plan 卡片样式 */
+.chat-action-card.is-high-risk {
+  border-color: var(--signal-red);
+}
+.chat-action-card.is-high-risk .chat-action-card-head span {
+  color: var(--signal-red);
+}
+.chat-action-card.is-awaitingSecondConfirm .chat-action-card-head span {
+  color: var(--signal-red);
+}
+/* 高风险删除二次确认按钮：红色变体 */
+.primary-button.red { background: var(--signal-red); }
+.primary-button.red:hover { background: #9c3f2c; }
 
 .chat-action-hint {
   font-size: 12px;
