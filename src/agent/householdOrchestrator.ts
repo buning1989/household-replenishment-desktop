@@ -49,7 +49,21 @@ import type {
 export function createHouseholdOrchestrator(): AgentOrchestrator {
   return {
     decide(input) {
-      return decideSync(input)
+      const decision = decideSync(input)
+      // 阶段 2C 复盘：记录 decideSync 返回值（在 App.tsx dispatch 之前）
+      if (input.trace) {
+        input.trace.decisionBeforeAppDispatch = decision.kind
+        // 如果是 sync 且不是 needTurnInterpreterLlm，说明 decideSync 已最终决策，
+        // interpretAndRoute 不会被调用，这里填 finalDecision
+        if (decision.kind === "sync" && !input.trace.finalDecision) {
+          input.trace.finalDecision = {
+            kind: "sync",
+            turnKind: decision.turn.kind,
+            message: "message" in decision.turn ? decision.turn.message.slice(0, 300) : undefined
+          }
+        }
+      }
+      return decision
     },
     normalizeLlmResponse(content, input) {
       return normalizeLlm(content, input)
@@ -243,10 +257,13 @@ function handleBoundaryOrLlmFallback(text: string): OrchestrateDecision {
  * 返回 null 表示交回 decideSync 后续流程处理（实际上各 focus 分支都已覆盖）。
  */
 function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDecision | null {
-  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
+  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch, trace } = input
   if (!pendingCollection) return null
 
   const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+  if (trace) {
+    trace.localInterpretation = interpretation
+  }
   const focus = resolveConversationFocus({
     interpretation,
     pendingCollection,
@@ -254,13 +271,24 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
     pendingDraft,
     pendingBatch
   })
+  if (trace) {
+    trace.firstFocusDecision = focus
+  }
 
   switch (focus.focus) {
     case "continue_pending_collection":
     case "correct_pending_collection": {
       const collectionTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
-      if (collectionTurn) return { kind: "sync", turn: collectionTurn }
+      if (collectionTurn) {
+        if (trace) {
+          trace.collectionFallback = { tried: true, producedTurn: true, turnKind: collectionTurn.kind }
+        }
+        return { kind: "sync", turn: collectionTurn }
+      }
       // handlePendingCollectionIntent 返回 null（noChange）：落到后续流程
+      if (trace) {
+        trace.collectionFallback = { tried: true, producedTurn: false }
+      }
       return null
     }
 
@@ -278,7 +306,15 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 但 focusResolver 可能把含评价/价格的长句误判成 query（如「这款猫砂品质不错，不起灰」
       // 命中 adjacentHomeLife 关键词），因此先尝试旧 collection 处理逻辑兜底字段抽取。
       const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
-      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      if (fallbackTurn) {
+        if (trace) {
+          trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
+        }
+        return { kind: "sync", turn: fallbackTurn }
+      }
+      if (trace) {
+        trace.collectionFallback = { tried: true, producedTurn: false }
+      }
       return null
     }
 
@@ -287,7 +323,15 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 先尝试旧 collection 处理逻辑，保留原有「评价/价格」等长句字段的抽取能力
       // （focusResolver 的短句识别覆盖面比 reviseDraftCollection 窄，需兜底）。
       const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
-      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      if (fallbackTurn) {
+        if (trace) {
+          trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
+        }
+        return { kind: "sync", turn: fallbackTurn }
+      }
+      if (trace) {
+        trace.collectionFallback = { tried: true, producedTurn: false }
+      }
       const boundary = classifyConversationBoundary(text)
       if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
         return {
@@ -303,7 +347,15 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 先尝试旧 collection 处理逻辑，保留原有长句评价/价格字段抽取能力
       // （focusResolver 的短句识别覆盖面比 reviseDraftCollection 窄，需兜底）。
       const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
-      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      if (fallbackTurn) {
+        if (trace) {
+          trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
+        }
+        return { kind: "sync", turn: fallbackTurn }
+      }
+      if (trace) {
+        trace.collectionFallback = { tried: true, producedTurn: false }
+      }
       // 旧逻辑也抽不出字段（如「拼夕夕/pdd/上次那个平台」这类平台别名或指代）：
       // 阶段 2C 不再直接回 needLlm → 「超出家务范围」，而是交给 LLM Turn Interpreter
       // 结合当前 pendingCollection 重新做结构化理解。
@@ -334,9 +386,12 @@ async function interpretAndRouteSync(
   input: OrchestrateInput,
   clientOverride?: TurnInterpreterLlmClient
 ): Promise<OrchestrateDecision> {
-  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
+  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch, trace } = input
   if (!pendingCollection) {
     // 无 pendingCollection 不应进入此路径；兜底交常规 LLM
+    if (trace) {
+      trace.finalDecision = { kind: "needLlm" }
+    }
     return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection" }
   }
 
@@ -348,12 +403,17 @@ async function interpretAndRouteSync(
     state,
     itemViews,
     dateContext,
-    client: clientOverride
+    client: clientOverride,
+    trace
   })
 
   // LLM 失败 / 低置信 / unknown → clarification（不回复「超出家务范围」）
   if (!llmInterpretation) {
-    return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+    const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+    if (trace) {
+      trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message.slice(0, 300) }
+    }
+    return { kind: "sync", turn: clarificationTurn }
   }
 
   const focus = resolveConversationFocus({
@@ -363,43 +423,78 @@ async function interpretAndRouteSync(
     pendingDraft,
     pendingBatch
   })
+  if (trace) {
+    trace.secondFocusDecision = focus
+  }
 
   switch (focus.focus) {
     case "continue_pending_collection":
     case "correct_pending_collection": {
       // 用 LLM 解释出的 fields 合成等价用户输入，复用旧 collection 处理逻辑抽取/写入字段
       const synthText = synthesizeInputFromInterpretation(llmInterpretation, pendingCollection)
+      if (trace) {
+        trace.synthesizedInput = synthText
+      }
       const collectionTurn = handlePendingCollectionIntent(synthText, pendingCollection, state, itemViews, dateContext)
-      if (collectionTurn) return { kind: "sync", turn: collectionTurn }
+      if (collectionTurn) {
+        if (trace) {
+          trace.finalDecision = { kind: "sync", turnKind: collectionTurn.kind, message: collectionTurn.message.slice(0, 300) }
+        }
+        return { kind: "sync", turn: collectionTurn }
+      }
       // 合成输入仍抽不出字段 → clarification
-      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      if (trace) {
+        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message.slice(0, 300) }
+      }
+      return { kind: "sync", turn: clarificationTurn }
     }
 
     case "start_new_collection": {
       // LLM 判定为新物品补货记录（itemName 与当前 collection 不同）：走 writeDraft 流程
       const writeDraftDecision = handleWriteDraftIntent(input)
-      if (writeDraftDecision) return writeDraftDecision
-      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+      if (writeDraftDecision) {
+        if (trace && writeDraftDecision.kind === "sync") {
+          trace.finalDecision = { kind: "sync", turnKind: writeDraftDecision.turn.kind }
+        }
+        return writeDraftDecision
+      }
+      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      if (trace) {
+        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind }
+      }
+      return { kind: "sync", turn: clarificationTurn }
     }
 
     case "route_to_query":
       // LLM 判定为查询：不打断 collection，交常规 answer LLM 回答查询
+      if (trace) {
+        trace.finalDecision = { kind: "needLlm" }
+      }
       return { kind: "needLlm", reason: "llm interpreted as query, defer to answer llm" }
 
     case "route_to_smalltalk": {
       const boundary = classifyConversationBoundary(text)
       if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
-        return {
-          kind: "sync",
-          turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
+        const turn = { kind: "answer" as const, message: composeBoundaryAnswer(boundary, text) }
+        if (trace) {
+          trace.finalDecision = { kind: "sync", turnKind: "answer" }
         }
+        return { kind: "sync", turn }
+      }
+      if (trace) {
+        trace.finalDecision = { kind: "needLlm" }
       }
       return { kind: "needLlm", reason: "llm interpreted as smalltalk" }
     }
 
     default:
       // route_to_llm / 其他：clarification 兜底
-      return { kind: "sync", turn: composeCollectionClarificationTurn(pendingCollection) }
+      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      if (trace) {
+        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind }
+      }
+      return { kind: "sync", turn: clarificationTurn }
   }
 }
 

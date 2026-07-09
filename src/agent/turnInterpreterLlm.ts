@@ -22,6 +22,7 @@ import type { AgentDraft } from "./drafts"
 import type { DraftCollection } from "./draftCollection"
 import type { AgentPlan } from "./actions"
 import type { TurnInterpretation, TurnIntent } from "./turnInterpretation"
+import type { AgentDecisionTrace } from "./agentDecisionTrace"
 
 /**
  * LLM 客户端抽象。complete(prompt) 返回原始文本（应是 JSON）。
@@ -42,6 +43,8 @@ export type AskTurnInterpreterLlmInput = {
   dateContext: ChatDateContext
   /** 可注入的 LLM 客户端；单测传 mock，真实运行时由内部构造 */
   client?: TurnInterpreterLlmClient
+  /** dev-only trace：记录调用过程，便于诊断真实链路断点 */
+  trace?: AgentDecisionTrace
 }
 
 /** LLM 允许返回的 intent 子集（比本地 TurnIntent 窄，去除 force_proposal 等）。 */
@@ -99,42 +102,129 @@ const VALID_LLM_INTENTS: ReadonlySet<LlmTurnIntent> = new Set([
 export async function askTurnInterpreterLlm(
   input: AskTurnInterpreterLlmInput
 ): Promise<TurnInterpretation | null> {
-  const client = input.client ?? createDesktopTurnInterpreterLlmClient(input.state)
-  if (!client) return null
+  const trace = input.trace
+  const apiKey = input.state.settings?.aiApiKey?.trim()
+  const model = (input.state.settings?.aiChatModel ?? input.state.settings?.aiModel)?.trim()
 
-  const prompt = buildInterpreterPrompt(input)
-  let raw: string
-  try {
-    raw = await client.complete(prompt)
-  } catch {
+  // 填充 trace.llmInterpreter 起始状态
+  if (trace) {
+    trace.llmInterpreter = {
+      shouldCall: true,
+      called: false,
+      hasApiKey: Boolean(apiKey),
+      model: model || "(default qwen-plus)"
+    }
+  }
+
+  const client = input.client ?? createDesktopTurnInterpreterLlmClient(input.state)
+  if (!client) {
+    if (trace) {
+      trace.llmInterpreter!.called = false
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = !apiKey
+        ? "no_api_key"
+        : "no_desktop_bridge"
+    }
     return null
   }
 
+  const prompt = buildInterpreterPrompt(input)
+  if (trace) {
+    trace.llmInterpreter!.promptPreview = prompt.slice(0, 500)
+    trace.llmInterpreter!.called = true
+  }
+
+  let raw: string
+  try {
+    raw = await client.complete(prompt)
+  } catch (err) {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = `client_exception: ${err instanceof Error ? err.message : String(err)}`
+    }
+    return null
+  }
+
+  if (trace) {
+    trace.llmInterpreter!.rawResponse = typeof raw === "string" ? raw.slice(0, 2000) : String(raw).slice(0, 2000)
+  }
+
   const parsed = parseLlmTurnInterpretation(raw)
-  if (!parsed) return null
+  if (trace) {
+    trace.llmInterpreter!.parsed = parsed
+  }
+  if (!parsed) {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = "json_parse_failed"
+    }
+    return null
+  }
 
   // 低置信 / unknown / 空字段 supplement → 转 null（调用方走 clarification）
-  if (parsed.confidence === "low") return null
-  if (parsed.intent === "unknown") return null
+  if (parsed.confidence === "low") {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = "confidence_low"
+    }
+    return null
+  }
+  if (parsed.intent === "unknown") {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = "intent_unknown"
+    }
+    return null
+  }
   if (
     parsed.intent === "supplement_current_collection" &&
     Object.keys(parsed.fields).length === 0
   ) {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = "supplement_with_empty_fields"
+    }
     return null
   }
 
-  return normalizeLlmInterpretation(parsed)
+  const normalized = normalizeLlmInterpretation(parsed)
+  if (trace) {
+    trace.llmInterpreter!.normalizedInterpretation = normalized
+    trace.llmInterpreter!.rejected = false
+  }
+  return normalized
 }
 
 /**
  * 构造给 LLM 的解释 prompt。明确告诉模型：你在解释用户这一轮输入，不是在聊天回复。
+ *
+ * Prompt 分两段：
+ *   1. system 段：任务定义 + JSON 输出绝对规则 + 别名归一化规则 + JSON schema
+ *   2. user 段：当前 pendingCollection 上下文 + 用户这一轮输入
+ *
+ * system 段在 buildSystemPrompt()，user 段在 buildUserPrompt()。
+ * 实际发送给 client 时合并为一条 prompt 字符串（client 实现决定如何分消息）。
  */
 function buildInterpreterPrompt(input: AskTurnInterpreterLlmInput): string {
-  const { text, pendingCollection, state, itemViews, dateContext } = input
+  const systemPrompt = buildSystemPrompt(input)
+  const userPrompt = buildUserPrompt(input)
+  return `${systemPrompt}\n\n=== 用户输入与上下文 ===\n${userPrompt}`
+}
+
+/** system 段：固定规则。 */
+function buildSystemPrompt(input: AskTurnInterpreterLlmInput): string {
   const lines: string[] = []
 
   lines.push("你是一个家庭补货记录采集助手。你不是在聊天回复用户，而是在解释用户这一轮输入的真实意图。")
-  lines.push("只输出一个 JSON 对象，不要输出任何解释性文字、不要用 markdown 代码块包裹。")
+  lines.push("")
+
+  // 绝对 JSON 输出规则——必须放在最显眼位置，qwen-plus 等模型容易忽略
+  lines.push("【绝对规则】")
+  lines.push("1. 只输出一个 JSON 对象。")
+  lines.push("2. 不要输出任何其他文字：不要解释、不要问候、不要寒暄、不要说「好的」「这是结果」。")
+  lines.push("3. 不要用 markdown 代码块包裹（不要写 ```json 或 ```）。")
+  lines.push("4. 第一个字符必须是 `{`，最后一个字符必须是 `}`。")
+  lines.push("5. 违反以上规则的输出将被系统丢弃，导致用户看到追问而不是结果。")
   lines.push("")
 
   lines.push("【任务】")
@@ -151,9 +241,9 @@ function buildInterpreterPrompt(input: AskTurnInterpreterLlmInput): string {
 
   lines.push("【平台别名归一化规则】")
   lines.push("如果用户输入是平台或平台别名，把 platform 归一为标准名：")
-  lines.push("- 拼夕夕 / pdd / p'd'd / 多多 → 拼多多")
-  lines.push("- 狗东 / 东哥 → 京东")
-  lines.push("- 淘系 / 某宝 → 淘宝")
+  lines.push("- 拼夕夕 / pdd / p'd'd / 多多 / PDD / Pdd → 拼多多")
+  lines.push("- 狗东 / 东哥 / jd / JD → 京东")
+  lines.push("- 淘系 / 某宝 / tb → 淘宝")
   lines.push("- 天猫 / tmall → 天猫")
   lines.push("注意：不要只依赖这几条示例，遇到其他平台别名也尽量归一。")
   lines.push("")
@@ -164,6 +254,7 @@ function buildInterpreterPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push("")
 
   lines.push("【输出 JSON schema】")
+  lines.push("第一个字符必须是 `{`，最后一个字符必须是 `}`。schema：")
   lines.push('{')
   lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_inventory | smalltalk | unknown",')
   lines.push('  "fields": {')
@@ -180,6 +271,14 @@ function buildInterpreterPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push('}')
   lines.push("只填入能确定的字段，不确定的字段不要硬编造。")
   lines.push("")
+
+  return lines.join("\n")
+}
+
+/** user 段：当前上下文 + 用户输入。 */
+function buildUserPrompt(input: AskTurnInterpreterLlmInput): string {
+  const { text, pendingCollection, state, itemViews, dateContext } = input
+  const lines: string[] = []
 
   lines.push("【当前时间】")
   lines.push(`今天是 ${dateContext.todayLabel}，当前时间 ${dateContext.timestampLabel}，时区 ${dateContext.timezone}。`)
@@ -211,6 +310,8 @@ function buildInterpreterPrompt(input: AskTurnInterpreterLlmInput): string {
 
   lines.push("【用户这一轮输入】")
   lines.push(text)
+  lines.push("")
+  lines.push("只输出 JSON 对象，第一个字符是 `{`，最后一个字符是 `}`。")
 
   return lines.join("\n")
 }
@@ -376,22 +477,40 @@ function normalizeLlmInterpretation(parsed: LlmTurnInterpretation): TurnInterpre
  * 构造真实运行时的 LLM 客户端（接 window.desktop.chatComplete）。
  * 仅在浏览器/Electron 主世界有 desktop bridge 时可用；否则返回 null。
  *
- * 注意：本函数不导入 householdChat 的 askHouseholdAssistant——那个函数用对话式 prompt，
- * 这里需要纯 JSON 输出，因此独立构造请求。
+ * 注意：
+ *   1. 使用 `window.desktop?.chatComplete`（typed global），而非 `(globalThis as any).window`。
+ *      后者在某些打包配置下可能拿不到真实 window。
+ *   2. system + user 双消息结构：system 段是固定规则，user 段是上下文 + 用户输入。
+ *      qwen-plus 等模型对「system 规则 + user 输入」结构比纯 system 更可靠地输出 JSON。
+ *   3. 模型默认 qwen-plus（与 askHouseholdAssistant 一致），不再用 gpt-4o-mini。
  */
 function createDesktopTurnInterpreterLlmClient(state: AppState): TurnInterpreterLlmClient | null {
   const apiKey = state.settings?.aiApiKey
   const model = (state.settings?.aiChatModel ?? state.settings?.aiModel)?.trim()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const desktop = (globalThis as any).window?.desktop
+  // 优先用 typed window（与 askHouseholdAssistant 一致），避免 globalThis.window 在某些环境拿不到
+  const desktop = typeof window !== "undefined" ? window.desktop : undefined
   if (!desktop?.chatComplete || !apiKey) return null
 
   return {
     async complete(prompt: string): Promise<string> {
-      const result = await desktop.chatComplete({
+      // prompt 已是 system + user 合并串，这里拆分发送：
+      // 找到 "=== 用户输入与上下文 ===" 分隔符，前段作 system，后段作 user
+      const separator = "=== 用户输入与上下文 ==="
+      const sepIndex = prompt.indexOf(separator)
+      const systemContent = sepIndex >= 0 ? prompt.slice(0, sepIndex).trim() : prompt
+      const userContent = sepIndex >= 0 ? prompt.slice(sepIndex + separator.length).trim() : ""
+
+      const messages = userContent
+        ? [
+            { role: "system" as const, content: systemContent },
+            { role: "user" as const, content: userContent }
+          ]
+        : [{ role: "system" as const, content: systemContent }]
+
+      const result = await desktop.chatComplete!({
         apiKey,
-        model: model || "gpt-4o-mini",
-        messages: [{ role: "system", content: prompt }]
+        model: model || "qwen-plus",
+        messages
       })
       if (!result?.ok) {
         throw new Error(typeof result?.error === "string" ? result.error : "llm failed")

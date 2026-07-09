@@ -52,6 +52,7 @@ import {
   type MeasureUnitDefinition
 } from "./orderImportHelpers"
 import { createHouseholdOrchestrator, isBatchIntentMarker, readTurnCommand } from "./agent/householdOrchestrator"
+import { createTrace, commitTrace, type AgentDecisionTrace } from "./agent/agentDecisionTrace"
 import type { AgentPlanCommand, AgentTurn } from "./agent/orchestrator"
 import type { AgentPlan } from "./agent/actions"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
@@ -2227,6 +2228,20 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const dateContext = buildChatDateContext()
 
     // 统一管家决策层：所有路径都先经过 orchestrator.decide
+    // 阶段 2C 复盘：创建 dev-only trace，贯穿 decide → interpretAndRoute → askTurnInterpreterLlm
+    const trace: AgentDecisionTrace = createTrace(text, {
+      collectionItemName: pendingCollection
+        ? (pendingCollection.draft.kind === "restock"
+            ? pendingCollection.draft.itemName
+            : pendingCollection.draft.kind === "createItemWithRestock"
+              ? pendingCollection.draft.item.itemName
+              : undefined)
+        : undefined,
+      collectionStatus: pendingCollection ? "pending" : undefined,
+      missingFields: pendingCollection
+        ? [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
+        : undefined
+    })
     let decision = orchestrator.decide({
       text,
       state,
@@ -2234,7 +2249,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       pendingDraft,
       pendingCollection,
       pendingPlan,
-      dateContext
+      dateContext,
+      trace
     })
 
     // 阶段 2C：pendingCollection 下本地低置信（route_to_llm）时，先调用 LLM Turn Interpreter
@@ -2257,7 +2273,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         pendingDraft,
         pendingCollection,
         pendingPlan,
-        dateContext
+        dateContext,
+        trace
       })
       setLoading(false)
       if (llmDecision.kind === "sync") {
@@ -2267,6 +2284,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         decision = { kind: "needLlm", reason: llmDecision.reason }
       }
     }
+
+    // 提交 trace：暴露到 window.__agentLastTrace，dev 环境 console.info
+    commitTrace(trace)
 
     // 响应节奏层：根据意图/turn/上下文决定这一轮的最小延迟和 loading 文案。
     // 用 transient assistant message 显示过程态，让用户看到「管家正在处理」。

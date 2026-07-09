@@ -201,6 +201,13 @@ export type OrchestrateInput = {
   pendingPlan?: AgentPlan
   /** 对话日期上下文 */
   dateContext: import("../llm/householdChat").ChatDateContext
+  /**
+   * 阶段 2C 复盘：dev-only 决策 trace。
+   * orchestrator 在 decideSync / interpretAndRouteSync 执行过程中填充字段，
+   * 调用方读取后暴露到 window.__agentLastTrace 并 console.info。
+   * 不影响决策逻辑，不写入 state，纯调试用途。
+   */
+  trace?: import("./agentDecisionTrace").AgentDecisionTrace
 }
 
 /** orchestrator 同步决策结果。LLM 调用是异步的，由调用方在外层处理。 */
