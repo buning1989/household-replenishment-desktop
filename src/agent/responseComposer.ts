@@ -232,12 +232,12 @@ function buildPriceGuidanceLine(
     return `同分类其他物品价格我参考了一下，${qty}${unit} 我先按 ¥${suggestion.value} 估着。实际金额你直接改。`
   }
 
-  // llmPrior：常识区间（最低置信，文案必须说「常见价格范围」）
+  // llmPrior：细分类目价格先验（最低置信，文案必须说「粗估」「还没有历史价格」）
   if (suggestion.source === "llmPrior") {
     if (suggestion.range) {
-      return `${itemName}之前还没记过价格。我先按常见价格范围估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。你说个实际金额，我再改准。`
+      return `${itemName}我还没有历史价格，只能按常见价格粗估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。你记得实际金额的话，直接说个数我改准。`
     }
-    return `${itemName}之前还没记过价格。我先按常见范围估，${qty}${unit} 大概 ¥${suggestion.value}。你说个实际金额，我再改准。`
+    return `${itemName}我还没有历史价格，只能按常见价格粗估，${qty}${unit} 大概 ¥${suggestion.value}。你记得实际金额的话，直接说个数我改准。`
   }
 
   // template：极少走到这里
@@ -361,6 +361,9 @@ export function composeCollectionMessage(
   if (price === undefined || price === null) {
     if (priceSuggestion) {
       lines.push(buildCollectionPriceStatement(itemName, qty, unit, platform, priceSuggestion))
+    } else {
+      // 没有细分类目先验，不估价
+      lines.push(`${itemName}我还没有历史价格，先不乱估。你记得金额的话，可以直接补一句，比如「36 元」。`)
     }
   }
 
@@ -417,11 +420,11 @@ function buildCollectionPriceStatement(
     }
     return `同分类其他物品我参考了一下，${qty}${unit} 我先按 ¥${suggestion.value} 估着。`
   }
-  // llmPrior / template：必须说「常见」，不伪装历史
+  // llmPrior / template：必须说「粗估」「还没有历史价格」，不伪装历史
   if (suggestion.range) {
-    return `${itemName}之前还没记过价格。按常见价格范围估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。`
+    return `${itemName}我还没有历史价格，只能按常见价格粗估，${qty}${unit} 大概 ¥${suggestion.range.min}~¥${suggestion.range.max}。`
   }
-  return `${itemName}之前还没记过价格。按常见范围估，${qty}${unit} 大概 ¥${suggestion.value}。`
+  return `${itemName}我还没有历史价格，只能按常见价格粗估，${qty}${unit} 大概 ¥${suggestion.value}。`
 }
 
 /**

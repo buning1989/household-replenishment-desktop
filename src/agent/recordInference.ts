@@ -19,6 +19,7 @@
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import type { AppState, ReplenishmentItem, RestockEvent } from "../types"
 import type { AgentDraft } from "./drafts"
+import { findPricePrior, computePriceRange } from "./pricePrior"
 
 export type FieldSuggestion = {
   field: "price" | "platform" | "purchaseProductName" | "unit" | "cycleDays"
@@ -141,40 +142,7 @@ function findItemInState(state: AppState, itemName: string, itemId?: string): Re
   return state.items.find((item) => item.name.trim().toLocaleLowerCase("zh-CN") === lower)
 }
 
-/**
- * 内置生活常识价格区间（每件单价）。用于无任何历史时的低置信参考。
- * 只覆盖家庭消耗品里最常见的几类，未命中时给一个保守默认区间。
- */
-const COMMON_SENSE_PRICE_RANGE: Array<{ keys: string[]; min: number; max: number; unit: string; perWhat: string }> = [
-  { keys: ["猫砂"], min: 20, max: 40, unit: "袋", perWhat: "袋" },
-  { keys: ["猫粮"], min: 80, max: 200, unit: "袋", perWhat: "袋" },
-  { keys: ["狗粮"], min: 80, max: 200, unit: "袋", perWhat: "袋" },
-  { keys: ["卫生纸", "卷纸"], min: 25, max: 50, unit: "提", perWhat: "提" },
-  { keys: ["抽纸", "面巾"], min: 25, max: 50, unit: "提", perWhat: "提" },
-  { keys: ["洗衣液"], min: 30, max: 60, unit: "瓶", perWhat: "瓶" },
-  { keys: ["洗发水"], min: 30, max: 80, unit: "瓶", perWhat: "瓶" },
-  { keys: ["沐浴露"], min: 25, max: 60, unit: "瓶", perWhat: "瓶" },
-  { keys: ["牙膏"], min: 15, max: 40, unit: "支", perWhat: "支" },
-  { keys: ["洗洁精"], min: 15, max: 30, unit: "瓶", perWhat: "瓶" },
-  { keys: ["厨房纸"], min: 25, max: 50, unit: "包", perWhat: "包" },
-  { keys: ["垃圾袋"], min: 15, max: 40, unit: "卷", perWhat: "卷" },
-  { keys: ["洗手液"], min: 15, max: 35, unit: "瓶", perWhat: "瓶" },
-  { keys: ["纸尿裤"], min: 80, max: 180, unit: "包", perWhat: "包" },
-  { keys: ["湿巾"], min: 15, max: 40, unit: "包", perWhat: "包" },
-  { keys: ["尿垫"], min: 30, max: 80, unit: "包", perWhat: "包" }
-]
-
-const DEFAULT_PRICE_RANGE = { min: 20, max: 50 }
-
-function findCommonSenseRange(itemName: string): { min: number; max: number; perWhat: string } | null {
-  const lower = itemName.trim().toLocaleLowerCase("zh-CN")
-  for (const entry of COMMON_SENSE_PRICE_RANGE) {
-    if (entry.keys.some((key) => lower.includes(key.toLocaleLowerCase("zh-CN"))) || entry.keys.some((key) => key.includes(itemName))) {
-      return { min: entry.min, max: entry.max, perWhat: entry.perWhat }
-    }
-  }
-  return null
-}
+// 已迁移到 pricePrior.ts 模块，使用更精确的细分类目价格先验
 
 /** 价格建议主逻辑：综合 itemHistory / purchaseOption / categoryHistory / llmPrior。 */
 function buildPriceSuggestion(
@@ -265,16 +233,26 @@ function buildPriceSuggestion(
   // 4) 内置模板默认价格（极少命中，因为模板不存价格，这里仅作为兜底返回 null 走 llmPrior）
   // 模板没有 price 字段，跳过。
 
-  // 5) llmPrior：基于物品名的生活常识区间
-  const range = findCommonSenseRange(ctx.itemName) || { ...DEFAULT_PRICE_RANGE, perWhat: unit }
-  const minTotal = Math.round(range.min * qty)
-  const maxTotal = Math.round(range.max * qty)
+  // 5) llmPrior：基于细分类目价格先验（pricePrior.ts）
+  // 只有命中细分类目时才估价，未命中时返回 null（不估价）
+  const prior = findPricePrior(ctx.itemName)
+  if (!prior) {
+    // 未命中细分类目，不估价
+    return null
+  }
+  
+  const range = computePriceRange(prior, qty)
+  if (!range) {
+    return null
+  }
+  
+  const perWhat = prior.unit[0] || unit
   return {
     field: "price",
-    range: { min: minTotal, max: maxTotal },
-    confidence: "low",
+    range: { min: range.min, max: range.max },
+    confidence: prior.confidence,
     source: "llmPrior",
-    reason: `按常见${ctx.itemName}价格范围 ¥${range.min}~¥${range.max}/${range.perWhat} 估算，${qty}${unit} 大概 ¥${minTotal}~¥${maxTotal}（这只是常见范围，不是历史记录）`
+    reason: `按${ctx.itemName}常见价格范围粗估，${qty}${unit} 大概 ¥${range.min}~¥${range.max}（这只是常见范围，不是历史记录）`
   }
 }
 

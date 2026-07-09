@@ -360,6 +360,56 @@ test("8. 无历史价格 → suggestion source=llmPrior/template, confidence=low
   assert.equal(priceSuggestion.confidence, "low", "confidence 应为 low")
   // message 不应出现「之前买过」
   assert.ok(!decision.turn.message.includes("之前买过"), `不应含「之前买过」, 实际：${decision.turn.message}`)
-  // message 应包含「常见」
-  assert.ok(decision.turn.message.includes("常见"), `应含「常见」, 实际：${decision.turn.message}`)
+  // message 应包含「常见」或「粗估」
+  assert.ok(
+    decision.turn.message.includes("常见") || decision.turn.message.includes("粗估"),
+    `应含「常见」或「粗估」, 实际：${decision.turn.message}`
+  )
+})
+
+// ---------- 9. 未知物品不估价 ----------
+
+test("9. 未知物品「临时用品」→ 不估价，文案含「先不乱估」", () => {
+  const state = makeState()  // 无 items
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({
+    text: "今天买了 5 包临时用品",
+    state,
+    itemViews: [],
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "collection")
+  const message = decision.turn.message
+  // 应包含「先不乱估」
+  assert.ok(message.includes("先不乱估"), `未知物品应说「先不乱估」, 实际：${message}`)
+  // 不应出现价格区间
+  assert.ok(!message.includes("¥"), `未知物品不应出现价格区间, 实际：${message}`)
+  // 不应出现 75-200
+  assert.ok(!message.includes("75") && !message.includes("200"), `不应出现 75-200, 实际：${message}`)
+})
+
+// ---------- 10. 宠物擦脚巾湿巾低价先验 ----------
+
+test("10. 宠物擦脚巾湿巾 5 包 → 25–75 区间，文案含「粗估」", () => {
+  const state = makeState()  // 无 items
+  const orch = createHouseholdOrchestrator()
+  const decision = orch.decide({
+    text: "今天买了 5 包宠物擦脚巾湿巾",
+    state,
+    itemViews: [],
+    dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
+  })
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "collection")
+  const message = decision.turn.message
+  // 应包含「粗估」或「还没有历史价格」
+  assert.ok(
+    message.includes("粗估") || message.includes("还没有历史价格"),
+    `应含「粗估」或「还没有历史价格」, 实际：${message}`
+  )
+  // 应出现价格区间，且在 25-75 范围
+  assert.ok(message.includes("¥"), `应出现价格区间, 实际：${message}`)
+  // 不应出现 75-200 这种过宽区间
+  assert.ok(!message.includes("200"), `不应出现 200, 实际：${message}`)
 })

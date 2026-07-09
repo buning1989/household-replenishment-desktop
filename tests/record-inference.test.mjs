@@ -163,12 +163,12 @@ test("场景4: 没有任何历史 → 返回 llmPrior, confidence=low, 文案不
   assert.equal(price.confidence, "low")
   // 文案不能伪装成历史事实，不应说「之前」
   assert.ok(!price.reason.includes("之前"), `llmPrior reason 不应说「之前」, 实际：${price.reason}`)
-  // 文案应说「常见」
-  assert.match(price.reason, /常见/, "llmPrior reason 应说明是常见范围")
-  // 应给 range（5 袋猫砂 20-40 一袋，约 100-200）
+  // 文案应说「常见」或「粗估」
+  assert.ok(price.reason.includes("常见") || price.reason.includes("粗估"), `llmPrior reason 应说明是常见范围/粗估, 实际：${price.reason}`)
+  // 应给 range（5 袋猫砂 20-50 一袋，约 100-250）
   assert.ok(price.range, "无历史应给区间")
   assert.ok(price.range.min >= 80 && price.range.min <= 120, `range.min 应在 80-120, 实际 ${price.range.min}`)
-  assert.ok(price.range.max >= 180 && price.range.max <= 220, `range.max 应在 180-220, 实际 ${price.range.max}`)
+  assert.ok(price.range.max >= 220 && price.range.max <= 280, `range.max 应在 220-280, 实际 ${price.range.max}`)
 })
 
 // ---------- 额外：字段已齐全时不给建议 ----------
@@ -263,4 +263,81 @@ test("辅助: createItem 草稿不返回价格/平台建议", () => {
   const platform = findSuggestionByField(suggestions, "platform")
   assert.equal(price, undefined)
   assert.equal(platform, undefined)
+})
+
+// ---------- 价格先验（pricePrior）测试 ----------
+
+test("pricePrior: 宠物擦脚巾湿巾 5 包 → 25–75 区间，confidence=low", () => {
+  const state = makeState()  // 无 items
+  const draft = {
+    kind: "createItemWithRestock",
+    item: { kind: "createItem", itemName: "宠物擦脚巾湿巾", category: "宠物用品", cycleDays: 14, bufferDays: 3, unit: "包" },
+    restock: { qty: 5, unit: "包", restockDate: 1000 }
+  }
+  const suggestions = buildRecordSuggestions(draft, state, [])
+  const price = findSuggestionByField(suggestions, "price")
+  assert.ok(price, "宠物擦脚巾应命中 pricePrior")
+  assert.equal(price.source, "llmPrior")
+  assert.equal(price.confidence, "low")
+  assert.ok(price.range, "应返回区间")
+  // 5-15 元/包 × 5 包 = 25-75
+  assert.ok(price.range.min >= 20 && price.range.min <= 30, `range.min 应接近 25, 实际 ${price.range.min}`)
+  assert.ok(price.range.max >= 65 && price.range.max <= 85, `range.max 应接近 75, 实际 ${price.range.max}`)
+  // 不应出现 75-200 这种过宽区间
+  assert.ok(price.range.max <= 100, `range.max 不应超过 100, 实际 ${price.range.max}`)
+})
+
+test("pricePrior: 未知物品「临时用品」→ 不返回价格建议", () => {
+  const state = makeState()
+  const draft = {
+    kind: "createItemWithRestock",
+    item: { kind: "createItem", itemName: "临时用品", category: "其他", cycleDays: 30, bufferDays: 3, unit: "包" },
+    restock: { qty: 5, unit: "包", restockDate: 1000 }
+  }
+  const suggestions = buildRecordSuggestions(draft, state, [])
+  const price = findSuggestionByField(suggestions, "price")
+  assert.equal(price, undefined, "未知物品不应返回价格建议")
+})
+
+test("pricePrior: 猫砂 5 袋无历史 → 100–250 区间，confidence=low", () => {
+  const state = makeState()
+  const draft = {
+    kind: "createItemWithRestock",
+    item: { kind: "createItem", itemName: "猫砂", category: "宠物用品", cycleDays: 14, bufferDays: 3, unit: "袋" },
+    restock: { qty: 5, unit: "袋", restockDate: 1000 }
+  }
+  const suggestions = buildRecordSuggestions(draft, state, [])
+  const price = findSuggestionByField(suggestions, "price")
+  assert.ok(price, "猫砂应命中 pricePrior")
+  assert.equal(price.source, "llmPrior")
+  assert.equal(price.confidence, "low")
+  assert.ok(price.range)
+  // 20-50 元/袋 × 5 袋 = 100-250
+  assert.ok(price.range.min >= 90 && price.range.min <= 110, `range.min 应接近 100, 实际 ${price.range.min}`)
+  assert.ok(price.range.max >= 240 && price.range.max <= 260, `range.max 应接近 250, 实际 ${price.range.max}`)
+})
+
+test("pricePrior: 有历史时优先用历史，不使用 pricePrior", () => {
+  const item = catItem("i1", "猫砂", {
+    history: [restockEvent(90, 3, "京东", 30)]  // 30 元/袋
+  })
+  const state = makeState({ items: [item] })
+  const itemViews = [{ item }]
+  const draft = {
+    kind: "restock",
+    itemId: "i1",
+    itemName: "猫砂",
+    qty: 5,
+    unit: "袋",
+    restockDate: 1000
+  }
+  const suggestions = buildRecordSuggestions(draft, state, itemViews)
+  const price = findSuggestionByField(suggestions, "price")
+  assert.ok(price)
+  assert.equal(price.source, "itemHistory", "有历史时应优先用 itemHistory")
+  assert.notEqual(price.source, "llmPrior", "不应使用 pricePrior")
+  // 估算 150（30 × 5）
+  if (price.value) {
+    assert.ok(Math.abs(price.value - 150) <= 5, `value 应接近 150, 实际：${price.value}`)
+  }
 })

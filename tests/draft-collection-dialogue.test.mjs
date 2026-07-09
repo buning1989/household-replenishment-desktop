@@ -252,8 +252,9 @@ test("场景11: composeCollectionGuidance 直接验证无历史 → 文案符合
   }
   const guidance = composeCollectionGuidance(draft, state, itemViews)
   assert.ok(guidance, "应返回采集文案")
-  assert.ok(guidance.includes("之前还没记过价格"), `应说明之前没记过, 实际：${guidance}`)
-  assert.ok(guidance.includes("常见"), `应说明按常见范围估, 实际：${guidance}`)
+  // 新文案：说「我还没有历史价格，只能按常见价格粗估」
+  assert.ok(guidance.includes("还没有历史价格") || guidance.includes("粗估"), `应说明还没有历史价格/粗估, 实际：${guidance}`)
+  assert.ok(guidance.includes("常见") || guidance.includes("粗估"), `应说明按常见范围估/粗估, 实际：${guidance}`)
   assert.ok(guidance.includes("5 袋") || guidance.includes("5袋"), `应包含「5 袋」, 实际：${guidance}`)
   assert.ok(!guidance.includes("大概多少钱"), `不应追问「大概多少钱」, 实际：${guidance}`)
 })
