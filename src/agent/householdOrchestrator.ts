@@ -14,6 +14,8 @@ import {
   type DraftCollection
 } from "./draftCollection"
 import { classifyAgentIntent, classifyBatchIntent, isSecondConfirmMatch, type BatchLocalIntent } from "./intent"
+import { interpretUserTurn } from "./turnInterpretation"
+import { resolveConversationFocus } from "./focusResolver"
 import {
   composeClarificationMessage,
   composeFallbackMessage,
@@ -69,11 +71,17 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
 
   // 2. pending collection（补货记录采集态）：补充字段 / 取消 / 直接保存 / 转 proposal
   //    collection 是 proposal 的前驱态：字段未齐时先整理，齐了再转 proposal 走 confirm 链路
+  //
+  //    阶段 2B：先用 turnInterpretation + focusResolver 判断本轮应如何对待当前 collection。
+  //    关键修复：当用户在旧物品采集态中输入「今天买了 3 袋五常大米」这类完整新补货句
+  //    （物品名与当前 collection 不同），不再把旧物品的数量/单位覆盖成新输入，而是开启新采集，
+  //    旧 collection 由 App.tsx 的 collection turn 处理逻辑自动标 superseded。
   if (pendingCollection) {
-    const collectionTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
-    if (collectionTurn) return { kind: "sync", turn: collectionTurn }
-    // collectionTurn === null 表示本轮没命中 collection 信号（如纯查询或新操作请求）
-    // 落到下面：新 writeDraft 会生成新 collection/proposal，旧 collection 由调用方标 superseded
+    const collectionDecision = handleCollectionFocusDecision(input)
+    if (collectionDecision) return collectionDecision
+    // collectionDecision === null 表示本轮不打断当前采集态、也不写入新任务，
+    // 也不走 query/LLM（如 route_to_smalltalk 已在此返回）。落到下面继续 batch/draft/query 流程。
+    // 通常不会落到这里：handleCollectionFocusDecision 已覆盖所有 focus 分支。
   }
 
   // 3. pending batch（订单导入后的批量修正）
@@ -126,67 +134,85 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   //   导致新写入请求走 needLlm 而非 writeDraft。
   const intent = classifyAgentIntent(text, Boolean(pendingDraft))
   if (intent === "writeDraft") {
-    // 4a. 先检查重复创建/歧义
-    const clarification = buildLocalClarification(text, state)
-    if (clarification) {
-      return { kind: "sync", turn: clarifyToTurn(clarification) }
-    }
-    // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期 + 第二期编辑类）
-    //     只对 AgentDraft 无法处理的新能力生成 planProposal，避免破坏旧 confirm/cancel/revise 流程
-    const planResult = buildAgentPlan({ text, state, dateContext, pendingPlan: undefined })
-    if (planResult.kind === "plan") {
-      const plan = planResult.plan
-      // 判断是否是 AgentPlan-only 能力：
-      //   第一期：createCategory / setMonthlyBudget / updateItem
-      //   第二期：renameCategory / moveItem / updateItemUnit / updateItemReminder /
-      //           updatePurchaseOption / setDefaultPurchaseOption
-      //   第三期：deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory
-      const isPlanOnly = plan.actions.some(
-        (a) => a.type === "createCategory"
-          || a.type === "setMonthlyBudget"
-          || a.type === "updateItem"
-          || a.type === "renameCategory"
-          || a.type === "moveItem"
-          || a.type === "updateItemUnit"
-          || a.type === "updateItemReminder"
-          || a.type === "updatePurchaseOption"
-          || a.type === "setDefaultPurchaseOption"
-          || a.type === "deletePurchaseOption"
-          || a.type === "deleteRestockRecord"
-          || a.type === "deleteItem"
-          || a.type === "deleteCategory"
-      )
-      if (isPlanOnly) {
-        return {
-          kind: "sync",
-          turn: { kind: "planProposal", message: composePlanMessage(plan, state), plan }
-        }
-      }
-      // 非 plan-only（如「买了两袋猫砂」）：回退到旧 AgentDraft 流程，保持 confirm 链路不变
-    }
-    if (planResult.kind === "clarification") {
-      // planner 的 clarification 是本地兜底，目前不会产出可点选选项
-      return { kind: "sync", turn: { kind: "clarification", message: planResult.message, options: [] } }
-    }
-    // 4c. 回退到旧 AgentDraft 流程
-    const localDraft = buildLocalDraftFromText(text, state)
-    if (localDraft) {
-      // 补货类草稿字段未齐时，先进采集态（DraftCollection），
-      // 用自然语言基于历史/常识帮用户整理，而不是立刻甩确认卡或机械追问「多少钱」。
-      // 字段已齐（readyToConfirm）或用户明确要求保存时，仍直接走 proposal。
-      if (shouldEnterCollection(localDraft, text)) {
-        return { kind: "sync", turn: draftToCollection(localDraft, state, itemViews, dateContext) }
-      }
-      return { kind: "sync", turn: draftToProposal(localDraft, state, itemViews) }
-    }
-    // 4d. 本地解析失败 → 交给 LLM
-    return { kind: "needLlm", reason: "writeDraft but local parser failed" }
+    const writeDraftDecision = handleWriteDraftIntent(input)
+    if (writeDraftDecision) return writeDraftDecision
+    // writeDraftDecision === null 表示本地解析失败（原 4d），落到下面 boundary / LLM
   }
 
-  // 5. 查询意图与其他无法本地处理的输入：
-  //    先用对话边界分类判定 identity/realtime/casual，命中则直接返回 sync answer，不必调 LLM。
-  //    adjacentHomeLife 仍交 LLM（LLM 失败时由 App.tsx 用 composeBoundaryAnswer 兜底）。
-  //    其他无法归类的交 LLM 尝试回答。
+  return handleBoundaryOrLlmFallback(text)
+}
+
+/**
+ * 处理 writeDraft 意图：检查重复创建/歧义 → planner → 旧 AgentDraft 流程。
+ * 返回 null 表示本地解析失败（原 4d），由调用方走 boundary / LLM 兜底。
+ *
+ * 本函数也用于 pendingCollection 分支的 start_new_collection：直接走 writeDraft 流程
+ * 生成新 collection/proposal，旧 collection 由 App.tsx 的 collection turn 处理逻辑标 superseded。
+ */
+function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | null {
+  const { text, state, itemViews, dateContext } = input
+  // 4a. 先检查重复创建/歧义
+  const clarification = buildLocalClarification(text, state)
+  if (clarification) {
+    return { kind: "sync", turn: clarifyToTurn(clarification) }
+  }
+  // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期 + 第二期编辑类）
+  //     只对 AgentDraft 无法处理的新能力生成 planProposal，避免破坏旧 confirm/cancel/revise 流程
+  const planResult = buildAgentPlan({ text, state, dateContext, pendingPlan: undefined })
+  if (planResult.kind === "plan") {
+    const plan = planResult.plan
+    // 判断是否是 AgentPlan-only 能力：
+    //   第一期：createCategory / setMonthlyBudget / updateItem
+    //   第二期：renameCategory / moveItem / updateItemUnit / updateItemReminder /
+    //           updatePurchaseOption / setDefaultPurchaseOption
+    //   第三期：deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory
+    const isPlanOnly = plan.actions.some(
+      (a) => a.type === "createCategory"
+        || a.type === "setMonthlyBudget"
+        || a.type === "updateItem"
+        || a.type === "renameCategory"
+        || a.type === "moveItem"
+        || a.type === "updateItemUnit"
+        || a.type === "updateItemReminder"
+        || a.type === "updatePurchaseOption"
+        || a.type === "setDefaultPurchaseOption"
+        || a.type === "deletePurchaseOption"
+        || a.type === "deleteRestockRecord"
+        || a.type === "deleteItem"
+        || a.type === "deleteCategory"
+    )
+    if (isPlanOnly) {
+      return {
+        kind: "sync",
+        turn: { kind: "planProposal", message: composePlanMessage(plan, state), plan }
+      }
+    }
+    // 非 plan-only（如「买了两袋猫砂」）：回退到旧 AgentDraft 流程，保持 confirm 链路不变
+  }
+  if (planResult.kind === "clarification") {
+    // planner 的 clarification 是本地兜底，目前不会产出可点选选项
+    return { kind: "sync", turn: { kind: "clarification", message: planResult.message, options: [] } }
+  }
+  // 4c. 回退到旧 AgentDraft 流程
+  const localDraft = buildLocalDraftFromText(text, state)
+  if (localDraft) {
+    // 补货类草稿字段未齐时，先进采集态（DraftCollection），
+    // 用自然语言基于历史/常识帮用户整理，而不是立刻甩确认卡或机械追问「多少钱」。
+    // 字段已齐（readyToConfirm）或用户明确要求保存时，仍直接走 proposal。
+    if (shouldEnterCollection(localDraft, text)) {
+      return { kind: "sync", turn: draftToCollection(localDraft, state, itemViews, dateContext) }
+    }
+    return { kind: "sync", turn: draftToProposal(localDraft, state, itemViews) }
+  }
+  // 4d. 本地解析失败 → 返回 null，由调用方走 boundary / LLM 兜底
+  return null
+}
+
+/**
+ * 对话边界与 LLM 兜底（原 decideSync 末段）。
+ * identity/realtime/casual → 本地 sync answer；adjacentHomeLife 与其他 → needLlm。
+ */
+function handleBoundaryOrLlmFallback(text: string): OrchestrateDecision {
   const boundary = classifyConversationBoundary(text)
   if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
     return {
@@ -198,6 +224,91 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     return { kind: "needLlm", reason: "adjacent home life question" }
   }
   return { kind: "needLlm", reason: "query intent or unmatched input" }
+}
+
+/**
+ * 阶段 2B：pendingCollection 分支接入 turnInterpretation + focusResolver。
+ *
+ * 根据本轮 interpretation 与当前 pending 上下文，决定：
+ *   - continue_pending_collection / correct_pending_collection → 旧 handlePendingCollectionIntent
+ *   - start_new_collection → 直接走 writeDraft 流程（生成新 collection/proposal）
+ *   - route_to_query → 不修改当前 collection，落回 decideSync 的 query/boundary/LLM 路径
+ *   - route_to_smalltalk → 本地 sync answer（边界闲聊）
+ *   - route_to_llm → needLlm
+ *
+ * 返回 null 表示交回 decideSync 后续流程处理（实际上各 focus 分支都已覆盖）。
+ */
+function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDecision | null {
+  const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
+  if (!pendingCollection) return null
+
+  const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+  const focus = resolveConversationFocus({
+    interpretation,
+    pendingCollection,
+    pendingPlan,
+    pendingDraft,
+    pendingBatch
+  })
+
+  switch (focus.focus) {
+    case "continue_pending_collection":
+    case "correct_pending_collection": {
+      const collectionTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
+      if (collectionTurn) return { kind: "sync", turn: collectionTurn }
+      // handlePendingCollectionIntent 返回 null（noChange）：落到后续流程
+      return null
+    }
+
+    case "start_new_collection": {
+      // 直接走 writeDraft 流程：clarification → planner → 旧 AgentDraft → collection/proposal
+      // 旧 collection 由 App.tsx 的 collection turn 处理逻辑标 superseded
+      const writeDraftDecision = handleWriteDraftIntent(input)
+      if (writeDraftDecision) return writeDraftDecision
+      // 本地解析失败：交 LLM 兜底
+      return { kind: "needLlm", reason: `start_new_collection but local parser failed: ${focus.reason}` }
+    }
+
+    case "route_to_query": {
+      // 不修改当前 collection，继续走 decideSync 的 batch/draft/query/boundary 流程。
+      // 但 focusResolver 可能把含评价/价格的长句误判成 query（如「这款猫砂品质不错，不起灰」
+      // 命中 adjacentHomeLife 关键词），因此先尝试旧 collection 处理逻辑兜底字段抽取。
+      const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
+      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      return null
+    }
+
+    case "route_to_smalltalk": {
+      // 本地边界闲聊直接回答；查询类（adjacentHomeLife）交给 LLM。
+      // 先尝试旧 collection 处理逻辑，保留原有「评价/价格」等长句字段的抽取能力
+      // （focusResolver 的短句识别覆盖面比 reviseDraftCollection 窄，需兜底）。
+      const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
+      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      const boundary = classifyConversationBoundary(text)
+      if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+        return {
+          kind: "sync",
+          turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
+        }
+      }
+      // 非边界闲聊但 focusResolver 判定为 smalltalk（如问候）：交 LLM
+      return { kind: "needLlm", reason: focus.reason }
+    }
+
+    case "route_to_llm": {
+      // 先尝试旧 collection 处理逻辑，保留原有长句评价/价格字段抽取能力
+      // （focusResolver 的短句识别覆盖面比 reviseDraftCollection 窄，需兜底）。
+      const fallbackTurn = handlePendingCollectionIntent(text, pendingCollection, state, itemViews, dateContext)
+      if (fallbackTurn) return { kind: "sync", turn: fallbackTurn }
+      return { kind: "needLlm", reason: focus.reason }
+    }
+
+    default:
+      // continue_pending_plan / continue_pending_batch / continue_pending_draft / route_to_write_draft
+      // 这些分支在 pendingCollection 场景下不应出现（focusResolver 已分流），
+      // 兜底交回 decideSync 后续流程处理。
+      return null
+  }
 }
 
 /**

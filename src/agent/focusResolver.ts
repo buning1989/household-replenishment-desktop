@@ -146,11 +146,25 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
       }
     }
 
-    // 6. 其他（manage_item / manage_budget / delete_request / batch_revision / unknown）
-    //    视为开启新任务，旧 collection 由调用方标 superseded。
+    // 6. 明确的写入类意图（manage_item / manage_budget / delete_request）：
+    //    与当前采集态不相关，开启新任务，旧 collection 由调用方标 superseded。
+    if (
+      intent === "manage_item" ||
+      intent === "manage_budget" ||
+      intent === "delete_request"
+    ) {
+      return {
+        focus: "start_new_collection",
+        reason: `本轮意图「${intent}」与当前采集态不相关，开启新写入任务`
+      }
+    }
+
+    // 7. unknown / batch_revision：不强行开启新任务，交回调用方用旧 collection
+    //    处理逻辑兜底字段抽取（如「45块」这类短句价格词被 interpretUserTurn 判为 unknown，
+    //    但旧 reviseDraftCollection 能抽出 price）。具体能否抽出字段由调用方决定。
     return {
-      focus: "start_new_collection",
-      reason: `本轮意图「${intent}」与当前采集态不相关，视为开启新任务`
+      focus: "route_to_llm",
+      reason: `本轮意图「${intent}」无法明确归类，交回调用方按旧 collection 逻辑兜底或交 LLM`
     }
   }
 
