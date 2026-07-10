@@ -66,10 +66,15 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
   // ---------- a. pendingPlan 优先 ----------
   // 仅 pending / awaitingSecondConfirm 状态的 plan 是活跃的。
   if (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm")) {
-    // 确认 / 二次确认删除 / 取消 → 继续当前 plan（具体执行/推进/取消由原状态机决定）
+    // 确认 / 二次确认删除 / 取消 / 强制保存信号 → 继续当前 plan
+    // 注意：「确认吧」「就这样」在 interpretUserTurn 中被判为 force_proposal，
+    // 但在 pendingPlan 上下文中应视为确认当前 plan（force_proposal 仅在
+    // pendingCollection 上下文中才表示「强制保存采集态」）。
+    // 具体执行/推进/取消由原状态机决定，二次确认删除约束不被绕过。
     if (
       intent === "confirm_current_task" ||
-      intent === "cancel_current_task"
+      intent === "cancel_current_task" ||
+      intent === "force_proposal"
     ) {
       return {
         focus: "continue_pending_plan",

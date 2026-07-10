@@ -582,6 +582,22 @@ export function supersedeOldPendingCollection(
   )
 }
 
+/**
+ * 新 collection turn 到来时，把旧 pending plan 标记为 superseded。
+ * 阶段 3A：pendingPlan 下用户输入新补货记录，走 writeDraft 生成新 collection，
+ * 旧 plan 不应继续保留 pending 状态。
+ * 返回新的 messages 数组（不可变）。
+ */
+export function supersedeOldPendingPlan(
+  messages: HouseholdChatMessage[]
+): HouseholdChatMessage[] {
+  return messages.map((msg) =>
+    msg.role === "assistant" && msg.agentPlan && msg.planStatus === "pending"
+      ? { ...msg, planStatus: "superseded" as const }
+      : msg
+  )
+}
+
 // 重新导出 pickObservationByPreference 以保持兼容（部分代码可能从 conversationContext 引入）
 export {
   pickObservationByPreference,

@@ -84,13 +84,18 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
 function decideSync(input: OrchestrateInput): OrchestrateDecision {
   const { text, state, itemViews, pendingDraft, pendingCollection, pendingBatch, pendingPlan, dateContext, trace } = input
 
-  // 1. pending plan 优先（多动作计划状态机：confirm / cancel / revise / status）
-  //    第三期：high risk plan 有 awaitingSecondConfirm 状态，需要二次「确认删除」
+  // 1. pending plan（多动作计划状态机：confirm / cancel / revise / status）
+  //    阶段 3A：先用 turnInterpretation + focusResolver 判断本轮是否继续当前 plan。
+  //    只有 confirm / cancel 才继续走原 plan handler（保留二次确认删除约束）。
+  //    新补货记录 / 查询 / 闲聊 / 低置信一律不执行 plan，落到后续流程。
+  //    关键修复：「今天买了 3 袋五常大米」不再因「袋」在 REVISE_KEYWORDS 中
+  //    被 classifyAgentIntent 误判为 reviseDraft，而是由 interpretUserTurn
+  //    正确识别为 new_restock_record，走新建 collection 路径。
   if (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm")) {
-    const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext, trace)
-    if (planTurn) return { kind: "sync", turn: planTurn }
-    // planTurn === null 表示本轮不是针对 pendingPlan 的 confirm/cancel/revise/status
-    // 落到下面：可能是新操作请求（生成新 plan，旧 plan 标 superseded）或查询/闲聊
+    const planDecision = handlePendingPlanFocusDecision(input)
+    if (planDecision) return planDecision
+    // planDecision === null 表示本轮不打断当前 plan 也不继续执行，
+    // 落到下面：可能是查询/闲聊/新操作请求。
   }
 
   // 2. pending collection（补货记录采集态）：补充字段 / 取消 / 直接保存 / 转 proposal
@@ -262,6 +267,107 @@ function handleBoundaryOrLlmFallback(text: string, trace?: AgentDecisionTrace): 
   }
   setRouteDecision(trace, "needLlm", { rule: "query_intent_or_unmatched", routeToLlm: true, reason: "query intent or unmatched input" })
   return { kind: "needLlm", reason: "query intent or unmatched input" }
+}
+
+/**
+ * 阶段 3A：pendingPlan 分支接入 turnInterpretation + focusResolver。
+ *
+ * 只有 focus = continue_pending_plan（确认/取消）才继续走原 plan handler，
+ * 保留二次确认删除约束。其他意图不执行 plan：
+ *   - start_new_collection + new_restock_record → 走 writeDraft 流程（新建 collection）
+ *   - start_new_collection + manage_item/delete_request → 交原 plan handler（保留 revise 能力）
+ *   - route_to_query / route_to_smalltalk / route_to_llm → 兼容 pendingStatus 后落回 decideSync
+ *
+ * 关键修复：「今天买了 3 袋五常大米」不再因「袋」在 REVISE_KEYWORDS 中被误判为 reviseDraft。
+ * interpretUserTurn 正确识别为 new_restock_record → focusResolver 返回 start_new_collection →
+ * 走 writeDraft，旧 plan 由 App.tsx 的 collection turn 处理逻辑标 superseded。
+ *
+ * 返回 null 表示交回 decideSync 后续流程处理（query / boundary / LLM）。
+ */
+function handlePendingPlanFocusDecision(input: OrchestrateInput): OrchestrateDecision | null {
+  const { text, state, itemViews, dateContext, pendingPlan, trace } = input
+  if (!pendingPlan) return null
+
+  const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+  const focus = resolveConversationFocus({
+    interpretation,
+    pendingPlan,
+    pendingCollection: input.pendingCollection,
+    pendingDraft: input.pendingDraft,
+    pendingBatch: input.pendingBatch
+  })
+
+  if (trace) {
+    trace.localInterpretation = interpretation
+    trace.firstFocusDecision = focus
+  }
+
+  switch (focus.focus) {
+    case "continue_pending_plan": {
+      // 确认 / 取消 → 继续走原 plan handler（保留二次确认删除约束）
+      setRouteDecision(trace, "pendingPlan", { rule: "focus.continue_pending_plan", interceptedByRule: true })
+      const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext, trace)
+      if (planTurn) return { kind: "sync", turn: planTurn }
+      return null
+    }
+
+    case "start_new_collection": {
+      // 新补货记录：走 writeDraft 流程，不执行 plan
+      if (interpretation.intent === "new_restock_record") {
+        setRouteDecision(trace, "pendingPlan", { rule: "focus.start_new_collection(new_restock)", interceptedByRule: true })
+        const writeDraftDecision = handleWriteDraftIntent(input)
+        if (writeDraftDecision) {
+          if (writeDraftDecision.kind === "sync" && trace && !trace.finalDecision) {
+            const message = "message" in writeDraftDecision.turn ? writeDraftDecision.turn.message : undefined
+            setFinalDecision(trace, { kind: "sync", turnKind: writeDraftDecision.turn.kind, message })
+          }
+          return writeDraftDecision
+        }
+        setRouteDecision(trace, "pendingPlan", { rule: "start_new_collection.parse_failed", routeToLlm: true })
+        return null
+      }
+      // 其他写入意图（manage_item / delete_request / batch_revision）：
+      // 可能是对当前 plan 的修订（如「改成删除两个」），交原 plan handler 处理。
+      // plan handler 未命中时落到 writeDraft。
+      setRouteDecision(trace, "pendingPlan", { rule: "focus.start_new_collection(non-restock)→planHandler", interceptedByRule: true })
+      const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext, trace)
+      if (planTurn) return { kind: "sync", turn: planTurn }
+      const writeDraftDecision = handleWriteDraftIntent(input)
+      if (writeDraftDecision) return writeDraftDecision
+      return null
+    }
+
+    case "route_to_query":
+    case "route_to_smalltalk":
+    case "route_to_llm": {
+      // 兼容 pendingStatus（如「现在什么情况」）：仍交原 plan handler 显示状态
+      const legacyIntent = classifyAgentIntent(text, true)
+      if (legacyIntent === "pendingStatus") {
+        setRouteDecision(trace, "pendingPlan", { rule: `focus.${focus.focus}→pendingStatus`, interceptedByRule: true })
+        const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext, trace)
+        if (planTurn) return { kind: "sync", turn: planTurn }
+      }
+      // 边界闲聊：本地直接回答
+      if (focus.focus === "route_to_smalltalk") {
+        const boundary = classifyConversationBoundary(text)
+        if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+          setRouteDecision(trace, "pendingPlan", { rule: "route_to_smalltalk.boundary", interceptedByRule: true })
+          return {
+            kind: "sync",
+            turn: { kind: "answer" as const, message: composeBoundaryAnswer(boundary, text) }
+          }
+        }
+      }
+      // 查询 / 闲聊 / 低置信：不执行 plan，落回 decideSync 后续流程
+      setRouteDecision(trace, "pendingPlan", { rule: `focus.${focus.focus}`, routeToLlm: focus.focus === "route_to_llm" })
+      return null
+    }
+
+    default:
+      // continue_pending_collection / continue_pending_batch / continue_pending_draft / route_to_write_draft
+      // 这些分支在 pendingPlan 场景下不应出现（focusResolver 已分流），兜底交回 decideSync。
+      return null
+  }
 }
 
 /**
