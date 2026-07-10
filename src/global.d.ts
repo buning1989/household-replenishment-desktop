@@ -1,4 +1,5 @@
 import type { AppState } from "./types"
+import type { AgentDecisionTrace } from "./agent/agentDecisionTrace"
 
 type NotificationAction = {
   action: "open" | "restock" | "snooze" | "openChat"
@@ -45,6 +46,15 @@ declare global {
       showWindow: () => void
       onNotificationAction: (callback: (payload: NotificationAction) => void) => () => void
     }
+    /**
+     * dev-only Agent 决策追踪。始终暴露（含生产环境），便于现场调试；
+     * console 输出仅在 isTraceEnabled() 为 true 时执行。
+     */
+    __agentLastTrace?: AgentDecisionTrace
+    /** 返回最近一条 trace 的可复制纯文本（9 个字段完整版） */
+    __copyAgentTrace?: () => string
+    /** 最近 20 条 trace 历史（最旧在前） */
+    __agentTraceHistory?: AgentDecisionTrace[]
   }
 }
 

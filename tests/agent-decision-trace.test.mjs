@@ -36,12 +36,18 @@ registerHooks({
 const { createHouseholdOrchestrator } = await import("../src/agent/householdOrchestrator.ts")
 const { buildLocalDraftFromText } = await import("../src/agent/drafts.ts")
 const { createDraftCollection } = await import("../src/agent/draftCollection.ts")
+const { createAgentPlan } = await import("../src/agent/actions.ts")
 const { buildChatDateContext } = await import("../src/llm/householdChat.ts")
 const {
   createTrace,
   commitTrace,
   peekLastTrace,
-  resetLastTraceForTest
+  peekTraceHistory,
+  resetLastTraceForTest,
+  buildTraceCurrentState,
+  setRouteDecision,
+  setFinalDecision,
+  formatTraceForCopy
 } = await import("../src/agent/agentDecisionTrace.ts")
 
 const NOW = Date.UTC(2026, 6, 9) // 2026-07-09
@@ -477,4 +483,334 @@ test("15. 泛化输入 P D D / pin duo duo / 拼西西 → 必须进入 needTurn
       )
     }
   }
+})
+
+// ============================================================
+// 阶段 9 字段 trace 扩展测试（buildTraceCurrentState / setRouteDecision /
+// setFinalDecision / formatTraceForCopy / commitTrace history / normalizeLlm 填充）
+// ============================================================
+
+// ---------- 16. buildTraceCurrentState：无 pending 时返回空对象 ----------
+
+test("16. buildTraceCurrentState 无 pending 返回空对象（无任何 has* 字段）", () => {
+  const cs = buildTraceCurrentState({})
+  assert.equal(cs.hasPendingPlan, undefined)
+  assert.equal(cs.hasPendingDraft, undefined)
+  assert.equal(cs.hasPendingCollection, undefined)
+  assert.equal(cs.hasPendingBatch, undefined)
+})
+
+// ---------- 17. buildTraceCurrentState：pendingPlan 摘要 ----------
+
+test("17. buildTraceCurrentState 含 pendingPlan → 摘要包含动作数与动作类型", () => {
+  const plan = createAgentPlan(
+    [
+      { type: "createCategory", name: "宠物用品" },
+      { type: "deleteItem", itemId: "i1", itemName: "猫砂" }
+    ],
+    "帮我建个宠物用品分类顺便删掉猫砂",
+    NOW
+  )
+  const cs = buildTraceCurrentState({ pendingPlan: plan })
+  assert.equal(cs.hasPendingPlan, true)
+  assert.equal(cs.pendingPlanStatus, "pending")
+  assert.equal(cs.pendingPlanRisk, "high") // deleteItem → high
+  assert.ok(cs.pendingPlanSummary?.includes("createCategory(宠物用品)"), `summary: ${cs.pendingPlanSummary}`)
+  assert.ok(cs.pendingPlanSummary?.includes("deleteItem(猫砂)"), `summary: ${cs.pendingPlanSummary}`)
+  assert.ok(cs.pendingPlanSummary?.startsWith("2 actions:"), `summary: ${cs.pendingPlanSummary}`)
+})
+
+// ---------- 18. buildTraceCurrentState：pendingDraft 摘要 ----------
+
+test("18. buildTraceCurrentState 含 pendingDraft(restock) → 摘要含物品名/qty/platform/price", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
+  const draft = buildLocalDraftFromText("今天在拼多多买了 5 袋猫砂 花了 45 块", state)
+  assert.ok(draft, "应解析出 draft")
+  const cs = buildTraceCurrentState({ pendingDraft: draft })
+  assert.equal(cs.hasPendingDraft, true)
+  assert.ok(cs.pendingDraftSummary?.includes("restock("), `summary: ${cs.pendingDraftSummary}`)
+  assert.ok(cs.pendingDraftSummary?.includes("猫砂"), `summary: ${cs.pendingDraftSummary}`)
+  assert.ok(cs.pendingDraftSummary?.includes("拼多多"), `summary: ${cs.pendingDraftSummary}`)
+})
+
+// ---------- 19. buildTraceCurrentState：pendingCollection 摘要 ----------
+
+test("19. buildTraceCurrentState 含 pendingCollection → 摘要含物品名与缺失字段", () => {
+  const collection = buildWipesCollection()
+  const cs = buildTraceCurrentState({ pendingCollection: collection })
+  assert.equal(cs.hasPendingCollection, true)
+  assert.ok(cs.pendingCollectionSummary?.includes("宠物擦脚巾湿巾"), `summary: ${cs.pendingCollectionSummary}`)
+  assert.ok(cs.pendingCollectionSummary?.includes("completeness="), `summary: ${cs.pendingCollectionSummary}`)
+})
+
+// ---------- 20. buildTraceCurrentState：pendingBatch 计数 ----------
+
+test("20. buildTraceCurrentState 含 pendingBatch → 计数正确", () => {
+  const state = makeState()
+  const d1 = buildLocalDraftFromText("今天买了 5 袋猫砂", state)
+  const d2 = buildLocalDraftFromText("今天买了 2 瓶洗发水", state)
+  assert.ok(d1 && d2)
+  const cs = buildTraceCurrentState({ pendingBatch: [d1, d2] })
+  assert.equal(cs.hasPendingBatch, true)
+  assert.equal(cs.pendingBatchCount, 2)
+})
+
+// ---------- 21. setRouteDecision：填充各字段 ----------
+
+test("21. setRouteDecision 填充 handler/rule/interceptedByRule/routeToLlm/reason", () => {
+  const trace = createTrace("测试", {})
+  setRouteDecision(trace, "boundary", {
+    rule: "boundary.casual",
+    interceptedByRule: true
+  })
+  assert.equal(trace.routeDecision?.handler, "boundary")
+  assert.equal(trace.routeDecision?.rule, "boundary.casual")
+  assert.equal(trace.routeDecision?.interceptedByRule, true)
+  assert.equal(trace.routeDecision?.routeToLlm, undefined)
+
+  setRouteDecision(trace, "needLlm", {
+    rule: "query_intent_or_unmatched",
+    routeToLlm: true,
+    reason: "query intent or unmatched input"
+  })
+  assert.equal(trace.routeDecision?.handler, "needLlm")
+  assert.equal(trace.routeDecision?.routeToLlm, true)
+  assert.equal(trace.routeDecision?.reason, "query intent or unmatched input")
+})
+
+// ---------- 22. setRouteDecision：trace 为 undefined 时安全跳过 ----------
+
+test("22. setRouteDecision(undefined, ...) 不抛错", () => {
+  assert.doesNotThrow(() => setRouteDecision(undefined, "boundary", { rule: "x" }))
+})
+
+// ---------- 23. setFinalDecision：填充 finalDecision 与完整 finalMessage ----------
+
+test("23. setFinalDecision 填充 finalDecision.kind/turnKind 与完整 finalMessage", () => {
+  const trace = createTrace("测试", {})
+  const msg = "猫砂我就按一袋记，今天补上。价格和平台这次先空着，不影响记录。"
+  setFinalDecision(trace, { kind: "llm", turnKind: "proposal", message: msg })
+  assert.equal(trace.finalDecision?.kind, "llm")
+  assert.equal(trace.finalDecision?.turnKind, "proposal")
+  assert.equal(trace.finalMessage, msg, "finalMessage 应为完整文本")
+})
+
+// ---------- 24. setFinalDecision：长消息 finalDecision.message 截断 300，finalMessage 保留完整 ----------
+
+test("24. setFinalDecision 长消息：finalDecision.message 截断 300，finalMessage 完整", () => {
+  const trace = createTrace("测试", {})
+  const longMsg = "这是非常长的回复".repeat(100) // 远超 300 字符
+  setFinalDecision(trace, { kind: "sync", message: longMsg })
+  assert.ok(
+    (trace.finalDecision?.message?.length ?? 0) <= 300,
+    `finalDecision.message 应 <= 300, 实际: ${trace.finalDecision?.message?.length}`
+  )
+  assert.equal(trace.finalMessage, longMsg, "finalMessage 应保留完整文本")
+})
+
+// ---------- 25. setFinalDecision：trace 为 undefined 时安全跳过 ----------
+
+test("25. setFinalDecision(undefined, ...) 不抛错", () => {
+  assert.doesNotThrow(() => setFinalDecision(undefined, { kind: "sync", message: "x" }))
+})
+
+// ---------- 26. createTrace 第三参 currentState 注入 ----------
+
+test("26. createTrace 第三参 currentState 被原样保留", () => {
+  const cs = buildTraceCurrentState({
+    pendingPlan: createAgentPlan([{ type: "setMonthlyBudget", amount: 500 }], "设预算", NOW)
+  })
+  const trace = createTrace("设预算", {}, cs)
+  assert.equal(trace.currentState, cs)
+  assert.equal(trace.currentState?.hasPendingPlan, true)
+  assert.ok(trace.currentState?.pendingPlanSummary?.includes("setMonthlyBudget"))
+})
+
+// ---------- 27. formatTraceForCopy：包含全部 9 个字段标签 ----------
+
+test("27. formatTraceForCopy 输出包含 9 个字段标签", () => {
+  const trace = createTrace("今天买了 5 袋猫砂", {})
+  setRouteDecision(trace, "writeDraft", { rule: "drafts.proposal", interceptedByRule: true })
+  setFinalDecision(trace, { kind: "sync", turnKind: "proposal", message: "猫砂我就按一袋记下。" })
+  const text = formatTraceForCopy(trace)
+  assert.ok(text.includes("【1. userInput】"), "缺 1. userInput")
+  assert.ok(text.includes("【2. currentState】"), "缺 2. currentState")
+  assert.ok(text.includes("【3. routeDecision】"), "缺 3. routeDecision")
+  assert.ok(text.includes("【4. llmRequest】"), "缺 4. llmRequest")
+  assert.ok(text.includes("【5. llmResponse】"), "缺 5. llmResponse")
+  assert.ok(text.includes("【6. parseResult】"), "缺 6. parseResult")
+  assert.ok(text.includes("【7. validationResult】"), "缺 7. validationResult")
+  assert.ok(text.includes("【8. finalDecision】"), "缺 8. finalDecision")
+  assert.ok(text.includes("【9. finalMessage】"), "缺 9. finalMessage")
+  assert.ok(text.includes("今天买了 5 袋猫砂"), "应包含 userInput 原文")
+  assert.ok(text.includes("猫砂我就按一袋记下。"), "应包含 finalMessage 完整文本")
+  assert.ok(text.includes("AGENT DECISION TRACE"), "应包含 header")
+  assert.ok(text.includes("END TRACE"), "应包含 footer")
+})
+
+// ---------- 28. formatTraceForCopy：未填充字段显示 (not captured) ----------
+
+test("28. formatTraceForCopy 未填充字段显示 not captured / no LLM call", () => {
+  const trace = createTrace("测试", {})
+  const text = formatTraceForCopy(trace)
+  assert.ok(text.includes("(not captured)"), "currentState 未填充应显示 not captured")
+  assert.ok(text.includes("(no LLM call)"), "llmRequest 未填充应显示 no LLM call")
+  assert.ok(text.includes("(no LLM response)"), "llmResponse 未填充应显示 no LLM response")
+})
+
+// ---------- 29. commitTrace 注册 __copyAgentTrace 与 __agentTraceHistory ----------
+
+test("29. commitTrace 注册 globalThis.__copyAgentTrace 返回 formatTraceForCopy 文本", () => {
+  const trace = createTrace("拼夕夕", { collectionItemName: "猫砂" })
+  commitTrace(trace)
+  // eslint-disable-next-line no-undef
+  assert.equal(typeof globalThis.__copyAgentTrace, "function")
+  const copied = globalThis.__copyAgentTrace()
+  assert.ok(copied.includes("拼夕夕"), "copy 文本应含 userInput")
+  assert.ok(copied.includes("【1. userInput】"))
+})
+
+// ---------- 30. peekTraceHistory：累积历史，上限 20 ----------
+
+test("30. peekTraceHistory 累积历史，超过上限 20 时丢弃最旧", () => {
+  for (let i = 0; i < 25; i++) {
+    commitTrace(createTrace(`输入${i}`, {}))
+  }
+  const history = peekTraceHistory()
+  assert.equal(history.length, 20, `history 应上限 20, 实际: ${history.length}`)
+  // 最旧的「输入0~4」应被丢弃，保留「输入5~24」
+  assert.equal(history[0].userText, "输入5", `最旧应保留输入5, 实际: ${history[0].userText}`)
+  assert.equal(history[19].userText, "输入24", `最新应保留输入24, 实际: ${history[19].userText}`)
+})
+
+// ---------- 31. normalizeLlm：queryAnswer 填充 parseResult + validationResult ----------
+
+test("31. normalizeLlm queryAnswer → parseResult.ok=true, validationResult.passed=true", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const trace = createTrace("猫砂还能用多久", {})
+  const turn = orch.normalizeLlmResponse(
+    '{"kind":"queryAnswer","answer":"猫砂大概还能用 5 天。"}',
+    { text: "猫砂还能用多久", state, itemViews: [], dateContext: DATE_CONTEXT, trace }
+  )
+  assert.ok(turn, "queryAnswer 应解析成功")
+  assert.equal(turn.kind, "answer")
+  assert.equal(trace.parseResult?.ok, true)
+  assert.equal(trace.parseResult?.kind, "queryAnswer")
+  assert.equal(trace.validationResult?.passed, true)
+  assert.equal(trace.validationResult?.turnKind, "answer")
+})
+
+// ---------- 32. normalizeLlm：解析失败填充 parseResult + validationResult ----------
+
+test("32. normalizeLlm 非 JSON → parseResult.ok=false, validationResult.rejectReason=normalize_returned_null", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const trace = createTrace("随便说", {})
+  const turn = orch.normalizeLlmResponse(
+    "这不是 JSON",
+    { text: "随便说", state, itemViews: [], dateContext: DATE_CONTEXT, trace }
+  )
+  assert.equal(turn, null, "非 JSON 应返回 null")
+  assert.equal(trace.parseResult?.ok, false)
+  assert.equal(trace.parseResult?.error, "parse_failed")
+  assert.equal(trace.validationResult?.passed, false)
+  assert.equal(trace.validationResult?.rejectReason, "normalize_returned_null")
+})
+
+// ---------- 33. normalizeLlm：draft 填充 parseResult + validationResult ----------
+
+test("33. normalizeLlm draft(restock) → parseResult.kind=draft, validationResult.turnKind=proposal/collection", () => {
+  const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
+  const orch = createHouseholdOrchestrator()
+  const trace = createTrace("今天买了 5 袋猫砂", {})
+  const turn = orch.normalizeLlmResponse(
+    '{"kind":"draft","message":"猫砂我就按一袋记下。","draft":{"kind":"restock","itemName":"猫砂","qty":5,"unit":"袋"}}',
+    { text: "今天买了 5 袋猫砂", state, itemViews: viewsOf([makeItem("i1", "猫砂", "宠物用品")]), dateContext: DATE_CONTEXT, trace }
+  )
+  assert.ok(turn, "draft 应解析成功")
+  assert.equal(trace.parseResult?.ok, true)
+  assert.equal(trace.parseResult?.kind, "draft")
+  assert.equal(trace.validationResult?.passed, true)
+  assert.ok(
+    trace.validationResult?.turnKind === "proposal" || trace.validationResult?.turnKind === "collection",
+    `turnKind 应为 proposal 或 collection, 实际: ${trace.validationResult?.turnKind}`
+  )
+})
+
+// ---------- 34. normalizeLlm：clarification 填充 parseResult + validationResult ----------
+
+test("34. normalizeLlm clarification → parseResult.kind=clarification, validationResult.passed=true", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const trace = createTrace("加一个", {})
+  const turn = orch.normalizeLlmResponse(
+    '{"kind":"clarification","clarification":{"question":"你说的「加一个」是要加什么？","options":["猫砂","猫粮"]}}',
+    { text: "加一个", state, itemViews: [], dateContext: DATE_CONTEXT, trace }
+  )
+  assert.ok(turn, "clarification 应解析成功")
+  assert.equal(turn.kind, "clarification")
+  assert.equal(trace.parseResult?.kind, "clarification")
+  assert.equal(trace.validationResult?.passed, true)
+  assert.equal(trace.validationResult?.turnKind, "clarification")
+})
+
+// ---------- 35. normalizeLlm：未传 trace 时不报错（向后兼容） ----------
+
+test("35. normalizeLlm 未传 trace → 正常解析，不报错", () => {
+  const state = makeState()
+  const orch = createHouseholdOrchestrator()
+  const turn = orch.normalizeLlmResponse(
+    '{"kind":"queryAnswer","answer":"好的。"}',
+    { text: "好", state, itemViews: [], dateContext: DATE_CONTEXT }
+  )
+  assert.ok(turn)
+  assert.equal(turn.kind, "answer")
+})
+
+// ---------- 36. formatTraceForCopy：llmRequest + llmResponse 完整渲染 ----------
+
+test("36. formatTraceForCopy 渲染 llmRequest/llmResponse/parseResult/validationResult 全字段", () => {
+  const trace = createTrace("帮我看看猫砂", {})
+  setRouteDecision(trace, "needLlm", { rule: "query_intent_or_unmatched", routeToLlm: true })
+  trace.llmRequest = {
+    kind: "answerLlm",
+    model: "qwen-plus",
+    systemPromptPreview: "你是 403 家庭管家",
+    recentMessageCount: 6,
+    relevantFactsPreview: "猫砂：余量充足",
+    activeFocus: "queryTopic",
+    allowedActions: ["queryAnswer", "draft", "clarification"]
+  }
+  trace.llmResponse = {
+    ok: true,
+    content: '{"kind":"queryAnswer","answer":"猫砂还能用 5 天。"}',
+    elapsedMs: 820
+  }
+  trace.parseResult = { ok: true, kind: "queryAnswer" }
+  trace.validationResult = { passed: true, turnKind: "answer" }
+  setFinalDecision(trace, { kind: "llm", turnKind: "answer", message: "猫砂还能用 5 天。" })
+  const text = formatTraceForCopy(trace)
+  assert.ok(text.includes("kind=answerLlm"), "应渲染 llmRequest.kind")
+  assert.ok(text.includes("model=qwen-plus"), "应渲染 model")
+  assert.ok(text.includes("recentMessageCount=6"), "应渲染 recentMessageCount")
+  assert.ok(text.includes("activeFocus=queryTopic"), "应渲染 activeFocus")
+  assert.ok(text.includes("你是 403 家庭管家"), "应渲染 systemPromptPreview")
+  assert.ok(text.includes("ok=true, elapsedMs=820"), "应渲染 llmResponse ok 与 elapsedMs")
+  assert.ok(text.includes("猫砂还能用 5 天"), "应渲染 llmResponse content")
+  assert.ok(text.includes("ok=true, kind=queryAnswer"), "应渲染 parseResult")
+  assert.ok(text.includes("passed=true, turnKind=answer"), "应渲染 validationResult")
+})
+
+// ---------- 37. formatTraceForCopy：validation 失败渲染 rejectReason ----------
+
+test("37. formatTraceForCopy 渲染 validationResult.rejectReason", () => {
+  const trace = createTrace("随便", {})
+  trace.parseResult = { ok: false, error: "parse_failed" }
+  trace.validationResult = { passed: false, rejectReason: "normalize_returned_null" }
+  const text = formatTraceForCopy(trace)
+  assert.ok(text.includes("ok=false"), "应渲染 parseResult.ok=false")
+  assert.ok(text.includes("error=parse_failed"), "应渲染 parseResult.error")
+  assert.ok(text.includes("passed=false"), "应渲染 validationResult.passed=false")
+  assert.ok(text.includes("rejectReason=normalize_returned_null"), "应渲染 rejectReason")
 })

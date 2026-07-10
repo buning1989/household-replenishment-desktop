@@ -44,6 +44,11 @@ import type {
   OrchestrateDecision,
   OrchestrateInput
 } from "./orchestrator"
+import {
+  setRouteDecision,
+  setFinalDecision,
+  type AgentDecisionTrace
+} from "./agentDecisionTrace"
 
 /** 构造一个 AgentOrchestrator 实例。无状态，可单例使用。 */
 export function createHouseholdOrchestrator(): AgentOrchestrator {
@@ -54,13 +59,14 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
       if (input.trace) {
         input.trace.decisionBeforeAppDispatch = decision.kind
         // 如果是 sync 且不是 needTurnInterpreterLlm，说明 decideSync 已最终决策，
-        // interpretAndRoute 不会被调用，这里填 finalDecision
+        // interpretAndRoute 不会被调用，这里填 finalDecision（含完整 finalMessage）
         if (decision.kind === "sync" && !input.trace.finalDecision) {
-          input.trace.finalDecision = {
+          const message = "message" in decision.turn ? decision.turn.message : undefined
+          setFinalDecision(input.trace, {
             kind: "sync",
             turnKind: decision.turn.kind,
-            message: "message" in decision.turn ? decision.turn.message.slice(0, 300) : undefined
-          }
+            message
+          })
         }
       }
       return decision
@@ -76,12 +82,12 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
 
 /** 同步决策：本地能处理就返回 sync turn，否则返回 needLlm。 */
 function decideSync(input: OrchestrateInput): OrchestrateDecision {
-  const { text, state, itemViews, pendingDraft, pendingCollection, pendingBatch, pendingPlan, dateContext } = input
+  const { text, state, itemViews, pendingDraft, pendingCollection, pendingBatch, pendingPlan, dateContext, trace } = input
 
   // 1. pending plan 优先（多动作计划状态机：confirm / cancel / revise / status）
   //    第三期：high risk plan 有 awaitingSecondConfirm 状态，需要二次「确认删除」
   if (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm")) {
-    const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext)
+    const planTurn = handlePendingPlanIntent(text, pendingPlan, state, itemViews, dateContext, trace)
     if (planTurn) return { kind: "sync", turn: planTurn }
     // planTurn === null 表示本轮不是针对 pendingPlan 的 confirm/cancel/revise/status
     // 落到下面：可能是新操作请求（生成新 plan，旧 plan 标 superseded）或查询/闲聊
@@ -104,7 +110,7 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
 
   // 3. pending batch（订单导入后的批量修正）
   if (pendingBatch && pendingBatch.length > 0) {
-    const batchTurn = handleBatchIntent(text, pendingBatch, state)
+    const batchTurn = handleBatchIntent(text, pendingBatch, state, trace)
     if (batchTurn) return { kind: "sync", turn: batchTurn }
     // 批量意图没命中，落到下面单草稿/查询/LLM 流程
   }
@@ -115,15 +121,19 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     if (intent === "confirmDraft") {
       // 调用方需要执行 commitAgentDraft 后构造 committed turn
       // orchestrator 不直接写 state，只标记需要 commit
+      setRouteDecision(trace, "pendingDraft", { rule: "confirmDraft", interceptedByRule: true })
       return { kind: "sync", turn: { kind: "proposal", message: composeProposalMessage(pendingDraft), executableDraft: pendingDraft, status: "pending" } }
     }
     if (intent === "cancelDraft") {
+      setRouteDecision(trace, "pendingDraft", { rule: "cancelDraft", interceptedByRule: true })
       return { kind: "sync", turn: { kind: "cancelled", message: composeCancelledMessage() } }
     }
     if (intent === "pendingStatus") {
+      setRouteDecision(trace, "pendingDraft", { rule: "pendingStatus", interceptedByRule: true })
       return { kind: "sync", turn: { kind: "answer", message: composePendingReminder(pendingDraft) } }
     }
     if (intent === "reviseDraft") {
+      setRouteDecision(trace, "pendingDraft", { rule: "reviseDraft", interceptedByRule: true })
       const revised = reviseAgentDraft(pendingDraft, text, state)
       if (revised) {
         return {
@@ -155,9 +165,10 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     const writeDraftDecision = handleWriteDraftIntent(input)
     if (writeDraftDecision) return writeDraftDecision
     // writeDraftDecision === null 表示本地解析失败（原 4d），落到下面 boundary / LLM
+    setRouteDecision(trace, "writeDraft", { rule: "local_parse_failed", routeToLlm: true })
   }
 
-  return handleBoundaryOrLlmFallback(text)
+  return handleBoundaryOrLlmFallback(text, trace)
 }
 
 /**
@@ -168,10 +179,11 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
  * 生成新 collection/proposal，旧 collection 由 App.tsx 的 collection turn 处理逻辑标 superseded。
  */
 function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | null {
-  const { text, state, itemViews, dateContext } = input
+  const { text, state, itemViews, dateContext, trace } = input
   // 4a. 先检查重复创建/歧义
   const clarification = buildLocalClarification(text, state)
   if (clarification) {
+    setRouteDecision(trace, "writeDraft", { rule: "clarification", interceptedByRule: true })
     return { kind: "sync", turn: clarifyToTurn(clarification) }
   }
   // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期 + 第二期编辑类）
@@ -200,15 +212,18 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
         || a.type === "deleteCategory"
     )
     if (isPlanOnly) {
+      setRouteDecision(trace, "writeDraft", { rule: "planner.planOnly", interceptedByRule: true })
       return {
         kind: "sync",
         turn: { kind: "planProposal", message: composePlanMessage(plan, state), plan }
       }
     }
     // 非 plan-only（如「买了两袋猫砂」）：回退到旧 AgentDraft 流程，保持 confirm 链路不变
+    setRouteDecision(trace, "writeDraft", { rule: "planner.nonPlanOnly_fallback_to_drafts" })
   }
   if (planResult.kind === "clarification") {
     // planner 的 clarification 是本地兜底，目前不会产出可点选选项
+    setRouteDecision(trace, "writeDraft", { rule: "planner.clarification", interceptedByRule: true })
     return { kind: "sync", turn: { kind: "clarification", message: planResult.message, options: [] } }
   }
   // 4c. 回退到旧 AgentDraft 流程
@@ -218,8 +233,10 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
     // 用自然语言基于历史/常识帮用户整理，而不是立刻甩确认卡或机械追问「多少钱」。
     // 字段已齐（readyToConfirm）或用户明确要求保存时，仍直接走 proposal。
     if (shouldEnterCollection(localDraft, text)) {
+      setRouteDecision(trace, "writeDraft", { rule: "drafts.collection", interceptedByRule: true })
       return { kind: "sync", turn: draftToCollection(localDraft, state, itemViews, dateContext) }
     }
+    setRouteDecision(trace, "writeDraft", { rule: "drafts.proposal", interceptedByRule: true })
     return { kind: "sync", turn: draftToProposal(localDraft, state, itemViews) }
   }
   // 4d. 本地解析失败 → 返回 null，由调用方走 boundary / LLM 兜底
@@ -230,17 +247,20 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
  * 对话边界与 LLM 兜底（原 decideSync 末段）。
  * identity/realtime/casual → 本地 sync answer；adjacentHomeLife 与其他 → needLlm。
  */
-function handleBoundaryOrLlmFallback(text: string): OrchestrateDecision {
+function handleBoundaryOrLlmFallback(text: string, trace?: AgentDecisionTrace): OrchestrateDecision {
   const boundary = classifyConversationBoundary(text)
   if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+    setRouteDecision(trace, "boundary", { rule: `boundary.${boundary}`, interceptedByRule: true })
     return {
       kind: "sync",
       turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
     }
   }
   if (boundary === "adjacentHomeLife") {
+    setRouteDecision(trace, "needLlm", { rule: "boundary.adjacentHomeLife", routeToLlm: true, reason: "adjacent home life question" })
     return { kind: "needLlm", reason: "adjacent home life question" }
   }
+  setRouteDecision(trace, "needLlm", { rule: "query_intent_or_unmatched", routeToLlm: true, reason: "query intent or unmatched input" })
   return { kind: "needLlm", reason: "query intent or unmatched input" }
 }
 
@@ -283,6 +303,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
         if (trace) {
           trace.collectionFallback = { tried: true, producedTurn: true, turnKind: collectionTurn.kind }
         }
+        setRouteDecision(trace, "pendingCollection", { rule: `focus.${focus.focus}`, interceptedByRule: true })
         return { kind: "sync", turn: collectionTurn }
       }
       // handlePendingCollectionIntent 返回 null（noChange）：落到后续流程
@@ -295,9 +316,11 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
     case "start_new_collection": {
       // 直接走 writeDraft 流程：clarification → planner → 旧 AgentDraft → collection/proposal
       // 旧 collection 由 App.tsx 的 collection turn 处理逻辑标 superseded
+      setRouteDecision(trace, "pendingCollection", { rule: "focus.start_new_collection" })
       const writeDraftDecision = handleWriteDraftIntent(input)
       if (writeDraftDecision) return writeDraftDecision
       // 本地解析失败：交 LLM 兜底
+      setRouteDecision(trace, "needLlm", { rule: "start_new_collection.local_parse_failed", routeToLlm: true, reason: `start_new_collection but local parser failed: ${focus.reason}` })
       return { kind: "needLlm", reason: `start_new_collection but local parser failed: ${focus.reason}` }
     }
 
@@ -310,6 +333,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
         if (trace) {
           trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
         }
+        setRouteDecision(trace, "pendingCollection", { rule: "focus.route_to_query.fallback_hit", interceptedByRule: true })
         return { kind: "sync", turn: fallbackTurn }
       }
       if (trace) {
@@ -327,6 +351,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
         if (trace) {
           trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
         }
+        setRouteDecision(trace, "pendingCollection", { rule: "focus.route_to_smalltalk.fallback_hit", interceptedByRule: true })
         return { kind: "sync", turn: fallbackTurn }
       }
       if (trace) {
@@ -334,12 +359,14 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       }
       const boundary = classifyConversationBoundary(text)
       if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+        setRouteDecision(trace, "boundary", { rule: `boundary.${boundary}`, interceptedByRule: true })
         return {
           kind: "sync",
           turn: { kind: "answer", message: composeBoundaryAnswer(boundary, text) }
         }
       }
       // 非边界闲聊但 focusResolver 判定为 smalltalk（如问候）：交 LLM
+      setRouteDecision(trace, "needLlm", { rule: "route_to_smalltalk.not_boundary", routeToLlm: true, reason: focus.reason })
       return { kind: "needLlm", reason: focus.reason }
     }
 
@@ -351,6 +378,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
         if (trace) {
           trace.collectionFallback = { tried: true, producedTurn: true, turnKind: fallbackTurn.kind }
         }
+        setRouteDecision(trace, "pendingCollection", { rule: "focus.route_to_llm.fallback_hit", interceptedByRule: true })
         return { kind: "sync", turn: fallbackTurn }
       }
       if (trace) {
@@ -359,6 +387,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 旧逻辑也抽不出字段（如「拼夕夕/pdd/上次那个平台」这类平台别名或指代）：
       // 阶段 2C 不再直接回 needLlm → 「超出家务范围」，而是交给 LLM Turn Interpreter
       // 结合当前 pendingCollection 重新做结构化理解。
+      setRouteDecision(trace, "needTurnInterpreterLlm", { rule: "focus.route_to_llm", routeToLlm: true, reason: focus.reason })
       return { kind: "needTurnInterpreterLlm", reason: focus.reason }
     }
 
@@ -389,9 +418,8 @@ async function interpretAndRouteSync(
   const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch, trace } = input
   if (!pendingCollection) {
     // 无 pendingCollection 不应进入此路径；兜底交常规 LLM
-    if (trace) {
-      trace.finalDecision = { kind: "needLlm" }
-    }
+    setRouteDecision(trace, "needLlm", { rule: "interpretAndRoute.no_pendingCollection", routeToLlm: true, reason: "interpretAndRoute without pendingCollection" })
+    setFinalDecision(trace, { kind: "needLlm" })
     return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection" }
   }
 
@@ -410,9 +438,8 @@ async function interpretAndRouteSync(
   // LLM 失败 / 低置信 / unknown → clarification（不回复「超出家务范围」）
   if (!llmInterpretation) {
     const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
-    if (trace) {
-      trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message.slice(0, 300) }
-    }
+    setRouteDecision(trace, "turnInterpreter", { rule: "llm_failed_or_low_confidence→clarification", interceptedByRule: true })
+    setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
     return { kind: "sync", turn: clarificationTurn }
   }
 
@@ -437,63 +464,56 @@ async function interpretAndRouteSync(
       }
       const collectionTurn = handlePendingCollectionIntent(synthText, pendingCollection, state, itemViews, dateContext)
       if (collectionTurn) {
-        if (trace) {
-          trace.finalDecision = { kind: "sync", turnKind: collectionTurn.kind, message: collectionTurn.message.slice(0, 300) }
-        }
+        setRouteDecision(trace, "turnInterpreter", { rule: `secondFocus.${focus.focus}`, interceptedByRule: true })
+        setFinalDecision(trace, { kind: "sync", turnKind: collectionTurn.kind, message: collectionTurn.message })
         return { kind: "sync", turn: collectionTurn }
       }
       // 合成输入仍抽不出字段 → clarification
       const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
-      if (trace) {
-        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message.slice(0, 300) }
-      }
+      setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.synth_no_extract→clarification", interceptedByRule: true })
+      setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
     }
 
     case "start_new_collection": {
       // LLM 判定为新物品补货记录（itemName 与当前 collection 不同）：走 writeDraft 流程
+      setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.start_new_collection" })
       const writeDraftDecision = handleWriteDraftIntent(input)
       if (writeDraftDecision) {
-        if (trace && writeDraftDecision.kind === "sync") {
-          trace.finalDecision = { kind: "sync", turnKind: writeDraftDecision.turn.kind }
+        if (writeDraftDecision.kind === "sync") {
+          setFinalDecision(trace, { kind: "sync", turnKind: writeDraftDecision.turn.kind, message: "message" in writeDraftDecision.turn ? writeDraftDecision.turn.message : undefined })
         }
         return writeDraftDecision
       }
       const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
-      if (trace) {
-        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind }
-      }
+      setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
     }
 
     case "route_to_query":
       // LLM 判定为查询：不打断 collection，交常规 answer LLM 回答查询
-      if (trace) {
-        trace.finalDecision = { kind: "needLlm" }
-      }
+      setRouteDecision(trace, "needLlm", { rule: "secondFocus.route_to_query", routeToLlm: true, reason: "llm interpreted as query, defer to answer llm" })
+      setFinalDecision(trace, { kind: "needLlm" })
       return { kind: "needLlm", reason: "llm interpreted as query, defer to answer llm" }
 
     case "route_to_smalltalk": {
       const boundary = classifyConversationBoundary(text)
       if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
         const turn = { kind: "answer" as const, message: composeBoundaryAnswer(boundary, text) }
-        if (trace) {
-          trace.finalDecision = { kind: "sync", turnKind: "answer" }
-        }
+        setRouteDecision(trace, "boundary", { rule: `boundary.${boundary}`, interceptedByRule: true })
+        setFinalDecision(trace, { kind: "sync", turnKind: "answer", message: turn.message })
         return { kind: "sync", turn }
       }
-      if (trace) {
-        trace.finalDecision = { kind: "needLlm" }
-      }
+      setRouteDecision(trace, "needLlm", { rule: "secondFocus.route_to_smalltalk.not_boundary", routeToLlm: true, reason: "llm interpreted as smalltalk" })
+      setFinalDecision(trace, { kind: "needLlm" })
       return { kind: "needLlm", reason: "llm interpreted as smalltalk" }
     }
 
     default:
       // route_to_llm / 其他：clarification 兜底
       const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
-      if (trace) {
-        trace.finalDecision = { kind: "sync", turnKind: clarificationTurn.kind }
-      }
+      setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.default→clarification", interceptedByRule: true })
+      setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
   }
 }
@@ -583,7 +603,8 @@ function handlePendingPlanIntent(
   pendingPlan: AgentPlan,
   state: import("../types").AppState,
   _itemViews: InferenceItemView[],
-  _dateContext: import("../llm/householdChat").ChatDateContext
+  _dateContext: import("../llm/householdChat").ChatDateContext,
+  trace?: AgentDecisionTrace
 ): AgentTurn | null {
   const isHighRisk = pendingPlan.requiresSecondConfirm === true || pendingPlan.risk === "high"
 
@@ -591,6 +612,7 @@ function handlePendingPlanIntent(
   if (pendingPlan.status === "awaitingSecondConfirm") {
     // 1. 二次确认删除 → planSecondConfirm command
     if (isSecondConfirmMatch(text)) {
+      setRouteDecision(trace, "pendingPlan", { rule: "awaitingSecondConfirm.isSecondConfirmMatch", interceptedByRule: true })
       return {
         kind: "planCommand" as const,
         message: composePlanMessage(pendingPlan, state),
@@ -600,6 +622,7 @@ function handlePendingPlanIntent(
     // 2. 取消 → planCancel command
     const cancelIntent = classifyAgentIntent(text, true)
     if (cancelIntent === "cancelDraft") {
+      setRouteDecision(trace, "pendingPlan", { rule: "awaitingSecondConfirm.cancel", interceptedByRule: true })
       return {
         kind: "planCommand" as const,
         message: composeCancelledMessage(),
@@ -608,6 +631,7 @@ function handlePendingPlanIntent(
     }
     // 3. 普通「确认」「好的」「可以」 → answer（提示需要说「确认删除」）
     if (cancelIntent === "confirmDraft") {
+      setRouteDecision(trace, "pendingPlan", { rule: "awaitingSecondConfirm.weak_confirm", interceptedByRule: true })
       return {
         kind: "answer" as const,
         message: "这是高风险删除操作，需要你明确说「确认删除」才能执行。输入「取消」可以放弃。"
@@ -615,6 +639,7 @@ function handlePendingPlanIntent(
     }
     // 4. 询问状态 → answer
     if (cancelIntent === "pendingStatus") {
+      setRouteDecision(trace, "pendingPlan", { rule: "awaitingSecondConfirm.status", interceptedByRule: true })
       return {
         kind: "answer" as const,
         message: "正在等待你的二次确认。这是高风险删除操作，请明确说「确认删除」执行，或「取消」放弃。"
@@ -632,6 +657,7 @@ function handlePendingPlanIntent(
   // 如果用户在 pending 状态直接输入「确认删除」类句式，直接执行删除。
   // 二次确认句式包含明确的删除语义，不需要再走 awaitingSecondConfirm。
   if (isHighRisk && isSecondConfirmMatch(text)) {
+    setRouteDecision(trace, "pendingPlan", { rule: "pending.directSecondConfirm", interceptedByRule: true })
     return {
       kind: "planCommand" as const,
       message: composePlanMessage(pendingPlan, state),
@@ -645,6 +671,7 @@ function handlePendingPlanIntent(
   if (intent === "confirmDraft") {
     if (isHighRisk) {
       // 高风险 plan → 进入 awaitingSecondConfirm，不执行写入
+      setRouteDecision(trace, "pendingPlan", { rule: "pending.confirm.highRisk→awaitingSecondConfirm", interceptedByRule: true })
       return {
         kind: "planCommand" as const,
         message: composePlanMessage(pendingPlan, state),
@@ -652,6 +679,7 @@ function handlePendingPlanIntent(
       }
     }
     // 普通 plan → 直接执行
+    setRouteDecision(trace, "pendingPlan", { rule: "pending.confirm", interceptedByRule: true })
     return {
       kind: "planCommand" as const,
       message: composePlanMessage(pendingPlan, state),
@@ -661,6 +689,7 @@ function handlePendingPlanIntent(
 
   // 2. 取消 → 返回 planCancel command
   if (intent === "cancelDraft") {
+    setRouteDecision(trace, "pendingPlan", { rule: "pending.cancel", interceptedByRule: true })
     return {
       kind: "planCommand" as const,
       message: composeCancelledMessage(),
@@ -670,6 +699,7 @@ function handlePendingPlanIntent(
 
   // 3. 询问状态 → answer（提示还没写入）
   if (intent === "pendingStatus") {
+    setRouteDecision(trace, "pendingPlan", { rule: "pending.status", interceptedByRule: true })
     const lines = pendingPlan.actions.map((action, index) => `${index + 1}. ${shortActionHint(action)}`)
     const riskHint = isHighRisk ? "注意：这是高风险删除操作，确认后还需要二次「确认删除」才能执行。\n" : ""
     return {
@@ -680,6 +710,7 @@ function handlePendingPlanIntent(
 
   // 4. 修订 → 用 planner 的 tryRevisePendingPlan 生成新 planProposal
   if (intent === "reviseDraft") {
+    setRouteDecision(trace, "pendingPlan", { rule: "pending.revise", interceptedByRule: true })
     const reviseResult = buildAgentPlan({ text, state, dateContext: _dateContext, pendingPlan })
     if (reviseResult.kind === "plan") {
       return {
@@ -877,26 +908,30 @@ function detectJustFilled(
 /** 处理批量意图（订单导入）。返回 null 表示不是批量意图。
  *  使用 typed command 替代旧的 __BATCH_CONFIRM__ 等魔法字符串，
  *  调用方读取 command 字段后分发到 confirmBatch / cancelBatch / reviseBatchIndex 等处理函数。 */
-function handleBatchIntent(text: string, pendingBatch: AgentDraft[], _state: import("../types").AppState): AgentTurn | null {
+function handleBatchIntent(text: string, pendingBatch: AgentDraft[], _state: import("../types").AppState, trace?: AgentDecisionTrace): AgentTurn | null {
   const batchIntent = classifyBatchIntent(text)
   if (!batchIntent) return null
 
   // 批量意图由调用方在 App.tsx 处理（因为涉及 batchDraftStatuses 数组操作）
   // orchestrator 只返回 typed command，不直接执行写入
   if (batchIntent.intent === "batchConfirm") {
-    // typed command：调用方读取 command 字段后执行 confirmBatch
+    setRouteDecision(trace, "pendingBatch", { rule: "batchConfirm", interceptedByRule: true })
     return { kind: "planCommand", message: "", command: { command: "batchConfirm" } }
   }
   if (batchIntent.intent === "batchCancel") {
+    setRouteDecision(trace, "pendingBatch", { rule: "batchCancel", interceptedByRule: true })
     return { kind: "planCommand", message: "", command: { command: "batchCancel" } }
   }
   if (batchIntent.intent === "batchCancelIndex") {
+    setRouteDecision(trace, "pendingBatch", { rule: `batchCancelIndex[${batchIntent.index}]`, interceptedByRule: true })
     return { kind: "planCommand", message: "", command: { command: "batchCancelIndex", index: batchIntent.index } }
   }
   if (batchIntent.intent === "batchReviseIndex") {
+    setRouteDecision(trace, "pendingBatch", { rule: `batchReviseIndex[${batchIntent.index}]`, interceptedByRule: true })
     return { kind: "planCommand", message: "", command: { command: "batchReviseIndex", index: batchIntent.index } }
   }
   if (batchIntent.intent === "batchReviseAll") {
+    setRouteDecision(trace, "pendingBatch", { rule: "batchReviseAll", interceptedByRule: true })
     return { kind: "planCommand", message: "", command: { command: "batchReviseAll" } }
   }
   return null
@@ -906,15 +941,33 @@ function handleBatchIntent(text: string, pendingBatch: AgentDraft[], _state: imp
  * 把 LLM 返回的原始内容规范化为 AgentTurn。
  * LLM 输出经过 parseAgentResponse 后，再由 composer 重新生成文案，
  * 不直接采用 LLM 的 message 字段。
+ *
+ * 阶段 2C+：同时填充 trace.parseResult 与 trace.validationResult，
+ * 便于外部 reviewer 判断问题出在 parse 还是 normalize。
  */
 function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | null {
+  const trace = input.trace
   const parsed = parseAgentResponse(content, input.state)
-  if (!parsed) return null
+  if (!parsed) {
+    if (trace) {
+      trace.parseResult = { ok: false, error: "parse_failed" }
+      trace.validationResult = { passed: false, rejectReason: "normalize_returned_null" }
+    }
+    return null
+  }
 
   if (parsed.kind === "queryAnswer") {
+    if (trace) {
+      trace.parseResult = { ok: true, kind: "queryAnswer" }
+      trace.validationResult = { passed: true, turnKind: "answer" }
+    }
     return { kind: "answer", message: parsed.answer }
   }
   if (parsed.kind === "clarification") {
+    if (trace) {
+      trace.parseResult = { ok: true, kind: "clarification" }
+      trace.validationResult = { passed: true, turnKind: "clarification" }
+    }
     return {
       kind: "clarification",
       // LLM 的 question 可以采用，但走 composer 校验是否包含禁用词
@@ -928,9 +981,21 @@ function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | nul
     // 这样保证 LLM 即使文案漂移，最终用户看到的仍是统一管家口吻
     // 补货类草稿字段未齐时同样进采集态，避免 LLM 绕过 collection 直接甩确认卡
     if (shouldEnterCollection(parsed.draft, input.text)) {
+      if (trace) {
+        trace.parseResult = { ok: true, kind: "draft" }
+        trace.validationResult = { passed: true, turnKind: "collection" }
+      }
       return draftToCollection(parsed.draft, input.state, input.itemViews, input.dateContext)
     }
+    if (trace) {
+      trace.parseResult = { ok: true, kind: "draft" }
+      trace.validationResult = { passed: true, turnKind: "proposal" }
+    }
     return draftToProposal(parsed.draft, input.state, input.itemViews)
+  }
+  if (trace) {
+    trace.parseResult = { ok: true, kind: "unknown" }
+    trace.validationResult = { passed: false, rejectReason: "normalize_returned_null" }
   }
   return null
 }

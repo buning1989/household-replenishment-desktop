@@ -52,7 +52,7 @@ import {
   type MeasureUnitDefinition
 } from "./orderImportHelpers"
 import { createHouseholdOrchestrator, isBatchIntentMarker, readTurnCommand } from "./agent/householdOrchestrator"
-import { createTrace, commitTrace, type AgentDecisionTrace } from "./agent/agentDecisionTrace"
+import { buildTraceCurrentState, commitTrace, createTrace, setFinalDecision, type AgentDecisionTrace } from "./agent/agentDecisionTrace"
 import type { AgentPlanCommand, AgentTurn } from "./agent/orchestrator"
 import type { AgentPlan } from "./agent/actions"
 import { loadState, persistState, reconcileState, takePendingLoadIssue, type PersistenceIssue } from "./store"
@@ -2229,6 +2229,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 
     // 统一管家决策层：所有路径都先经过 orchestrator.decide
     // 阶段 2C 复盘：创建 dev-only trace，贯穿 decide → interpretAndRoute → askTurnInterpreterLlm
+    // trace 不影响正式 UI；仅 dev 环境 / localStorage.agentDebug="1" 时 console 输出。
+    // window.__agentLastTrace / __copyAgentTrace() / __agentTraceHistory 始终暴露便于现场调试。
     const trace: AgentDecisionTrace = createTrace(text, {
       collectionItemName: pendingCollection
         ? (pendingCollection.draft.kind === "restock"
@@ -2241,7 +2243,12 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       missingFields: pendingCollection
         ? [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
         : undefined
-    })
+    }, buildTraceCurrentState({
+      pendingPlan,
+      pendingDraft,
+      pendingCollection,
+      pendingBatch: pendingBatchMessage?.agentDraftBatch
+    }))
     let decision = orchestrator.decide({
       text,
       state,
@@ -2439,7 +2446,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const result = await askHouseholdAssistant({
       apiKey: state.settings.aiApiKey,
       model: state.settings.aiChatModel ?? state.settings.aiModel,
-      contextPack
+      contextPack,
+      trace
     })
     // 实际耗时已超过 minDelayMs 时不再额外等待
     const remaining = computeRemainingDelay(timing.minDelayMs, Date.now() - llmStart)
@@ -2450,7 +2458,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const baseWithoutTransient = nextMessages
 	    if (result.ok) {
 	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
-	        text, state, itemViews, pendingDraft, pendingCollection, dateContext
+	        text, state, itemViews, pendingDraft, pendingCollection, dateContext, trace
 	      })
 	      if (!turn) {
 	        // 非管家问题不再统一机械拒绝：按对话边界给自然回应。
@@ -2458,6 +2466,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const fallback = pendingDraft
 	          ? composeFallbackMessage("no-draft")
 	          : composeBoundaryAnswer(classifyConversationBoundary(text), text)
+	        setFinalDecision(trace, { kind: "llm", turnKind: "fallback", message: fallback })
+	        commitTrace(trace)
 	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback, createdAt: Date.now() }])
 	        return
 	      }
@@ -2466,6 +2476,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const base = pendingCollectionMessageIndex >= 0
 	          ? supersedeOldPendingCollection(baseWithoutTransient)
 	          : baseWithoutTransient
+	        setFinalDecision(trace, { kind: "llm", turnKind: "collection", message: turn.message })
+	        commitTrace(trace)
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt: Date.now() }])
 	        return
 	      }
@@ -2476,6 +2488,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	            ? { ...message, collectionStatus: "cancelled" as const }
 	            : message)
 	          : baseWithoutTransient
+	        setFinalDecision(trace, { kind: "llm", turnKind: "cancelled", message: turn.message })
+	        commitTrace(trace)
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, createdAt: Date.now() }])
 	        return
 	      }
@@ -2487,6 +2501,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        if (pendingCollectionMessageIndex >= 0) {
 	          base = supersedeOldPendingCollection(base)
 	        }
+	        setFinalDecision(trace, { kind: "llm", turnKind: "proposal", message: turn.message })
+	        commitTrace(trace)
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
 	        return
 	      }
@@ -2495,19 +2511,27 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	        const base = pendingCollectionMessageIndex >= 0
 	          ? supersedeOldPendingCollection(baseWithoutTransient)
 	          : baseWithoutTransient
+	        setFinalDecision(trace, { kind: "llm", turnKind: "proposal", message: turn.message })
+	        commitTrace(trace)
 	        onMessagesChange([...base, { role: "assistant", content: turn.message, agentDraft: turn.executableDraft, draftStatus: "pending" as const, createdAt: Date.now() }])
 	        return
 	      }
+	      setFinalDecision(trace, { kind: "llm", turnKind: turn.kind, message: "message" in turn ? turn.message : undefined })
+	      commitTrace(trace)
 	      onMessagesChange([...baseWithoutTransient, agentTurnToMessage(turn)])
 	    } else {
       // 任务四 A：LLM 失败/超时时用 answerHouseholdQuickly 作为兜底回答
       const fallbackAnswer = answerHouseholdQuickly(text, state, itemViews, dateContext, seenObservationKeys)
       if (fallbackAnswer) {
+        setFinalDecision(trace, { kind: "llmError", turnKind: "quickAnswer", message: fallbackAnswer })
+        commitTrace(trace)
         onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallbackAnswer, createdAt: Date.now() }])
         return
       }
       // answerHouseholdQuickly 未命中：按对话边界给自然回应，不再统一 setError
       const boundaryFallback = composeBoundaryAnswer(classifyConversationBoundary(text), text)
+      setFinalDecision(trace, { kind: "llmError", turnKind: "boundaryFallback", message: boundaryFallback })
+      commitTrace(trace)
       onMessagesChange([...baseWithoutTransient, { role: "assistant", content: boundaryFallback, createdAt: Date.now() }])
     }
   }

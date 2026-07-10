@@ -967,7 +967,8 @@ export async function askHouseholdAssistant({
   apiKey,
   model,
   contextPack,
-  repairMissingActionBlock
+  repairMissingActionBlock,
+  trace
 }: {
   apiKey: string
   model?: string
@@ -976,6 +977,8 @@ export async function askHouseholdAssistant({
   contextPack: AgentContextPack
   /** 上一轮疑似忘记动作块时，仅重试一次并把协议纠正放进系统提示 */
   repairMissingActionBlock?: boolean
+  /** dev-only trace：填充 llmRequest / llmResponse，便于复制给 reviewer 排查 */
+  trace?: import("../agent/agentDecisionTrace").AgentDecisionTrace
 }): Promise<{ ok: true; content: string } | { ok: false; error: string }> {
   const { dateContext, activeFocus, recentMessages, relevantAppFacts, pendingExecutable, allowedActions } = contextPack
 
@@ -1009,17 +1012,42 @@ export async function askHouseholdAssistant({
     ...recentMessages.map((message) => ({ role: message.role, content: message.content }))
   ]
 
+  // 填充 trace.llmRequest（发送前快照）
+  if (trace) {
+    trace.llmRequest = {
+      kind: "answerLlm",
+      model: model?.trim() || DEFAULT_CHAT_MODEL,
+      systemPromptPreview: systemPrompt.slice(0, 1500),
+      recentMessageCount: recentMessages.length,
+      relevantFactsPreview: relevantAppFacts.slice(0, 800),
+      activeFocus: activeFocus.kind,
+      allowedActions: allowedActions.slice()
+    }
+  }
+
+  const llmStart = Date.now()
+  let result: { ok: true; content: string } | { ok: false; error: string }
   if (window.desktop?.chatComplete) {
-    return window.desktop.chatComplete({
+    result = await window.desktop.chatComplete({
       apiKey,
       model: model?.trim() || DEFAULT_CHAT_MODEL,
       messages: requestMessages
     })
+  } else if (window.desktop) {
+    result = { ok: false, error: "当前窗口还没有加载家庭问答服务，请关闭并重新启动 403家庭管家后再试。" }
+  } else {
+    result = { ok: false, error: "当前是浏览器预览，无法连接本机对话服务。请在 403家庭管家桌面应用中使用。" }
   }
 
-  if (window.desktop) {
-    return { ok: false, error: "当前窗口还没有加载家庭问答服务，请关闭并重新启动 403家庭管家后再试。" }
+  // 填充 trace.llmResponse（接收后快照，content 不截断）
+  if (trace) {
+    trace.llmResponse = {
+      ok: result.ok,
+      content: result.ok ? result.content : undefined,
+      error: result.ok ? undefined : result.error,
+      elapsedMs: Date.now() - llmStart
+    }
   }
 
-  return { ok: false, error: "当前是浏览器预览，无法连接本机对话服务。请在 403家庭管家桌面应用中使用。" }
+  return result
 }
