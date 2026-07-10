@@ -164,7 +164,7 @@ __agentTraceHistory // 最近 20 轮
 | 6 | （重新上传）第一个跳过 | 执行 batchCancelIndex(0) | `firstFocus=continue_pending_batch`, `command=batchCancelIndex` |
 | 7 | （重新上传）就这样 | 执行 batchConfirm | `firstFocus=continue_pending_batch`, force_proposal 视为确认 |
 | 8 | （重新上传）可以了 | 执行 batchConfirm | 同上 |
-| 9 | （重新上传）按这个来 | **当前行为**：不触发 batchConfirm，走 fallback | 不命中 force_proposal/confirm；记录为当前语义 |
+| 9 | （重新上传）按这个来 | 执行 batchConfirm | 阶段 4B：已纳入 FORCE_PROPOSAL_PATTERNS + CONFIRM_EXPLICIT_PHRASES，与「就这样」一致 |
 
 ---
 
