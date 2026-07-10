@@ -476,7 +476,9 @@ const cases = [
     },
     expect: ({ decision, trace, restockFields: rf }) => {
       assertNotEqual(trace.firstFocusDecision?.focus, "route_to_llm", "45块 不应 route_to_llm")
-      assertEqual(trace.llmInterpreter, undefined, "45块 不应调用 LLM")
+      // 阶段 3B.1：createTrace 默认初始化 llmInterpreter（called=false, skipReason=local_high_confidence）
+      assertEqual(trace.llmInterpreter?.called, false, "45块 不应调用 LLM (called=false)")
+      assertEqual(trace.llmInterpreter?.skipReason, "local_high_confidence", "45块 skipReason=local_high_confidence")
       assertEqual(decision.kind, "sync", "decision kind")
       const draft =
         decision.turn.kind === "collection"
@@ -499,7 +501,9 @@ const cases = [
     },
     expect: ({ decision, trace, restockFields: rf }) => {
       assertNotEqual(trace.firstFocusDecision?.focus, "route_to_llm", "长评价不应 route_to_llm")
-      assertEqual(trace.llmInterpreter, undefined, "长评价不应调用 LLM")
+      // 阶段 3B.1：createTrace 默认初始化 llmInterpreter（called=false, skipReason=local_high_confidence）
+      assertEqual(trace.llmInterpreter?.called, false, "长评价不应调用 LLM (called=false)")
+      assertEqual(trace.llmInterpreter?.skipReason, "local_high_confidence", "长评价 skipReason=local_high_confidence")
       assertEqual(decision.kind, "sync", "decision kind")
       const draft =
         decision.turn.kind === "collection"

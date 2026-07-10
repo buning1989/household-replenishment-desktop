@@ -2352,6 +2352,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         if (pendingPlanMessageIndex >= 0) {
           base = supersedeOldPendingPlan(base)
         }
+        // 阶段 3B：新 collection supersede 旧 pendingDraft，避免下一轮 draft handler 抢焦点
+        if (pendingMessageIndex >= 0) {
+          base = supersedeOldPendingDraft(base)
+        }
         onMessagesChange([...base, { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt: Date.now() }])
         return
       }

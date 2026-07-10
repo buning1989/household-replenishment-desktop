@@ -129,6 +129,8 @@ export async function askTurnInterpreterLlm(
   const trace = input.trace
   const apiKey = input.state.settings?.aiApiKey?.trim()
   const model = resolveTurnInterpreterModel(input.state.settings)
+  // provider：mock client（测试注入）→ "mock"；desktop bridge → "desktop"
+  const provider = input.client ? "mock" : "desktop"
 
   // 填充 trace.llmInterpreter 起始状态
   if (trace) {
@@ -136,7 +138,8 @@ export async function askTurnInterpreterLlm(
       shouldCall: true,
       called: false,
       hasApiKey: Boolean(apiKey),
-      model: model || "(default qwen-plus)"
+      model: model || "(default qwen-plus)",
+      provider
     }
   }
 
@@ -145,9 +148,10 @@ export async function askTurnInterpreterLlm(
     if (trace) {
       trace.llmInterpreter!.called = false
       trace.llmInterpreter!.rejected = true
-      trace.llmInterpreter!.rejectReason = !apiKey
-        ? "no_api_key"
-        : "no_desktop_bridge"
+      // 阶段 3B.1：同时记录 skipReason（明确未调用原因）和 rejectReason（业务拒绝）
+      const skipReason = !apiKey ? "no_api_key" : "no_desktop_bridge"
+      trace.llmInterpreter!.skipReason = skipReason
+      trace.llmInterpreter!.rejectReason = skipReason
     }
     return null
   }
@@ -156,25 +160,37 @@ export async function askTurnInterpreterLlm(
   if (trace) {
     trace.llmInterpreter!.promptPreview = prompt.slice(0, 500)
     trace.llmInterpreter!.called = true
+    // 进入真实调用，清除 skipReason
+    trace.llmInterpreter!.skipReason = undefined
   }
 
+  const startTime = Date.now()
   let raw: string
   try {
     raw = await client.complete(prompt)
   } catch (err) {
     if (trace) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      trace.llmInterpreter!.durationMs = Date.now() - startTime
       trace.llmInterpreter!.rejected = true
-      trace.llmInterpreter!.rejectReason = `client_exception: ${err instanceof Error ? err.message : String(err)}`
+      // 阶段 3B.1：error 是 client 抛异常；rejectReason 是业务拒绝（保持兼容）
+      trace.llmInterpreter!.error = errMsg
+      trace.llmInterpreter!.rejectReason = `client_exception: ${errMsg}`
     }
     return null
   }
 
   if (trace) {
+    trace.llmInterpreter!.durationMs = Date.now() - startTime
     trace.llmInterpreter!.rawResponse = typeof raw === "string" ? raw.slice(0, 2000) : String(raw).slice(0, 2000)
   }
 
   // 第一次解析 + 校验
   const firstAttempt = parseAndValidateTurnInterpretation(raw, trace)
+  if (trace) {
+    // schemaValid：JSON 解析 + schema 校验是否通过
+    trace.llmInterpreter!.schemaValid = firstAttempt.parsed !== null
+  }
   if (firstAttempt.parsed) {
     const rejected = rejectIfNeeded(firstAttempt.parsed, trace)
     if (!rejected) {
@@ -208,8 +224,10 @@ export async function askTurnInterpreterLlm(
     repairRaw = await client.complete(buildRepairPrompt(raw, firstAttempt.rejectReason ?? "json_parse_failed", input))
   } catch (err) {
     if (trace) {
+      const errMsg = err instanceof Error ? err.message : String(err)
       trace.llmInterpreter!.rejected = true
-      trace.llmInterpreter!.rejectReason = `repair_client_exception: ${err instanceof Error ? err.message : String(err)}`
+      trace.llmInterpreter!.error = `repair: ${errMsg}`
+      trace.llmInterpreter!.rejectReason = `repair_client_exception: ${errMsg}`
       trace.llmInterpreter!.repairRejectReason = `client_exception`
     }
     return null
@@ -222,6 +240,10 @@ export async function askTurnInterpreterLlm(
   const repairAttempt = parseAndValidateTurnInterpretation(repairRaw, trace)
   if (trace) {
     trace.llmInterpreter!.repairParsed = repairAttempt.parsed
+    // repair 成功则 schemaValid 更新为 true
+    if (repairAttempt.parsed) {
+      trace.llmInterpreter!.schemaValid = true
+    }
   }
   if (!repairAttempt.parsed) {
     if (trace) {

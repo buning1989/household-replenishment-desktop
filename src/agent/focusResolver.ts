@@ -185,17 +185,24 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
   }
 
   // ---------- d. pendingDraft ----------
+  // 阶段 3B：新增 force_proposal 匹配（与 pendingPlan 阶段 3A 一致）。
+  // 「确认吧」「就这样」在 interpretUserTurn 中被判为 force_proposal，
+  // 但在 pendingDraft 上下文中应视为确认当前 draft（force_proposal 仅在
+  // pendingCollection 上下文中才表示「强制保存采集态」）。
   if (pendingDraft) {
     if (
       intent === "confirm_current_task" ||
-      intent === "cancel_current_task"
+      intent === "cancel_current_task" ||
+      intent === "force_proposal"
     ) {
       return {
         focus: "continue_pending_draft",
-        reason: `命中${intent === "confirm_current_task" ? "确认" : "取消"}信号，继续当前 pending draft`
+        reason: draftContinueReason(intent)
       }
     }
-    // 其他意图落到下方路由（新写入 / 查询 / LLM）
+    // 其他意图（新补货记录 / 查询 / 闲聊 / 删除 / 物品管理）落到下方路由。
+    // 关键修复：新补货记录不再被旧 draft handler 的 reviseDraft 吞掉，
+    // 而是走到下方 hasActivePending 分支返回 start_new_collection。
   }
 
   // ---------- e. 路由 ----------
@@ -308,4 +315,18 @@ function describeFields(interpretation: TurnInterpretation): string {
   if (f.quantity !== undefined) parts.push(`数量=${f.quantity}${f.unit ?? ""}`)
   if (f.date !== undefined) parts.push(`日期=${f.date}`)
   return parts.length > 0 ? `（${parts.join("，")}）` : ""
+}
+
+/**
+ * 生成 continue_pending_draft 的 reason（阶段 3B）。
+ * force_proposal 在 pendingDraft 上下文中视为确认当前 draft。
+ */
+function draftContinueReason(intent: TurnInterpretation["intent"]): string {
+  if (intent === "cancel_current_task") {
+    return "命中取消信号，继续当前 pending draft 的取消流程"
+  }
+  if (intent === "force_proposal") {
+    return "命中强制保存信号，在 pendingDraft 上下文中视为确认当前 draft"
+  }
+  return "命中确认信号，继续当前 pending draft 的确认流程"
 }

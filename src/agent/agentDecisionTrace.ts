@@ -51,7 +51,12 @@ export type TraceRouteDecision = {
   handler: string
   /** 命中的具体规则或分支，如 "awaitingSecondConfirm.isSecondConfirmMatch" / "boundary.casual" / "planner.planOnly" / "focus.route_to_llm" */
   rule?: string
-  /** true 表示被本地规则提前拦截，未走 LLM */
+  /**
+   * true 表示最终被某个本地路由规则接住（无论是否调用过 LLM）。
+   * 注意：interceptedByRule 只能表示「最终被路由规则接住」，
+   * 不能表示「没有调用 LLM」。LLM 是否调用请看 llmInterpreter.called。
+   * 二者可以同时为 true：LLM 解释成功后被本地 route rule 接住继续路由。
+   */
   interceptedByRule?: boolean
   /** true 表示最终走向 route_to_llm（needLlm / needTurnInterpreterLlm） */
   routeToLlm?: boolean
@@ -164,26 +169,44 @@ export type AgentDecisionTrace = {
   llmInterpreter?: {
     /** 是否应该调用（即 decideSync 返回 needTurnInterpreterLlm） */
     shouldCall: boolean
-    /** 是否真实调用了 askTurnInterpreterLlm */
+    /** 是否真实调用了 askTurnInterpreterLlm。本地高置信路径默认 false。 */
     called: boolean
-    /** 未调用的原因（如 noApiKey / noDesktopBridge / notNeeded） */
+    /**
+     * 未调用的原因（shouldCall=false 或 called=false 时填写）。
+     * 取值如：
+     *   - "local_high_confidence"：本地高置信规则直接处理，未进入 interpretAndRoute
+     *   - "not_entered"：未进入 interpretAndRouteSync（createTrace 默认值）
+     *   - "no_pendingCollection"：interpretAndRouteSync 入口检查失败
+     *   - "no_api_key"：无 API Key
+     *   - "no_desktop_bridge"：无 desktop bridge
+     */
+    skipReason?: string
+    /** 未调用的旧字段（兼容；新代码请用 skipReason）。取值如 noApiKey / noDesktopBridge / notNeeded */
     reason?: string
     /** 是否检测到 API Key */
     hasApiKey?: boolean
     /** 使用的模型名 */
     model?: string
+    /** LLM 提供方（如 dashscope / openai / mock） */
+    provider?: string
     /** 发给 LLM 的 prompt 预览（前 500 字符） */
     promptPreview?: string
     /** LLM 原始返回文本（前 2000 字符） */
     rawResponse?: string
     /** parseLlmTurnInterpretation 解析结果（可能为 null） */
     parsed?: unknown
+    /** JSON 解析 + schema 校验是否通过。false 表示非合法 JSON 或 schema 不符合。 */
+    schemaValid?: boolean
     /** normalize 后的 TurnInterpretation（若通过校验） */
     normalizedInterpretation?: TurnInterpretation
     /** 是否被拒绝（低置信 / unknown / 空字段 / 解析失败） */
     rejected?: boolean
     /** 拒绝原因 */
     rejectReason?: string
+    /** LLM 调用异常（区别于 rejectReason：rejectReason 是业务拒绝，error 是 client 抛异常） */
+    error?: string
+    /** LLM 调用耗时（毫秒） */
+    durationMs?: number
     /** validator 放宽后的 warning（如 confidence 缺失默认 medium） */
     validationWarning?: string
     /** 是否尝试过一次 JSON repair retry */
@@ -253,7 +276,15 @@ export function createTrace(
     createdAt: Date.now(),
     userText,
     pending,
-    currentState
+    currentState,
+    // 阶段 3B.1：默认初始化 llmInterpreter 为 called=false，
+    // 让所有本地高置信路径自动有 called=false + skipReason。
+    // 进入 interpretAndRouteSync 时由调用方覆盖 shouldCall=true / skipReason=undefined。
+    llmInterpreter: {
+      shouldCall: false,
+      called: false,
+      skipReason: "local_high_confidence"
+    }
   }
 }
 
@@ -444,8 +475,11 @@ function summarizeTrace(trace: AgentDecisionTrace): {
   parseOk?: boolean
   validationPassed?: boolean
   llmCalled?: boolean
+  llmSkipReason?: string
+  llmSchemaValid?: boolean
   llmRejected?: boolean
   llmRejectReason?: string
+  llmError?: string
   secondFocus?: string
   synthesizedInput?: string
   finalKind?: string
@@ -466,8 +500,11 @@ function summarizeTrace(trace: AgentDecisionTrace): {
     parseOk: trace.parseResult?.ok,
     validationPassed: trace.validationResult?.passed,
     llmCalled: trace.llmInterpreter?.called,
+    llmSkipReason: trace.llmInterpreter?.skipReason,
+    llmSchemaValid: trace.llmInterpreter?.schemaValid,
     llmRejected: trace.llmInterpreter?.rejected,
     llmRejectReason: trace.llmInterpreter?.rejectReason,
+    llmError: trace.llmInterpreter?.error,
     secondFocus: trace.secondFocusDecision?.focus,
     synthesizedInput: trace.synthesizedInput,
     finalKind: trace.finalDecision?.kind,
@@ -511,7 +548,15 @@ export function formatTraceForCopy(trace: AgentDecisionTrace): string {
     const rd = trace.routeDecision
     lines.push(`handler=${rd.handler}`)
     if (rd.rule) lines.push(`rule=${rd.rule}`)
-    if (rd.interceptedByRule !== undefined) lines.push(`interceptedByRule=${rd.interceptedByRule}`)
+    if (rd.interceptedByRule !== undefined) {
+      lines.push(`interceptedByRule=${rd.interceptedByRule}`)
+      // 阶段 3B.1：明确提示 interceptedByRule 不等于「未调用 LLM」
+      if (rd.interceptedByRule) {
+        const llmCalled = trace.llmInterpreter?.called === true
+        lines.push(`  # 注意：interceptedByRule=true 只表示「最终被路由规则接住」，不代表「未调用 LLM」`)
+        lines.push(`  # LLM Turn Interpreter called = ${llmCalled ? "true" : "false"}${!llmCalled && trace.llmInterpreter?.skipReason ? ` (skipReason=${trace.llmInterpreter.skipReason})` : ""}`)
+      }
+    }
     if (rd.routeToLlm !== undefined) lines.push(`routeToLlm=${rd.routeToLlm}`)
     if (rd.reason) lines.push(`reason=${rd.reason}`)
   } else {
@@ -521,7 +566,7 @@ export function formatTraceForCopy(trace: AgentDecisionTrace): string {
     lines.push(`decisionBeforeAppDispatch=${trace.decisionBeforeAppDispatch}`)
   }
   lines.push("")
-  lines.push("【3b. localInterpretation / focus (pendingCollection 路径)】")
+  lines.push("【3b. localInterpretation / focus (pendingPlan / pendingCollection / pendingDraft 路径)】")
   if (trace.localInterpretation) {
     lines.push(`localInterpretation.intent=${trace.localInterpretation.intent}`)
     lines.push(`localInterpretation.fields=${JSON.stringify(trace.localInterpretation.fields)}`)
@@ -553,10 +598,19 @@ export function formatTraceForCopy(trace: AgentDecisionTrace): string {
       lines.push(indent(r.systemPromptPreview))
     }
   } else if (trace.llmInterpreter) {
-    lines.push(`(turnInterpreter) shouldCall=${trace.llmInterpreter.shouldCall}, called=${trace.llmInterpreter.called}, model=${trace.llmInterpreter.model ?? "?"}`)
-    if (trace.llmInterpreter.promptPreview) {
+    const li = trace.llmInterpreter
+    lines.push(`(turnInterpreter) shouldCall=${li.shouldCall}, called=${li.called}`)
+    if (li.provider) lines.push(`provider=${li.provider}`)
+    if (li.model) lines.push(`model=${li.model}`)
+    if (!li.called && li.skipReason) {
+      lines.push(`skipReason=${li.skipReason}`)
+    }
+    if (li.called && li.durationMs !== undefined) {
+      lines.push(`durationMs=${li.durationMs}`)
+    }
+    if (li.promptPreview) {
       lines.push("promptPreview:")
-      lines.push(indent(trace.llmInterpreter.promptPreview))
+      lines.push(indent(li.promptPreview))
     }
   } else {
     lines.push("(no LLM call)")
@@ -572,33 +626,41 @@ export function formatTraceForCopy(trace: AgentDecisionTrace): string {
       lines.push(indent(r.content))
     }
   } else if (trace.llmInterpreter?.called) {
-    lines.push(`(turnInterpreter) rawResponse:`)
+    lines.push(`(turnInterpreter) called=true, rawResponse:`)
     lines.push(indent(trace.llmInterpreter.rawResponse ?? "(empty)"))
+    if (trace.llmInterpreter.error) {
+      lines.push(`error=${trace.llmInterpreter.error}`)
+    }
   } else {
-    lines.push("(no LLM response)")
+    const skipReason = trace.llmInterpreter?.skipReason ?? "not_entered"
+    lines.push(`(no LLM response; llmInterpreter.called=false, skipReason=${skipReason})`)
   }
   lines.push("")
   lines.push("【6. parseResult】")
   if (trace.parseResult) {
     lines.push(`ok=${trace.parseResult.ok}, kind=${trace.parseResult.kind ?? "?"}`)
     if (trace.parseResult.error) lines.push(`error=${trace.parseResult.error}`)
-  } else if (trace.llmInterpreter) {
-    lines.push(`(turnInterpreter) parsed=${trace.llmInterpreter.parsed ? JSON.stringify(trace.llmInterpreter.parsed) : "null"}`)
-    if (trace.llmInterpreter.normalizedInterpretation) {
-      lines.push(`normalizedInterpretation=${JSON.stringify(trace.llmInterpreter.normalizedInterpretation)}`)
+  } else if (trace.llmInterpreter?.called) {
+    const li = trace.llmInterpreter
+    lines.push(`(turnInterpreter) parsed=${li.parsed ? JSON.stringify(li.parsed) : "null"}, schemaValid=${li.schemaValid ?? "?"}`)
+    if (li.normalizedInterpretation) {
+      lines.push(`normalizedInterpretation=${JSON.stringify(li.normalizedInterpretation)}`)
     }
   } else {
-    lines.push("(not captured)")
+    lines.push("(not captured; LLM not called)")
   }
   lines.push("")
   lines.push("【7. validationResult】")
   if (trace.validationResult) {
     lines.push(`passed=${trace.validationResult.passed}, turnKind=${trace.validationResult.turnKind ?? "?"}`)
     if (trace.validationResult.rejectReason) lines.push(`rejectReason=${trace.validationResult.rejectReason}`)
-  } else if (trace.llmInterpreter) {
-    lines.push(`(turnInterpreter) rejected=${trace.llmInterpreter.rejected}, rejectReason=${trace.llmInterpreter.rejectReason ?? "?"}`)
+  } else if (trace.llmInterpreter?.called) {
+    const li = trace.llmInterpreter
+    lines.push(`(turnInterpreter) rejected=${li.rejected}, rejectReason=${li.rejectReason ?? "?"}`)
+    if (li.error) lines.push(`error=${li.error}`)
+    if (li.schemaValid === false) lines.push(`schemaValid=false (JSON 解析或 schema 校验失败)`)
   } else {
-    lines.push("(not captured)")
+    lines.push("(not captured; LLM not called)")
   }
   if (trace.llmInterpreter?.rejected) {
     lines.push(`llmInterpreter.rejectReason=${trace.llmInterpreter.rejectReason}`)

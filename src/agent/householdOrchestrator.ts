@@ -121,34 +121,17 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   }
 
   // 4. pending proposal（旧 AgentDraft 状态机）：confirm / cancel / revise / pendingStatus
+  //    阶段 3B：先用 turnInterpretation + focusResolver 判断本轮是否继续当前 draft。
+  //    只有 confirm / cancel / force_proposal 才继续走原 draft handler。
+  //    新补货记录 / 查询 / 闲聊 / 低置信一律不继续 draft，落到后续流程。
+  //    关键修复：pendingDraft 下输入「今天买了 3 袋五常大米」不再被旧 classifyAgentIntent
+  //    因「袋」在 REVISE_KEYWORDS 中误判为 reviseDraft，而是由 interpretUserTurn
+  //    正确识别为 new_restock_record，走新建 collection 路径，旧 draft 由 App.tsx 标 superseded。
   if (pendingDraft) {
-    const intent = classifyAgentIntent(text, true)
-    if (intent === "confirmDraft") {
-      // 调用方需要执行 commitAgentDraft 后构造 committed turn
-      // orchestrator 不直接写 state，只标记需要 commit
-      setRouteDecision(trace, "pendingDraft", { rule: "confirmDraft", interceptedByRule: true })
-      return { kind: "sync", turn: { kind: "proposal", message: composeProposalMessage(pendingDraft), executableDraft: pendingDraft, status: "pending" } }
-    }
-    if (intent === "cancelDraft") {
-      setRouteDecision(trace, "pendingDraft", { rule: "cancelDraft", interceptedByRule: true })
-      return { kind: "sync", turn: { kind: "cancelled", message: composeCancelledMessage() } }
-    }
-    if (intent === "pendingStatus") {
-      setRouteDecision(trace, "pendingDraft", { rule: "pendingStatus", interceptedByRule: true })
-      return { kind: "sync", turn: { kind: "answer", message: composePendingReminder(pendingDraft) } }
-    }
-    if (intent === "reviseDraft") {
-      setRouteDecision(trace, "pendingDraft", { rule: "reviseDraft", interceptedByRule: true })
-      const revised = reviseAgentDraft(pendingDraft, text, state)
-      if (revised) {
-        return {
-          kind: "sync",
-          turn: { kind: "proposal", message: composeRevisedMessage(), executableDraft: revised, status: "pending" }
-        }
-      }
-      // 修订失败：回退到 pending reminder
-      return { kind: "sync", turn: { kind: "answer", message: composePendingReminder(pendingDraft) } }
-    }
+    const draftDecision = handlePendingDraftFocusDecision(input)
+    if (draftDecision) return draftDecision
+    // draftDecision === null 表示本轮不打断当前 draft、也不继续执行，
+    // 落到下面继续 writeDraft / boundary / LLM 流程。
   }
 
   // 4. writeDraft 意图：
@@ -506,6 +489,158 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
 }
 
 /**
+ * 阶段 3B：pendingDraft 分支接入 turnInterpretation + focusResolver。
+ *
+ * 只有 focus = continue_pending_draft（确认/取消/强制保存）才继续走原 draft handler，
+ * 保留旧 confirm/cancel/revise/pendingStatus 链路。其他意图不执行 draft：
+ *   - start_new_collection + new_restock_record → 走 writeDraft 流程（新建 collection）
+ *   - start_new_collection + manage_item/delete_request → 交原 draft handler（保留 revise 能力）
+ *   - route_to_query / route_to_smalltalk / route_to_llm → 兼容 pendingStatus 后落回 decideSync
+ *
+ * 关键修复：pendingDraft 下输入「今天买了 3 袋五常大米」不再被旧 classifyAgentIntent
+ * 因「袋」在 REVISE_KEYWORDS 中误判为 reviseDraft，而是由 interpretUserTurn
+ * 正确识别为 new_restock_record → focusResolver 返回 start_new_collection →
+ * 走 writeDraft，旧 draft 由 App.tsx 的 collection turn 处理逻辑标 superseded。
+ *
+ * 返回 null 表示交回 decideSync 后续流程处理（writeDraft / boundary / LLM）。
+ */
+function handlePendingDraftFocusDecision(input: OrchestrateInput): OrchestrateDecision | null {
+  const { text, state, itemViews, dateContext, pendingDraft, trace } = input
+  if (!pendingDraft) return null
+
+  const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+  const focus = resolveConversationFocus({
+    interpretation,
+    pendingPlan: input.pendingPlan,
+    pendingCollection: input.pendingCollection,
+    pendingDraft,
+    pendingBatch: input.pendingBatch
+  })
+
+  if (trace) {
+    trace.localInterpretation = interpretation
+    trace.firstFocusDecision = focus
+  }
+
+  switch (focus.focus) {
+    case "continue_pending_draft": {
+      // 确认 / 取消 / 强制保存 → 继续走原 draft handler（保留旧状态机）
+      setRouteDecision(trace, "pendingDraft", { rule: "focus.continue_pending_draft", interceptedByRule: true })
+      const draftTurn = handlePendingDraftIntent(text, pendingDraft, state, trace)
+      if (draftTurn) return { kind: "sync", turn: draftTurn }
+      return null
+    }
+
+    case "start_new_collection": {
+      // 新补货记录：走 writeDraft 流程，不执行 draft
+      if (interpretation.intent === "new_restock_record") {
+        setRouteDecision(trace, "pendingDraft", { rule: "focus.start_new_collection(new_restock)", interceptedByRule: true })
+        const writeDraftDecision = handleWriteDraftIntent(input)
+        if (writeDraftDecision) {
+          if (writeDraftDecision.kind === "sync" && trace && !trace.finalDecision) {
+            const message = "message" in writeDraftDecision.turn ? writeDraftDecision.turn.message : undefined
+            setFinalDecision(trace, { kind: "sync", turnKind: writeDraftDecision.turn.kind, message })
+          }
+          return writeDraftDecision
+        }
+        setRouteDecision(trace, "pendingDraft", { rule: "start_new_collection.parse_failed", routeToLlm: true })
+        return null
+      }
+      // 其他写入意图（manage_item / delete_request / batch_revision）：
+      // 可能是对当前 draft 的修订（如「改成 3 袋」），交原 draft handler 处理。
+      // draft handler 未命中时落到 writeDraft。
+      setRouteDecision(trace, "pendingDraft", { rule: "focus.start_new_collection(non-restock)→draftHandler", interceptedByRule: true })
+      const draftTurn = handlePendingDraftIntent(text, pendingDraft, state, trace)
+      if (draftTurn) return { kind: "sync", turn: draftTurn }
+      const writeDraftDecision = handleWriteDraftIntent(input)
+      if (writeDraftDecision) return writeDraftDecision
+      return null
+    }
+
+    case "route_to_query":
+    case "route_to_smalltalk":
+    case "route_to_llm": {
+      // 兼容 pendingStatus（如「现在什么情况」）：仍交原 draft handler 显示状态
+      const legacyIntent = classifyAgentIntent(text, true)
+      if (legacyIntent === "pendingStatus") {
+        setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}→pendingStatus`, interceptedByRule: true })
+        const draftTurn = handlePendingDraftIntent(text, pendingDraft, state, trace)
+        if (draftTurn) return { kind: "sync", turn: draftTurn }
+      }
+      // 兼容 reviseDraft（如「改成 3 袋」「换成京东」「价格 45」）：
+      // interpretUserTurn 可能判为 unknown（无「买了」关键词），但 classifyAgentIntent
+      // 能识别为 reviseDraft。仍交原 draft handler 处理，保留旧修订能力。
+      // 注意：含「买了」的新补货记录已由 start_new_collection 分支处理，
+      // 不会走到这里，因此不会重新引入「袋」误判问题。
+      if (legacyIntent === "reviseDraft") {
+        setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}→reviseDraft`, interceptedByRule: true })
+        const draftTurn = handlePendingDraftIntent(text, pendingDraft, state, trace)
+        if (draftTurn) return { kind: "sync", turn: draftTurn }
+      }
+      // 边界闲聊：本地直接回答
+      if (focus.focus === "route_to_smalltalk") {
+        const boundary = classifyConversationBoundary(text)
+        if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+          setRouteDecision(trace, "pendingDraft", { rule: "route_to_smalltalk.boundary", interceptedByRule: true })
+          return {
+            kind: "sync",
+            turn: { kind: "answer" as const, message: composeBoundaryAnswer(boundary, text) }
+          }
+        }
+      }
+      // 查询 / 闲聊 / 低置信：不执行 draft，落回 decideSync 后续流程
+      setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}`, routeToLlm: focus.focus === "route_to_llm" })
+      return null
+    }
+
+    default:
+      // continue_pending_collection / continue_pending_batch / continue_pending_plan / route_to_write_draft
+      // 这些分支在 pendingDraft 场景下不应出现（focusResolver 已分流），兜底交回 decideSync。
+      return null
+  }
+}
+
+/**
+ * 阶段 3B：原 pendingDraft 状态机的 confirm / cancel / revise / pendingStatus 逻辑。
+ * 从 decideSync 旧分支提取，保持行为不变。
+ */
+function handlePendingDraftIntent(
+  text: string,
+  pendingDraft: AgentDraft,
+  state: import("../types").AppState,
+  trace?: AgentDecisionTrace
+): AgentTurn | null {
+  const intent = classifyAgentIntent(text, true)
+  if (intent === "confirmDraft") {
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.confirmDraft", interceptedByRule: true })
+    return { kind: "proposal", message: composeProposalMessage(pendingDraft), executableDraft: pendingDraft, status: "pending" }
+  }
+  if (intent === "cancelDraft") {
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.cancelDraft", interceptedByRule: true })
+    return { kind: "cancelled", message: composeCancelledMessage() }
+  }
+  if (intent === "pendingStatus") {
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.pendingStatus", interceptedByRule: true })
+    return { kind: "answer", message: composePendingReminder(pendingDraft) }
+  }
+  if (intent === "reviseDraft") {
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.reviseDraft", interceptedByRule: true })
+    const revised = reviseAgentDraft(pendingDraft, text, state)
+    if (revised) {
+      return {
+        kind: "proposal",
+        message: composeRevisedMessage(),
+        executableDraft: revised,
+        status: "pending"
+      }
+    }
+    // 修订失败：回退到 pending reminder
+    return { kind: "answer", message: composePendingReminder(pendingDraft) }
+  }
+  return null
+}
+
+/**
  * 阶段 2C：pendingCollection 下本地低置信（route_to_llm）时，调用 LLM Turn Interpreter
  * 重新做结构化理解，再用 resolveConversationFocus 二次路由。
  *
@@ -522,8 +657,27 @@ async function interpretAndRouteSync(
   clientOverride?: TurnInterpreterLlmClient
 ): Promise<OrchestrateDecision> {
   const { text, state, itemViews, dateContext, pendingCollection, pendingPlan, pendingDraft, pendingBatch, trace } = input
+
+  // 阶段 3B.1：进入 interpretAndRouteSync 表示 shouldCall=true（decideSync 返回 needTurnInterpreterLlm）
+  // 覆盖 createTrace 默认的 shouldCall=false / skipReason="local_high_confidence"
+  if (trace) {
+    if (trace.llmInterpreter) {
+      trace.llmInterpreter.shouldCall = true
+      trace.llmInterpreter.skipReason = "entering_interpretAndRoute"
+    } else {
+      trace.llmInterpreter = {
+        shouldCall: true,
+        called: false,
+        skipReason: "entering_interpretAndRoute"
+      }
+    }
+  }
+
   if (!pendingCollection) {
     // 无 pendingCollection 不应进入此路径；兜底交常规 LLM
+    if (trace) {
+      trace.llmInterpreter!.skipReason = "no_pendingCollection"
+    }
     setRouteDecision(trace, "needLlm", { rule: "interpretAndRoute.no_pendingCollection", routeToLlm: true, reason: "interpretAndRoute without pendingCollection" })
     setFinalDecision(trace, { kind: "needLlm" })
     return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection" }
