@@ -5,7 +5,7 @@
  * 本文件是纯逻辑（除 LLM 调用由调用方在外层处理），可被测试直接覆盖。
  */
 
-import { buildLocalClarification, buildLocalDraftFromText, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
+import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
 import {
   createDraftCollection,
   reviseDraftCollection,
@@ -83,6 +83,32 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
 /** 同步决策：本地能处理就返回 sync turn，否则返回 needLlm。 */
 function decideSync(input: OrchestrateInput): OrchestrateDecision {
   const { text, state, itemViews, pendingDraft, pendingCollection, pendingBatch, pendingPlan, dateContext, trace } = input
+
+  // 0. 阶段 4B.3：调试命令误输入保护
+  //    用户把 __copyAgentTrace() 等调试命令误发到聊天框时，本地拦截，不送 LLM，不写入。
+  if (isDebugCommandInput(text)) {
+    setRouteDecision(trace, "debugCommandGuard", { rule: "debug_command_guard", interceptedByRule: true })
+    if (trace && trace.llmInterpreter) {
+      trace.llmInterpreter.shouldCall = false
+      trace.llmInterpreter.skipReason = "debug_command_guard"
+    }
+    return {
+      kind: "sync",
+      turn: { kind: "answer", message: "这是调试命令，请在右侧 Console 里执行，不需要发到聊天里。" }
+    }
+  }
+
+  // 0.5. 阶段 4B.3：pending status query 本地高置信处理
+  //      用户问「现在还有什么待确认的吗 / 还有待确认的吗 / 有什么没确认的吗 / 现在还有 pending 吗」
+  //      时不送 LLM，本地按当前 pending 状态给摘要，避免 LLM 自然语言回答被 normalize 打成 fallback。
+  if (isPendingStatusQuery(text)) {
+    const message = composePendingStatusSummary(pendingCollection, pendingPlan, pendingDraft, pendingBatch)
+    setRouteDecision(trace, "pendingStatusQuery", { rule: "pending_status_query", interceptedByRule: true })
+    return {
+      kind: "sync",
+      turn: { kind: "answer", message }
+    }
+  }
 
   // 1. pending plan（多动作计划状态机：confirm / cancel / revise / status）
   //    阶段 3A：先用 turnInterpretation + focusResolver 判断本轮是否继续当前 plan。
@@ -236,6 +262,93 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
   }
   // 4d. 本地解析失败 → 返回 null，由调用方走 boundary / LLM 兜底
   return null
+}
+
+/**
+ * 阶段 4B.3：判断用户输入是否为调试命令误发到聊天框。
+ *
+ * 命中以下模式时本地拦截，不送 LLM，不写入：
+ *   - __copyAgentTrace()
+ *   - __agentLastTrace
+ *   - __agentTraceHistory
+ *   - localStorage.agentDebug
+ *   - window.__copyAgentTrace
+ *
+ * 判断依据：去掉空格后包含上述标识符。长度限制避免误伤普通文本。
+ */
+const DEBUG_COMMAND_PATTERNS = [
+  "__copyagenttrace",
+  "__agentlasttrace",
+  "__agenttracehistory",
+  "localstorage.agentdebug",
+  "window.__copyagenttrace"
+]
+
+function isDebugCommandInput(text: string): boolean {
+  const normalized = text.replace(/\s+/g, "").toLowerCase()
+  if (!normalized || normalized.length > 60) return false
+  return DEBUG_COMMAND_PATTERNS.some((pattern) => normalized.includes(pattern))
+}
+
+/**
+ * 阶段 4B.3：判断用户输入是否为 pending status query。
+ *
+ * 匹配「现在还有什么待确认的吗 / 还有待确认的吗 / 有什么没确认的吗 / 现在还有 pending 吗」
+ * 等状态查询句式。这类查询不应送 LLM（自然语言回答容易被 normalize 打成 fallback）。
+ *
+ * 判断依据：包含「待确认」或「pending」+「吗」的疑问句式。
+ * 不匹配只含「确认」的写入句式（如「确认」「按这个来」）。
+ */
+function isPendingStatusQuery(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  if (!normalized || normalized.length > 40) return false
+  // 必须是疑问句（含「吗」「么」结尾，或「有没有」「还有什么」）
+  const isQuestion = /[吗么]$/.test(normalized) || /有没有|还有什么|还有什么待|还有没有|还有 pending|有没有待/.test(normalized)
+  if (!isQuestion) return false
+  // 必须包含待确认/pending 语义
+  const hasPendingSemantics = /待确认|没确认|没记|pending|待补|待采集|待整理|待办|待处理|没确认完|没确认的/.test(normalized)
+  return hasPendingSemantics
+}
+
+/**
+ * 阶段 4B.3：按当前 pending 状态生成本地摘要。
+ *
+ * 优先级：pendingCollection > pendingPlan > pendingDraft > pendingBatch > 无 pending。
+ * 只读摘要，不修改任何 pending 状态，不触发 confirm/cancel/写入。
+ */
+function composePendingStatusSummary(
+  pendingCollection: DraftCollection | undefined,
+  pendingPlan: AgentPlan | undefined,
+  pendingDraft: AgentDraft | undefined,
+  pendingBatch: AgentDraft[] | undefined
+): string {
+  if (pendingCollection) {
+    const draft = pendingCollection.draft
+    const description = describeAgentDraft(draft)
+    const missing = [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
+    if (missing.length > 0) {
+      const missingText = missing
+        .map((slot) => slot === "platform" ? "平台" : slot === "price" ? "金额" : slot === "review" ? "评价" : slot === "spec" ? "规格" : slot === "notes" ? "备注" : slot)
+        .filter(Boolean)
+      return `现在有一条待补全记录：${description}，还缺${missingText.join("和")}。`
+    }
+    return `现在有一条待补全记录：${description}。`
+  }
+  if (pendingPlan) {
+    const actionCount = pendingPlan.actions.length
+    const needsSecondConfirm = pendingPlan.status === "awaitingSecondConfirm"
+    const summary = needsSecondConfirm
+      ? `现在有一个待二次确认的操作（含 ${actionCount} 个动作），需要你再次确认才会执行。`
+      : `现在有一个待确认操作（含 ${actionCount} 个动作）。`
+    return summary
+  }
+  if (pendingDraft) {
+    return `现在有一条待确认草稿：${describeAgentDraft(pendingDraft)}。`
+  }
+  if (pendingBatch && pendingBatch.length > 0) {
+    return `现在有 ${pendingBatch.length} 条批量记录待确认。`
+  }
+  return "现在没有待确认的记录。"
 }
 
 /**
@@ -1315,10 +1428,63 @@ function handleBatchIntent(text: string, pendingBatch: AgentDraft[], _state: imp
  * 阶段 2C+：同时填充 trace.parseResult 与 trace.validationResult，
  * 便于外部 reviewer 判断问题出在 parse 还是 normalize。
  */
+/**
+ * 阶段 4B.3：尝试把 LLM 返回的纯文本当作 answer 回复。
+ *
+ * 触发条件：
+ *   - parseAgentResponse 返回 null（非 JSON 结构或 JSON 不合法）
+ *   - 内容是合理长度的自然语言（4-300 字符）
+ *   - 不包含明显违规写入指令（创建/删除/确认/取消/草稿/计划 等系统语义）
+ *   - 不包含「超出家务范围」这类禁用文案
+ *
+ * 严格限制：只放宽纯文本 answer，不放宽 draft/collection/plan 写入校验。
+ * LLM 即使返回自然语言，也不能绕过结构化写入流程。
+ */
+const FREE_TEXT_ANSWER_FORBIDDEN = [
+  // 写入指令（LLM 不能用自然语言绕过结构化写入）
+  "创建草稿", "新建草稿", "删除草稿", "确认草稿", "取消草稿",
+  "创建计划", "新建计划", "删除计划", "确认计划", "取消计划",
+  "创建物品", "新建物品", "删除物品",
+  "创建分类", "新建分类", "删除分类",
+  // 禁用文案
+  "超出家务范围", "不太属于我能直接处理"
+]
+
+const FREE_TEXT_ANSWER_FORBIDDEN_MIN_LENGTH = 4
+const FREE_TEXT_ANSWER_FORBIDDEN_MAX_LENGTH = 300
+
+function tryFreeTextAnswer(content: string): string | null {
+  const trimmed = content.trim()
+  if (!trimmed) return null
+  // 长度限制
+  if (trimmed.length < FREE_TEXT_ANSWER_FORBIDDEN_MIN_LENGTH) return null
+  if (trimmed.length > FREE_TEXT_ANSWER_FORBIDDEN_MAX_LENGTH) return null
+  // 包含 JSON 结构（{ ... }）的不当作纯文本 answer
+  if (trimmed.includes("{") && trimmed.includes("}")) return null
+  // 检查禁用词
+  const lower = trimmed.toLowerCase()
+  for (const forbidden of FREE_TEXT_ANSWER_FORBIDDEN) {
+    if (lower.includes(forbidden.toLowerCase())) return null
+  }
+  return trimmed
+}
+
 function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | null {
   const trace = input.trace
   const parsed = parseAgentResponse(content, input.state)
   if (!parsed) {
+    // 阶段 4B.3：纯文本 answer fallback 防线。
+    // 当 LLM 返回的是合理自然语言回答（非 JSON 结构）时，不要打成 normalize_returned_null
+    // 再 fallback 成「这个不太属于我能直接处理的家务范围」。
+    // 严格限制：只放宽纯文本 answer，不放宽 draft/collection/plan 写入校验。
+    const freeTextAnswer = tryFreeTextAnswer(content)
+    if (freeTextAnswer) {
+      if (trace) {
+        trace.parseResult = { ok: false, error: "parse_failed_but_free_text_answer" }
+        trace.validationResult = { passed: true, turnKind: "answer" }
+      }
+      return { kind: "answer", message: freeTextAnswer }
+    }
     if (trace) {
       trace.parseResult = { ok: false, error: "parse_failed" }
       trace.validationResult = { passed: false, rejectReason: "normalize_returned_null" }

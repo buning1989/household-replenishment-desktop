@@ -716,11 +716,12 @@ test("32. normalizeLlm 非 JSON → parseResult.ok=false, validationResult.rejec
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const trace = createTrace("随便说", {})
+  // 含 JSON 结构但解析失败的内容不放宽为纯文本 answer（避免 LLM 用半结构化内容绕过写入校验）
   const turn = orch.normalizeLlmResponse(
-    "这不是 JSON",
+    '{ "kind": "invalid", "data": ... }',
     { text: "随便说", state, itemViews: [], dateContext: DATE_CONTEXT, trace }
   )
-  assert.equal(turn, null, "非 JSON 应返回 null")
+  assert.equal(turn, null, "含 JSON 结构但解析失败应返回 null")
   assert.equal(trace.parseResult?.ok, false)
   assert.equal(trace.parseResult?.error, "parse_failed")
   assert.equal(trace.validationResult?.passed, false)

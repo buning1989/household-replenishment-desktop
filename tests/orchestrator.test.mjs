@@ -366,7 +366,8 @@ test("orchestrator: normalizeLlmResponse 解析 clarification", () => {
 
 test("orchestrator: normalizeLlmResponse 解析失败返回 null", () => {
   const orch = createHouseholdOrchestrator()
-  const turn = orch.normalizeLlmResponse("这不是 JSON", {
+  // 含 JSON 结构但解析失败的内容不放宽为纯文本 answer（避免 LLM 用半结构化内容绕过写入校验）
+  const turn = orch.normalizeLlmResponse('{ "kind": "invalid", "data": ... }', {
     text: "xxx",
     state: makeState(),
     itemViews: [],
