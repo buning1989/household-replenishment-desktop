@@ -39,9 +39,11 @@
 | 1.5 | 不起灰 | continue_pending_collection | collection | review 含「不起灰」 |
 | 1.6 | asdfasdf | route_to_llm | clarification | 不说「超出家务范围」；`llmInterpreter.called` 视 mock/real而定 |
 | 1.7 | 今天买了 3 袋五常大米 | start_new_collection | collection（新建） | 物品名=五常大米；旧 collection 被 supersede |
+| 1.8 | 按这个来 | continue_pending_collection（force_proposal） | proposal | 阶段 4B.1：与「就这样」一致；字段缺失也转 proposal（带未补全标记） |
+| 1.9 | 按这个来（无 active pending） | route_to_llm | needLlm / answer fallback | 无对象可作用；不创建 collection / proposal / planCommand |
 
 **测试覆盖**：
-- `tests/agent-entry-routing.test.mjs`（11 条）
+- `tests/agent-entry-routing.test.mjs`（13 条）
 - `tests/agent-entry-llm-fallback.test.mjs`（12 条）
 - `tests/turn-interpreter-llm.test.mjs`（14 条）
 - `scripts/smoke-agent-llm-fallback.mjs`（8 case）

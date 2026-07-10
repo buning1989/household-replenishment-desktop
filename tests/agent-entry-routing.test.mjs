@@ -33,6 +33,7 @@ const { createHouseholdOrchestrator } = await import("../src/agent/householdOrch
 const { buildLocalDraftFromText } = await import("../src/agent/drafts.ts")
 const { createDraftCollection } = await import("../src/agent/draftCollection.ts")
 const { buildChatDateContext } = await import("../src/llm/householdChat.ts")
+const { createTrace } = await import("../src/agent/agentDecisionTrace.ts")
 
 const NOW = Date.UTC(2026, 6, 9) // 2026-07-09
 const DATE_CONTEXT = buildChatDateContext(NOW)
@@ -416,4 +417,81 @@ test("11. pendingCollection=猫砂 + 「算了，不记了」→ cancelled", () 
 
   assert.equal(d.kind, "sync")
   assert.equal(d.turn.kind, "cancelled")
+})
+
+// ---------- 12. 阶段 4B.1：pendingCollection + 「按这个来」确认语义 ----------
+
+test("12. pendingCollection=宠物擦脚湿巾 + 「按这个来」→ proposal（与「就这样」一致）", () => {
+  const state = makeState({ items: [] })
+  const orch = createHouseholdOrchestrator()
+  // 宠物擦脚湿巾采集态：itemName/qty/unit/restockDate 齐全，price/platform 缺失
+  const pendingCollection = buildWipesCollection()
+  const trace = createTrace("按这个来", {
+    collectionItemName: "宠物擦脚湿巾",
+    collectionStatus: "pending",
+    missingFields: [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
+  })
+
+  const d = decide(orch, {
+    text: "按这个来",
+    state,
+    itemViews: viewsOf(state.items),
+    pendingCollection,
+    trace
+  })
+
+  // 阶段 4B：「按这个来」已纳入 FORCE_PROPOSAL_PATTERNS + CONFIRM_EXPLICIT_PHRASES，
+  // 在 pendingCollection 上下文中触发 force_proposal → 强制转 proposal（带未补全标记）
+  assert.equal(d.kind, "sync", "应返回 sync，不应进入 route_to_llm")
+  assert.equal(d.turn.kind, "proposal", "应转 proposal，与「就这样」一致")
+  assert.notEqual(d.turn.kind, "clarification", "不应返回 clarification")
+  assert.notEqual(d.turn.kind, "collection", "不应继续采集态")
+  const draft = d.turn.executableDraft
+  const fields = restockFields(draft)
+  assert.equal(fields.itemName, "宠物擦脚湿巾", "物品名不变")
+
+  // trace：本地高置信，called=false
+  assert.ok(trace.llmInterpreter, "llmInterpreter 应存在")
+  assert.equal(trace.llmInterpreter.called, false, "本地高置信 called=false")
+  assert.equal(trace.llmInterpreter.skipReason, "local_high_confidence")
+  // focusResolver 路径
+  assert.equal(trace.firstFocusDecision?.focus, "continue_pending_collection")
+})
+
+// ---------- 13. 阶段 4B.1：无 active pending 的安全测试 ----------
+
+test("13. 无 active pending + 「按这个来」→ 不写入，走 fallback", () => {
+  const state = makeState({ items: [] })
+  const orch = createHouseholdOrchestrator()
+  const trace = createTrace("按这个来", {})
+
+  const d = decide(orch, {
+    text: "按这个来",
+    state,
+    itemViews: viewsOf(state.items),
+    trace
+  })
+
+  // 无 active pending 时，「按这个来」无对象可作用，
+  // 不应创建 collection、不应执行 plan、不应确认 batch/draft。
+  // 应进入 needLlm 或 boundary fallback（answer）。
+  if (d.kind === "sync") {
+    assert.notEqual(d.turn.kind, "collection", "无 pending 不应新建 collection")
+    assert.notEqual(d.turn.kind, "proposal", "无 pending 不应生成 proposal")
+    assert.notEqual(d.turn.kind, "planCommand", "无 pending 不应执行 plan 命令")
+    assert.notEqual(d.turn.kind, "cancelled", "无 pending 不应返回 cancelled")
+    // sync + answer 是边界 fallback 的合理结果（如闲聊/身份类）
+  } else {
+    assert.equal(d.kind, "needLlm", "非 sync 应为 needLlm fallback")
+  }
+
+  // trace：finalDecision 不应是写入类（writeDraft / collection / proposal / planCommand）
+  const finalDecision = trace.finalDecision
+  if (finalDecision) {
+    const writeKinds = ["collection", "proposal", "planCommand", "planProposal"]
+    assert.ok(
+      !writeKinds.includes(finalDecision.turnKind ?? ""),
+      `无 active pending 时 finalDecision 不应是写入类, 实际: ${finalDecision.turnKind}`
+    )
+  }
 })
