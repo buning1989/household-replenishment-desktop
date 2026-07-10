@@ -395,3 +395,24 @@ test("3B-15: 不影响 pendingPlan 行为 — pendingPlan + 确认仍走 plan ha
   assert.equal(decision.kind, "sync")
   assert.equal(decision.turn.kind, "planCommand")
 })
+
+// ---------- 12. 阶段 4B：「按这个来」确认语义补齐 ----------
+
+test("3B-16: pendingDraft + 「按这个来」→ 仍走 draft handler（proposal）", () => {
+  const orch = createHouseholdOrchestrator()
+  const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
+  const pendingDraft = makePendingDraft()
+
+  const decision = decide(orch, {
+    text: "按这个来",
+    state,
+    itemViews: viewsOf(state.items),
+    pendingDraft
+  })
+
+  // 阶段 4B：「按这个来」已纳入 FORCE_PROPOSAL_PATTERNS + CONFIRM_EXPLICIT_PHRASES，
+  // 在 pendingDraft 上下文中视为确认当前 draft → proposal
+  assert.equal(decision.kind, "sync")
+  assert.equal(decision.turn.kind, "proposal")
+  assert.equal(decision.turn.executableDraft, pendingDraft)
+})

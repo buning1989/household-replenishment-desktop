@@ -58,9 +58,10 @@
 | 2.2 | 确认 | continue_pending_plan | planCommand | 旧 plan handler 执行 |
 | 2.3 | 算了 | continue_pending_plan | cancelled | 旧 plan handler 取消 |
 | 2.4 | 今天买了 3 袋五常大米 | start_new_collection | collection（新建） | 旧 pendingPlan 被 supersede；不被「袋」误判为 reviseDraft |
+| 2.5 | 按这个来 | continue_pending_plan（force_proposal） | planCommand | 阶段 4B：已纳入确认语义，在 plan 上下文视为确认 |
 
 **测试覆盖**：
-- `tests/agent-entry-pending-plan-routing.test.mjs`（10 条）
+- `tests/agent-entry-pending-plan-routing.test.mjs`（11 条）
 
 ---
 
@@ -77,9 +78,10 @@
 | 3.5 | 改成 3 袋 | continue_pending_draft（兼容 reviseDraft） | proposal（qty=3） | 旧 revise 能力不破坏 |
 | 3.6 | 记了吗 | continue_pending_draft（兼容 pendingStatus） | answer | 旧 status 能力不破坏 |
 | 3.7 | 确认吧 | continue_pending_draft（force_proposal） | proposal | force_proposal 在 pendingDraft 上下文视为确认 |
+| 3.8 | 按这个来 | continue_pending_draft（force_proposal） | proposal | 阶段 4B：已纳入确认语义，与「确认吧」一致 |
 
 **测试覆盖**：
-- `tests/agent-entry-pending-draft-routing.test.mjs`（15 条）
+- `tests/agent-entry-pending-draft-routing.test.mjs`（16 条）
 
 ---
 
@@ -99,10 +101,11 @@
 | 4.8 | 第一个跳过 | continue_pending_batch | planCommand(batchCancelIndex, index=0) | 旧 batch handler 索引取消 |
 | 4.9 | 就这样 | continue_pending_batch（force_proposal） | planCommand(batchConfirm) | force_proposal 在 batch 上下文视为确认 |
 | 4.10 | 可以了 | continue_pending_batch（force_proposal） | planCommand(batchConfirm) | 同上 |
-| 4.11 | 按这个来 | 不命中 force_proposal / confirm | needLlm 或 fallback | **当前行为**：不在确认短语列表，不误触发 batchConfirm；记录为当前语义，不在本轮修改 |
+| 4.11 | 按这个来 | continue_pending_batch（force_proposal） | planCommand(batchConfirm) | 阶段 4B：已纳入 FORCE_PROPOSAL_PATTERNS + CONFIRM_EXPLICIT_PHRASES，与「就这样」一致 |
+| 4.12 | 就按这个来 | continue_pending_batch（force_proposal） | planCommand(batchConfirm) | 包含「按这个来」，命中同上 |
 
 **测试覆盖**：
-- `tests/agent-entry-pending-batch-routing.test.mjs`（22 条，含 3C-20/21/22 force_proposal 回归）
+- `tests/agent-entry-pending-batch-routing.test.mjs`（23 条，含 3C-20/21/22/23 force_proposal 回归）
 
 ---
 

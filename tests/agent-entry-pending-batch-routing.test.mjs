@@ -574,7 +574,7 @@ test("3C-21: pendingBatch + 「可以了」→ 走 batch handler，不空转", (
   assert.equal(trace.firstFocusDecision?.focus, "continue_pending_batch")
 })
 
-test("3C-22: pendingBatch + 「按这个来」→ 暴露当前行为（不强行改业务逻辑）", () => {
+test("3C-22: pendingBatch + 「按这个来」→ 走 batch handler（batchConfirm）", () => {
   const orch = createHouseholdOrchestrator()
   const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
   const pendingBatch = makePendingBatch()
@@ -588,34 +588,34 @@ test("3C-22: pendingBatch + 「按这个来」→ 暴露当前行为（不强行
     trace
   })
 
-  // 当前行为：「按这个来」不在任何确认/强制保存短语列表中
-  //   - 不命中 isForceProposalSignal（不在 FORCE_PROPOSAL_PATTERNS）
-  //   - 不命中 isConfirmMatch（不在 CONFIRM_EXPLICIT_PHRASES，长度 4 但不含 casual 短语）
-  //   - interpretUserTurn 判为 unknown 或其他
-  //   - focusResolver 不会返回 continue_pending_batch
-  //   - classifyBatchIntent 也不命中（isBatchConfirmMatch 只检查 CONFIRM_EXPLICIT_PHRASES）
-  //   - 最终落到 needLlm 或 boundary fallback
-  //
-  // 本测试暴露此行为，不强行改业务逻辑。
-  // 如果未来需要支持「按这个来」，应在 CONFIRM_EXPLICIT_PHRASES 或 FORCE_PROPOSAL_PATTERNS 中新增，
-  // 届时本测试需同步更新。
-  //
-  // 关键断言：不应错误执行 batchConfirm（避免误确认）
-  if (decision.kind === "sync") {
-    assert.notEqual(
-      decision.turn.command?.command,
-      "batchConfirm",
-      "「按这个来」当前不在确认短语列表，不应误触发 batchConfirm"
-    )
-    assert.notEqual(
-      decision.turn.command?.command,
-      "batchCancel",
-      "「按这个来」不应误触发 batchCancel"
-    )
-  }
-  // 也不应空转到 collection（不是新补货记录）
-  if (decision.kind === "sync") {
-    assert.notEqual(decision.turn.kind, "collection", "「按这个来」不应新建 collection")
-  }
+  // 阶段 4B：「按这个来」已纳入确认语义（与「就这样」「可以了」一致），
+  //   - isForceProposalSignal 命中 /按这个来/ → force_proposal
+  //   - focusResolver 返回 continue_pending_batch
+  //   - classifyBatchIntent → isBatchConfirmMatch 命中 "按这个来" → batchConfirm
+  assert.equal(decision.kind, "sync", "应返回 sync，不应空转或 needLlm")
+  assert.equal(decision.turn.kind, "planCommand", "应走 batch handler")
+  assert.equal(decision.turn.command.command, "batchConfirm")
+  assert.equal(trace.firstFocusDecision?.focus, "continue_pending_batch")
+})
+
+test("3C-23: pendingBatch + 「就按这个来」→ 走 batch handler（batchConfirm）", () => {
+  const orch = createHouseholdOrchestrator()
+  const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
+  const pendingBatch = makePendingBatch()
+  const trace = createTrace("就按这个来", {})
+
+  const decision = decide(orch, {
+    text: "就按这个来",
+    state,
+    itemViews: viewsOf(state.items),
+    pendingBatch,
+    trace
+  })
+
+  // 「就按这个来」包含「按这个来」→ 命中 /按这个来/ 和 "按这个来"
+  assert.equal(decision.kind, "sync", "应返回 sync")
+  assert.equal(decision.turn.kind, "planCommand", "应走 batch handler")
+  assert.equal(decision.turn.command.command, "batchConfirm")
+  assert.equal(trace.firstFocusDecision?.focus, "continue_pending_batch")
 })
 

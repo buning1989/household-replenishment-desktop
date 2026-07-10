@@ -39,6 +39,7 @@ export type DraftCollection = {
 /** 用户明确要求直接保存的信号（跳过质量字段追问，直接转 proposal）。 */
 const FORCE_PROPOSAL_PATTERNS = [
   /就这样/,
+  /按这个来/,
   /先保存/,
   /直接记下/,
   /不用问/,

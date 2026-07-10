@@ -21,14 +21,44 @@ npm run dev
 - 不会抛异常，但平台别名无法补全。
 - trace 中 `llmInterpreter.called=false, skipReason=no_api_key`。
 
-设置方式（在 Electron 启动前）：
+### 2.1 支持的环境变量
+
+real smoke 脚本按优先级读取以下 key（任一即可）：
+
+| 环境变量 | 优先级 | 说明 |
+|---------|-------|------|
+| `DASHSCOPE_API_KEY` | 1 | 阿里云 DashScope key（推荐） |
+| `AI_API_KEY` | 2 | 通用别名 |
+| `OPENAI_API_KEY` | 3 | OpenAI 兼容（备用） |
+
+模型选择（可选）：
+
+| 环境变量 | 说明 |
+|---------|------|
+| `AI_CHAT_MODEL` | 覆盖默认模型（默认 `qwen-plus`） |
+
+endpoint 固定为 DashScope 兼容模式：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`。
+
+### 2.2 设置方式
+
+在 Electron 启动前：
 
 ```bash
 export DASHSCOPE_API_KEY=<你的 key>
+# 可选：覆盖模型
+# export AI_CHAT_MODEL=qwen-max
 npm run dev
 ```
 
 或在应用内「设置 → AI」中填入 key。
+
+### 2.3 运行 real smoke
+
+```bash
+DASHSCOPE_API_KEY=<你的 key> npm run smoke:agent-llm:real
+```
+
+无 key 时输出 `REAL_LLM_SMOKE_SKIPPED: no api key`，exit code 0。这是预期行为，不是失败。
 
 ## 3. 如何打开 trace
 
