@@ -249,6 +249,14 @@ function formatSummary(name, decision, trace, llmCalled) {
 
 // ---------- 判定 ----------
 
+/**
+ * 判定结果：
+ *   - PASS：核心验收通过
+ *   - FAIL：核心验收失败，process.exit(1)
+ *   - PASS_NEED_LLM：advisory，不算核心失败。
+ *     适用于「你知道 X 么」这类疑问句——LLM 可能判为 smalltalk 交 answer LLM，
+ *     或判为 clarification 追问，都不算核心失败，但需在汇总中单独展示。
+ */
 function judge(name, decision, trace) {
   const llm = trace.llmInterpreter
   const errors = []
@@ -257,7 +265,7 @@ function judge(name, decision, trace) {
     errors.push("llmInterpreter.called 应为 true")
   }
 
-  // Case 1-3：拼夕夕 / PDD / p'd'd
+  // Case 1-3：拼夕夕 / PDD / p'd'd（核心验收，必须补 platform=拼多多）
   if (["拼夕夕", "PDD", "p'd'd"].includes(name)) {
     if (llm?.normalizedInterpretation?.intent !== "supplement_current_collection") {
       errors.push(`normalizedIntent 应为 supplement_current_collection, 实际: ${llm?.normalizedInterpretation?.intent}`)
@@ -284,23 +292,39 @@ function judge(name, decision, trace) {
     }
   }
 
-  // Case 4-5：你知道 p'd'd / 你知道拼夕夕么
+  // Case 4-5：你知道 p'd'd / 你知道拼夕夕么（advisory，不要求直接写入 platform）
+  // 可接受结果：
+  //   A. finalDecision = needLlm（交普通 answer LLM 自然回答）
+  //   B. final turn = clarification（追问是否补平台）
+  //   C. 不允许「超出家务范围」
+  //   D. 不允许低置信下直接写入错误字段（confidence=low 但写入 platform 视为错误）
   if (["你知道 p'd'd", "你知道拼夕夕么"].includes(name)) {
-    if (decision.kind !== "sync") {
-      errors.push(`final decision 应为 sync, 实际: ${decision.kind}`)
-    } else {
-      if (decision.turn.message?.includes("超出家务范围")) {
-        errors.push("final message 不应包含「超出家务范围」")
-      }
-    }
-    // 可接受：高置信 platform=拼多多，或中置信 clarification
-    // 不接受：llmInterpreter.called = false
     if (!llm?.called) {
       errors.push("llmInterpreter.called 应为 true")
     }
+    // C. 不允许「超出家务范围」
+    if (decision.kind === "sync" && decision.turn.message?.includes("超出家务范围")) {
+      errors.push("final message 不应包含「超出家务范围」")
+    }
+    // D. 不允许低置信直接写入字段
+    const normalized = llm?.normalizedInterpretation
+    if (
+      normalized?.confidence === "low" &&
+      normalized?.fields &&
+      Object.keys(normalized.fields).length > 0
+    ) {
+      errors.push(`低置信下不应直接写入字段, 实际 fields: ${JSON.stringify(normalized.fields)}`)
+    }
+    // 如果是 sync turn，检查是否在低置信下写入 platform
+    if (decision.kind === "sync" && decision.turn.kind === "collection") {
+      const draft = decision.turn.collection?.draft
+      if (draft && restockFields(draft).platform && normalized?.confidence === "low") {
+        errors.push("低置信下不应直接写入 platform")
+      }
+    }
   }
 
-  // Case 6：asdfasdf
+  // Case 6：asdfasdf（核心验收，必须 clarification，不写字段）
   if (name === "asdfasdf") {
     if (!llm?.called) {
       errors.push("llmInterpreter.called 应为 true")
@@ -319,7 +343,13 @@ function judge(name, decision, trace) {
     }
   }
 
-  return errors
+  // 确定状态
+  const isAdvisory = ["你知道 p'd'd", "你知道拼夕夕么"].includes(name)
+  const status = errors.length === 0
+    ? (isAdvisory ? "PASS_NEED_LLM" : "PASS")
+    : (isAdvisory ? "FAIL" : "FAIL")
+
+  return { status, errors }
 }
 
 // ---------- 主流程 ----------
@@ -356,42 +386,46 @@ async function main() {
   ]
 
   let passCount = 0
+  let advisoryCount = 0
   let failCount = 0
   const results = []
 
   for (const text of cases) {
     try {
       const { summary, trace, decision } = await runCase(text, text, state, pendingCollection, client)
-      const errors = judge(text, decision, trace)
-      const pass = errors.length === 0
-      if (pass) {
+      const { status, errors } = judge(text, decision, trace)
+      if (status === "PASS") {
         passCount++
+      } else if (status === "PASS_NEED_LLM") {
+        advisoryCount++
       } else {
         failCount++
       }
       // 在 summary 顶部替换 result 行
       const judgedSummary = summary.replace(
         /^CASE: .+\nresult: .+$/,
-        `CASE: ${text}\nresult: ${pass ? "PASS" : "FAIL"}`
+        `CASE: ${text}\nresult: ${status}`
       )
-      const fullSummary = pass
-        ? judgedSummary
-        : `${judgedSummary}\nerrors:\n${errors.map((e) => `  - ${e}`).join("\n")}`
+      const fullSummary =
+        errors.length === 0
+          ? judgedSummary
+          : `${judgedSummary}\nerrors:\n${errors.map((e) => `  - ${e}`).join("\n")}`
       console.log(fullSummary)
       console.log("")
-      results.push({ name: text, pass, summary: fullSummary, trace })
+      results.push({ name: text, status, summary: fullSummary, trace })
     } catch (err) {
       failCount++
       console.log(`CASE: ${text}`)
       console.log(`result: FAIL (执行异常)`)
       console.log(`error: ${err.message}`)
       console.log("")
-      results.push({ name: text, pass: false, summary: `error: ${err.message}`, trace: null })
+      results.push({ name: text, status: "FAIL", summary: `error: ${err.message}`, trace: null })
     }
   }
 
   console.log("=== 汇总 ===")
-  console.log(`PASS: ${passCount} / ${cases.length}`)
+  console.log(`PASS (核心): ${passCount} / ${cases.length}`)
+  console.log(`PASS_NEED_LLM (advisory): ${advisoryCount} / ${cases.length}`)
   console.log(`FAIL: ${failCount} / ${cases.length}`)
   console.log(`model: ${model}`)
 
@@ -399,7 +433,7 @@ async function main() {
     console.log("")
     console.log("=== 失败 case 完整 trace ===")
     for (const r of results) {
-      if (!r.pass && r.trace) {
+      if (r.status === "FAIL" && r.trace) {
         console.log(`\n--- ${r.name} ---`)
         console.log(JSON.stringify(r.trace, null, 2))
       }
