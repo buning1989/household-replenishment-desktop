@@ -174,14 +174,25 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
   }
 
   // ---------- c. pendingBatch ----------
+  // 阶段 3C：pendingBatch 接入 focusResolver。
+  // 确认 / 取消 / 强制保存 / 批量修订 → 继续当前 batch（交原 batch handler 执行）。
+  // 新补货记录 / 查询 / 闲聊 / 低置信 → 不继续 batch，落到下方路由。
+  // 关键修复：新补货记录不再被旧 batch handler 吞掉，旧 batch 由 App.tsx 标 superseded。
   if (pendingBatch && pendingBatch.length > 0) {
-    if (intent === "batch_revision") {
+    if (
+      intent === "confirm_current_task" ||
+      intent === "cancel_current_task" ||
+      intent === "force_proposal" ||
+      intent === "batch_revision"
+    ) {
       return {
         focus: "continue_pending_batch",
-        reason: "命中批量修订信号，继续当前批量待确认方案"
+        reason: batchContinueReason(intent)
       }
     }
-    // 非 batch 意图落到下方路由（查询 / 新写入 / LLM）
+    // 其他意图（新补货记录 / 查询 / 闲聊 / 删除 / 物品管理）落到下方路由。
+    // 新补货记录会由 hasActivePending 分支返回 start_new_collection，
+    // 旧 pendingBatch 由 App.tsx collection turn handler 标 superseded。
   }
 
   // ---------- d. pendingDraft ----------
@@ -329,4 +340,21 @@ function draftContinueReason(intent: TurnInterpretation["intent"]): string {
     return "命中强制保存信号，在 pendingDraft 上下文中视为确认当前 draft"
   }
   return "命中确认信号，继续当前 pending draft 的确认流程"
+}
+
+/**
+ * 生成 continue_pending_batch 的 reason（阶段 3C）。
+ * force_proposal 在 pendingBatch 上下文中视为确认当前 batch。
+ */
+function batchContinueReason(intent: TurnInterpretation["intent"]): string {
+  if (intent === "cancel_current_task") {
+    return "命中取消信号，继续当前 pending batch 的取消流程"
+  }
+  if (intent === "force_proposal") {
+    return "命中强制保存信号，在 pendingBatch 上下文中视为确认当前 batch"
+  }
+  if (intent === "batch_revision") {
+    return "命中批量修订信号，继续当前批量待确认方案"
+  }
+  return "命中确认信号，继续当前 pending batch 的确认流程"
 }

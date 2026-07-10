@@ -114,10 +114,17 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   }
 
   // 3. pending batch（订单导入后的批量修正）
+  //    阶段 3C：先用 turnInterpretation + focusResolver 判断本轮是否继续当前 batch。
+  //    只有 confirm / cancel / force_proposal / batch_revision 才继续走原 batch handler。
+  //    新补货记录 / 查询 / 闲聊 / 低置信一律不继续 batch，落到后续流程。
+  //    关键修复：pendingBatch 下输入「今天买了 3 袋五常大米」不再被旧 batch handler 吞掉，
+  //    而是由 interpretUserTurn 正确识别为 new_restock_record，走新建 collection 路径，
+  //    旧 pendingBatch 由 App.tsx 的 collection turn 处理逻辑标 superseded。
   if (pendingBatch && pendingBatch.length > 0) {
-    const batchTurn = handleBatchIntent(text, pendingBatch, state, trace)
-    if (batchTurn) return { kind: "sync", turn: batchTurn }
-    // 批量意图没命中，落到下面单草稿/查询/LLM 流程
+    const batchDecision = handlePendingBatchFocusDecision(input)
+    if (batchDecision) return batchDecision
+    // batchDecision === null 表示本轮不打断当前 batch、也不继续执行，
+    // 落到下面继续 pendingDraft / writeDraft / boundary / LLM 流程。
   }
 
   // 4. pending proposal（旧 AgentDraft 状态机）：confirm / cancel / revise / pendingStatus
@@ -638,6 +645,109 @@ function handlePendingDraftIntent(
     return { kind: "answer", message: composePendingReminder(pendingDraft) }
   }
   return null
+}
+
+/**
+ * 阶段 3C：pendingBatch 分支接入 turnInterpretation + focusResolver。
+ *
+ * 只有 focus = continue_pending_batch（确认/取消/强制保存/批量修订）才继续走原 batch handler，
+ * 保留旧 confirm/cancel/revise 链路。其他意图不执行 batch：
+ *   - start_new_collection + new_restock_record → 走 writeDraft 流程（新建 collection）
+ *   - start_new_collection + manage_item/delete_request → 交原 batch handler 兜底（保留修订能力）
+ *   - route_to_query / route_to_smalltalk / route_to_llm → 兼容旧 batch 意图后落回 decideSync
+ *
+ * 关键修复：pendingBatch 下输入「今天买了 3 袋五常大米」不再被旧 batch handler 吞掉，
+ * 而是由 interpretUserTurn 正确识别为 new_restock_record → focusResolver 返回 start_new_collection →
+ * 走 writeDraft，旧 pendingBatch 由 App.tsx 的 collection turn 处理逻辑标 superseded。
+ *
+ * 返回 null 表示交回 decideSync 后续流程处理（pendingDraft / writeDraft / boundary / LLM）。
+ */
+function handlePendingBatchFocusDecision(input: OrchestrateInput): OrchestrateDecision | null {
+  const { text, state, itemViews, dateContext, pendingBatch, trace } = input
+  if (!pendingBatch || pendingBatch.length === 0) return null
+
+  const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+  const focus = resolveConversationFocus({
+    interpretation,
+    pendingPlan: input.pendingPlan,
+    pendingCollection: input.pendingCollection,
+    pendingDraft: input.pendingDraft,
+    pendingBatch
+  })
+
+  if (trace) {
+    trace.localInterpretation = interpretation
+    trace.firstFocusDecision = focus
+  }
+
+  switch (focus.focus) {
+    case "continue_pending_batch": {
+      // 确认 / 取消 / 强制保存 / 批量修订 → 继续走原 batch handler（保留旧状态机）
+      setRouteDecision(trace, "pendingBatch", { rule: "focus.continue_pending_batch", interceptedByRule: true })
+      const batchTurn = handleBatchIntent(text, pendingBatch, state, trace)
+      if (batchTurn) return { kind: "sync", turn: batchTurn }
+      // 旧 batch handler 未命中（如 classifyBatchIntent 返回 null）→ 落回 decideSync
+      setRouteDecision(trace, "pendingBatch", { rule: "focus.continue_pending_batch.no_match", routeToLlm: false })
+      return null
+    }
+
+    case "start_new_collection": {
+      // 新补货记录：走 writeDraft 流程，不执行 batch
+      if (interpretation.intent === "new_restock_record") {
+        setRouteDecision(trace, "pendingBatch", { rule: "focus.start_new_collection(new_restock)", interceptedByRule: true })
+        const writeDraftDecision = handleWriteDraftIntent(input)
+        if (writeDraftDecision) {
+          if (writeDraftDecision.kind === "sync" && trace && !trace.finalDecision) {
+            const message = "message" in writeDraftDecision.turn ? writeDraftDecision.turn.message : undefined
+            setFinalDecision(trace, { kind: "sync", turnKind: writeDraftDecision.turn.kind, message })
+          }
+          return writeDraftDecision
+        }
+        setRouteDecision(trace, "pendingBatch", { rule: "start_new_collection.parse_failed", routeToLlm: true })
+        return null
+      }
+      // 其他写入意图（manage_item / delete_request / batch_revision）：
+      // 可能是对当前 batch 的修订，交原 batch handler 兜底。
+      // batch handler 未命中时落到 writeDraft。
+      setRouteDecision(trace, "pendingBatch", { rule: "focus.start_new_collection(non-restock)→batchHandler", interceptedByRule: true })
+      const batchTurn = handleBatchIntent(text, pendingBatch, state, trace)
+      if (batchTurn) return { kind: "sync", turn: batchTurn }
+      const writeDraftDecision = handleWriteDraftIntent(input)
+      if (writeDraftDecision) return writeDraftDecision
+      return null
+    }
+
+    case "route_to_query":
+    case "route_to_smalltalk":
+    case "route_to_llm": {
+      // 兼容旧 batch 意图（如 classifyBatchIntent 识别的 batchConfirm/batchCancel 等）：
+      // 仍交原 batch handler 处理，保留旧确认/取消能力。
+      const batchTurn = handleBatchIntent(text, pendingBatch, state, trace)
+      if (batchTurn) {
+        setRouteDecision(trace, "pendingBatch", { rule: `focus.${focus.focus}→batchHandler`, interceptedByRule: true })
+        return { kind: "sync", turn: batchTurn }
+      }
+      // 边界闲聊：本地直接回答
+      if (focus.focus === "route_to_smalltalk") {
+        const boundary = classifyConversationBoundary(text)
+        if (boundary === "identityOrMeta" || boundary === "realtimeExternal" || boundary === "casual") {
+          setRouteDecision(trace, "pendingBatch", { rule: "route_to_smalltalk.boundary", interceptedByRule: true })
+          return {
+            kind: "sync",
+            turn: { kind: "answer" as const, message: composeBoundaryAnswer(boundary, text) }
+          }
+        }
+      }
+      // 查询 / 闲聊 / 低置信：不执行 batch，落回 decideSync 后续流程
+      setRouteDecision(trace, "pendingBatch", { rule: `focus.${focus.focus}`, routeToLlm: focus.focus === "route_to_llm" })
+      return null
+    }
+
+    default:
+      // continue_pending_collection / continue_pending_batch / continue_pending_plan / continue_pending_draft / route_to_write_draft
+      // 这些分支在 pendingBatch 场景下不应出现（focusResolver 已分流），兜底交回 decideSync。
+      return null
+  }
 }
 
 /**

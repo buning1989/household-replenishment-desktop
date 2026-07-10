@@ -598,6 +598,36 @@ export function supersedeOldPendingPlan(
   )
 }
 
+/**
+ * 新 collection turn 到来时，把旧 pending batch 标记为 superseded。
+ * 阶段 3C：pendingBatch 下用户输入新补货记录，走 writeDraft 生成新 collection，
+ * 旧 batch 不应继续保留 pending 状态。
+ *
+ * batch 的状态是 batchDraftStatuses 数组，逐项把 "pending" 标为 "superseded"。
+ * 只有至少一个 pending 状态的 batch 消息才需要修改（避免无谓的数组复制）。
+ * 返回新的 messages 数组（不可变）。
+ */
+export function supersedeOldPendingBatch(
+  messages: HouseholdChatMessage[]
+): HouseholdChatMessage[] {
+  return messages.map((msg) => {
+    if (
+      msg.role === "assistant" &&
+      msg.agentDraftBatch &&
+      msg.batchDraftStatuses &&
+      msg.batchDraftStatuses.some((status) => status === "pending")
+    ) {
+      return {
+        ...msg,
+        batchDraftStatuses: msg.batchDraftStatuses.map((status) =>
+          status === "pending" ? ("superseded" as const) : status
+        )
+      }
+    }
+    return msg
+  })
+}
+
 // 重新导出 pickObservationByPreference 以保持兼容（部分代码可能从 conversationContext 引入）
 export {
   pickObservationByPreference,

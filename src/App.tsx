@@ -27,7 +27,7 @@ import { buildManagerBriefing, buildManagerObservations } from "./agent/observat
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent, classifyAgentIntent } from "./agent/intent"
 import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, commitAgentPlan, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
-import { buildAgentContextPack, supersedeOldPendingDraft, supersedeOldPendingCollection, supersedeOldPendingPlan } from "./agent/conversationContext"
+import { buildAgentContextPack, supersedeOldPendingBatch, supersedeOldPendingDraft, supersedeOldPendingCollection, supersedeOldPendingPlan } from "./agent/conversationContext"
 import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
 import { computeRemainingDelay, getResponseTiming } from "./agent/responsePacing"
@@ -2344,6 +2344,8 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       // 采集态 collection turn：新采集或补充采集，渲染为普通气泡（不展示确认卡）
       // 旧 pending collection 标 superseded，新 collection 标 pending
       // 阶段 3A：若旧 pendingPlan 存在（pendingPlan 下用户输入新补货记录），也标 superseded
+      // 阶段 3B：若旧 pendingDraft 存在，也标 superseded
+      // 阶段 3C：若旧 pendingBatch 存在，也标 superseded
       if (turn.kind === "collection") {
         await waitWithTransient(nextMessages, timing)
         let base = pendingCollectionMessageIndex >= 0
@@ -2355,6 +2357,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
         // 阶段 3B：新 collection supersede 旧 pendingDraft，避免下一轮 draft handler 抢焦点
         if (pendingMessageIndex >= 0) {
           base = supersedeOldPendingDraft(base)
+        }
+        // 阶段 3C：新 collection supersede 旧 pendingBatch，避免下一轮 batch handler 抢焦点
+        if (pendingBatchMessageIndex >= 0) {
+          base = supersedeOldPendingBatch(base)
         }
         onMessagesChange([...base, { role: "assistant", content: turn.message, agentCollection: turn.collection, collectionStatus: "pending" as const, createdAt: Date.now() }])
         return
