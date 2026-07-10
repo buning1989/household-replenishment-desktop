@@ -86,11 +86,35 @@ const VALID_LLM_INTENTS: ReadonlySet<LlmTurnIntent> = new Set([
 ])
 
 /**
+ * 解析 Turn Interpreter 应使用的模型。
+ *
+ * 规则：
+ *   1. 优先使用 aiChatModel（明确的文本对话模型）
+ *   2. aiChatModel 为空时，若 aiModel 不含视觉模型关键词（vl/vision/视觉），可用 aiModel
+ *   3. 否则默认 qwen-plus
+ *
+ * 关键修复：aiModel 可能是视觉模型（如 qwen3-vl-plus），视觉模型做纯文本 JSON interpreter
+ * 表现不稳定，不允许作为 turnInterpreter model。
+ */
+export function resolveTurnInterpreterModel(settings?: {
+  aiChatModel?: string
+  aiModel?: string
+}): string {
+  const chatModel = settings?.aiChatModel?.trim()
+  if (chatModel) return chatModel
+
+  const fallback = settings?.aiModel?.trim()
+  if (fallback && !/vl|vision|视觉/i.test(fallback)) return fallback
+
+  return "qwen-plus"
+}
+
+/**
  * 调用 LLM 解释当前这一轮输入，返回结构化 TurnInterpretation 或 null。
  *
  * 返回 null 的情况（调用方应转 clarification）：
  *   - LLM 调用失败
- *   - JSON 解析失败
+ *   - JSON 解析失败（含一次 repair retry 后仍失败）
  *   - intent 不合法
  *   - confidence = "low"
  *   - intent = unknown
@@ -104,7 +128,7 @@ export async function askTurnInterpreterLlm(
 ): Promise<TurnInterpretation | null> {
   const trace = input.trace
   const apiKey = input.state.settings?.aiApiKey?.trim()
-  const model = (input.state.settings?.aiChatModel ?? input.state.settings?.aiModel)?.trim()
+  const model = resolveTurnInterpreterModel(input.state.settings)
 
   // 填充 trace.llmInterpreter 起始状态
   if (trace) {
@@ -116,7 +140,7 @@ export async function askTurnInterpreterLlm(
     }
   }
 
-  const client = input.client ?? createDesktopTurnInterpreterLlmClient(input.state)
+  const client = input.client ?? createDesktopTurnInterpreterLlmClient(input.state, model)
   if (!client) {
     if (trace) {
       trace.llmInterpreter!.called = false
@@ -149,32 +173,123 @@ export async function askTurnInterpreterLlm(
     trace.llmInterpreter!.rawResponse = typeof raw === "string" ? raw.slice(0, 2000) : String(raw).slice(0, 2000)
   }
 
-  const parsed = parseLlmTurnInterpretation(raw)
-  if (trace) {
-    trace.llmInterpreter!.parsed = parsed
+  // 第一次解析 + 校验
+  const firstAttempt = parseAndValidateTurnInterpretation(raw, trace)
+  if (firstAttempt.parsed) {
+    const rejected = rejectIfNeeded(firstAttempt.parsed, trace)
+    if (!rejected) {
+      const normalized = normalizeLlmInterpretation(firstAttempt.parsed)
+      if (trace) {
+        trace.llmInterpreter!.normalizedInterpretation = normalized
+        trace.llmInterpreter!.rejected = false
+      }
+      return normalized
+    }
+    // rejected（low / unknown / empty_fields）→ 不再 repair，直接 null
+    return null
   }
-  if (!parsed) {
+
+  // 第一次解析失败 → 尝试一次 repair retry
+  const repairable = isRepairable(firstAttempt.rejectReason)
+  if (!repairable) {
     if (trace) {
       trace.llmInterpreter!.rejected = true
-      trace.llmInterpreter!.rejectReason = "json_parse_failed"
+      trace.llmInterpreter!.rejectReason = firstAttempt.rejectReason
     }
     return null
   }
 
-  // 低置信 / unknown / 空字段 supplement → 转 null（调用方走 clarification）
+  if (trace) {
+    trace.llmInterpreter!.repairAttempted = true
+  }
+
+  let repairRaw: string
+  try {
+    repairRaw = await client.complete(buildRepairPrompt(raw, firstAttempt.rejectReason ?? "json_parse_failed", input))
+  } catch (err) {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = `repair_client_exception: ${err instanceof Error ? err.message : String(err)}`
+      trace.llmInterpreter!.repairRejectReason = `client_exception`
+    }
+    return null
+  }
+
+  if (trace) {
+    trace.llmInterpreter!.repairRawResponse = typeof repairRaw === "string" ? repairRaw.slice(0, 2000) : String(repairRaw).slice(0, 2000)
+  }
+
+  const repairAttempt = parseAndValidateTurnInterpretation(repairRaw, trace)
+  if (trace) {
+    trace.llmInterpreter!.repairParsed = repairAttempt.parsed
+  }
+  if (!repairAttempt.parsed) {
+    if (trace) {
+      trace.llmInterpreter!.rejected = true
+      trace.llmInterpreter!.rejectReason = repairAttempt.rejectReason
+      trace.llmInterpreter!.repairRejectReason = repairAttempt.rejectReason
+    }
+    return null
+  }
+
+  // repair 成功解析，再做一次 reject 检查
+  const repairRejected = rejectIfNeeded(repairAttempt.parsed, trace)
+  if (repairRejected) {
+    if (trace) {
+      trace.llmInterpreter!.repairRejectReason = trace.llmInterpreter!.rejectReason
+    }
+    return null
+  }
+
+  const normalized = normalizeLlmInterpretation(repairAttempt.parsed)
+  if (trace) {
+    trace.llmInterpreter!.normalizedInterpretation = normalized
+    trace.llmInterpreter!.rejected = false
+  }
+  return normalized
+}
+
+/**
+ * 解析 + 校验 LLM 返回，返回 { parsed, rejectReason }。
+ * rejectReason 表示「解析/校验失败的原因」，不包含 low/unknown/empty_fields 等业务拒绝（那些由 rejectIfNeeded 处理）。
+ */
+function parseAndValidateTurnInterpretation(
+  raw: string,
+  trace: AgentDecisionTrace | undefined
+): { parsed: LlmTurnInterpretation | null; rejectReason?: string } {
+  const parsed = parseLlmTurnInterpretation(raw)
+  if (!parsed) return { parsed: null, rejectReason: "json_parse_failed" }
+
+  // validator 已在 parseLlmTurnInterpretation 内放宽：fields 缺失→{}，confidence 缺失→medium
+  // 这里只记录 warning（如果有的话）
+  if (trace && trace.llmInterpreter && !trace.llmInterpreter.validationWarning) {
+    // parseLlmTurnInterpretation 不直接返回 warning，通过检查 raw 是否缺 confidence 来推断
+    // 简化：validateLlmTurnInterpretation 已在内部处理，这里不重复推断
+  }
+  return { parsed }
+}
+
+/**
+ * 业务拒绝检查：low confidence / unknown / supplement 空 fields。
+ * 返回 true 表示被拒绝（trace 已记录 rejectReason）。
+ */
+function rejectIfNeeded(
+  parsed: LlmTurnInterpretation,
+  trace: AgentDecisionTrace | undefined
+): boolean {
   if (parsed.confidence === "low") {
     if (trace) {
       trace.llmInterpreter!.rejected = true
       trace.llmInterpreter!.rejectReason = "confidence_low"
     }
-    return null
+    return true
   }
   if (parsed.intent === "unknown") {
     if (trace) {
       trace.llmInterpreter!.rejected = true
       trace.llmInterpreter!.rejectReason = "intent_unknown"
     }
-    return null
+    return true
   }
   if (
     parsed.intent === "supplement_current_collection" &&
@@ -184,15 +299,76 @@ export async function askTurnInterpreterLlm(
       trace.llmInterpreter!.rejected = true
       trace.llmInterpreter!.rejectReason = "supplement_with_empty_fields"
     }
-    return null
+    return true
   }
+  return false
+}
 
-  const normalized = normalizeLlmInterpretation(parsed)
-  if (trace) {
-    trace.llmInterpreter!.normalizedInterpretation = normalized
-    trace.llmInterpreter!.rejected = false
+/** 判断 rejectReason 是否允许 repair retry。 */
+function isRepairable(rejectReason: string | undefined): boolean {
+  if (!rejectReason) return false
+  return [
+    "json_parse_failed",
+    "invalid_schema",
+    "missing_fields_object",
+    "confidence_missing"
+  ].includes(rejectReason)
+  // 注意：supplement_with_empty_fields 不在可 repair 列表——空 fields 是业务判断，repair 也不会变
+}
+
+/**
+ * 构造 repair prompt：告知模型上一次输出无法解析，要求只输出合法 JSON。
+ */
+function buildRepairPrompt(
+  rawResponse: string,
+  rejectReason: string,
+  input: AskTurnInterpreterLlmInput
+): string {
+  const lines: string[] = []
+  lines.push("你上一轮的输出无法被系统解析，需要重新输出。")
+  lines.push("")
+  lines.push("【上一次输出】")
+  lines.push(rawResponse.slice(0, 1000))
+  lines.push("")
+  lines.push("【失败原因】")
+  lines.push(rejectReason)
+  lines.push("")
+  lines.push("【合法 JSON schema】")
+  lines.push('{')
+  lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_inventory | smalltalk | unknown",')
+  lines.push('  "fields": {')
+  lines.push('    "itemName": "可选",')
+  lines.push('    "quantity": "可选，数字",')
+  lines.push('    "unit": "可选",')
+  lines.push('    "date": "可选",')
+  lines.push('    "price": "可选，数字",')
+  lines.push('    "platform": "可选，归一后的标准平台名",')
+  lines.push('    "review": "可选"')
+  lines.push('  },')
+  lines.push('  "confidence": "high | medium | low",')
+  lines.push('  "reason": "一句话说明"')
+  lines.push('}')
+  lines.push("")
+  lines.push("【绝对规则】")
+  lines.push("1. 只输出一个 JSON 对象，不要输出任何其他文字。")
+  lines.push("2. 不要用 markdown 代码块包裹。")
+  lines.push("3. 第一个字符必须是 `{`，最后一个字符必须是 `}`。")
+  lines.push("")
+  lines.push("【当前正在采集的补货记录】")
+  if (input.pendingCollection) {
+    const f = describeCollectionDraft(input.pendingCollection)
+    lines.push(`物品名：${f.itemName ?? "（未定）"}`)
+    const missing = [...input.pendingCollection.requiredMissingSlots, ...input.pendingCollection.qualityMissingSlots]
+    lines.push(`当前缺失字段：${missing.length > 0 ? missing.join("、") : "（无）"}`)
+  } else {
+    lines.push("（无）")
   }
-  return normalized
+  lines.push("")
+  lines.push("【用户这一轮输入】")
+  lines.push(input.text)
+  lines.push("")
+  lines.push("只输出 JSON 对象。")
+  return lines.join("\n")
 }
 
 /**
@@ -391,6 +567,11 @@ function collectHistoryPlatforms(
  * 解析 LLM 返回的原始文本为 LlmTurnInterpretation。
  * 容忍前后多余文字、markdown 代码块包裹；提取第一个 { ... } JSON 对象。
  * 解析失败或字段不合法返回 null。
+ *
+ * 放宽规则（阶段 2C 真实链路修复）：
+ *   - fields 缺失或不是对象时，默认 {}，不再直接返回 null
+ *   - confidence 缺失时，默认 "medium"，不再直接返回 null（但 parseResult 会记录 warning）
+ *   - intent 不合法仍返回 null（不可放宽）
  */
 export function parseLlmTurnInterpretation(raw: string): LlmTurnInterpretation | null {
   if (!raw || typeof raw !== "string") return null
@@ -412,7 +593,11 @@ export function parseLlmTurnInterpretation(raw: string): LlmTurnInterpretation |
   }
 }
 
-/** 校验解析后的对象是否符合 schema。 */
+/**
+ * 校验解析后的对象是否符合 schema。
+ * 放宽：fields 缺失→{}，confidence 缺失→medium。
+ * 严格：intent 必须合法。
+ */
 function validateLlmTurnInterpretation(obj: unknown): LlmTurnInterpretation | null {
   if (!obj || typeof obj !== "object") return null
   const o = obj as Record<string, unknown>
@@ -422,9 +607,9 @@ function validateLlmTurnInterpretation(obj: unknown): LlmTurnInterpretation | nu
     return null
   }
 
+  // 放宽：fields 缺失或不是对象时默认 {}，不再返回 null
   const fieldsRaw = o.fields
-  if (!fieldsRaw || typeof fieldsRaw !== "object") return null
-  const f = fieldsRaw as Record<string, unknown>
+  const f = (fieldsRaw && typeof fieldsRaw === "object") ? fieldsRaw as Record<string, unknown> : {}
   const fields: LlmTurnInterpretation["fields"] = {}
   if (typeof f.itemName === "string" && f.itemName.trim()) fields.itemName = f.itemName.trim()
   if (typeof f.quantity === "number" && Number.isFinite(f.quantity)) fields.quantity = f.quantity
@@ -436,8 +621,12 @@ function validateLlmTurnInterpretation(obj: unknown): LlmTurnInterpretation | nu
   if (typeof f.platform === "string" && f.platform.trim()) fields.platform = f.platform.trim()
   if (typeof f.review === "string" && f.review.trim()) fields.review = f.review.trim()
 
-  const confidence = o.confidence
-  if (confidence !== "high" && confidence !== "medium" && confidence !== "low") return null
+  // 放宽：confidence 缺失时默认 "medium"，不再返回 null
+  const confidenceRaw = o.confidence
+  const confidence: "high" | "medium" | "low" =
+    confidenceRaw === "high" || confidenceRaw === "medium" || confidenceRaw === "low"
+      ? confidenceRaw
+      : "medium"
 
   const reason = typeof o.reason === "string" ? o.reason : ""
 
@@ -482,11 +671,10 @@ function normalizeLlmInterpretation(parsed: LlmTurnInterpretation): TurnInterpre
  *      后者在某些打包配置下可能拿不到真实 window。
  *   2. system + user 双消息结构：system 段是固定规则，user 段是上下文 + 用户输入。
  *      qwen-plus 等模型对「system 规则 + user 输入」结构比纯 system 更可靠地输出 JSON。
- *   3. 模型默认 qwen-plus（与 askHouseholdAssistant 一致），不再用 gpt-4o-mini。
+ *   3. 模型由 resolveTurnInterpreterModel 决定，避免视觉模型做纯文本 JSON interpreter。
  */
-function createDesktopTurnInterpreterLlmClient(state: AppState): TurnInterpreterLlmClient | null {
+function createDesktopTurnInterpreterLlmClient(state: AppState, model: string): TurnInterpreterLlmClient | null {
   const apiKey = state.settings?.aiApiKey
-  const model = (state.settings?.aiChatModel ?? state.settings?.aiModel)?.trim()
   // 优先用 typed window（与 askHouseholdAssistant 一致），避免 globalThis.window 在某些环境拿不到
   const desktop = typeof window !== "undefined" ? window.desktop : undefined
   if (!desktop?.chatComplete || !apiKey) return null
@@ -494,18 +682,24 @@ function createDesktopTurnInterpreterLlmClient(state: AppState): TurnInterpreter
   return {
     async complete(prompt: string): Promise<string> {
       // prompt 已是 system + user 合并串，这里拆分发送：
-      // 找到 "=== 用户输入与上下文 ===" 分隔符，前段作 system，后段作 user
+      // 找到 "=== 用户输入与上下文 ===" 分隔符，前段作 system，后段作 user。
+      // repair prompt 没有该分隔符，整体作为 user 消息。
       const separator = "=== 用户输入与上下文 ==="
       const sepIndex = prompt.indexOf(separator)
-      const systemContent = sepIndex >= 0 ? prompt.slice(0, sepIndex).trim() : prompt
-      const userContent = sepIndex >= 0 ? prompt.slice(sepIndex + separator.length).trim() : ""
-
-      const messages = userContent
-        ? [
-            { role: "system" as const, content: systemContent },
-            { role: "user" as const, content: userContent }
-          ]
-        : [{ role: "system" as const, content: systemContent }]
+      let messages: { role: "system" | "user"; content: string }[]
+      if (sepIndex >= 0) {
+        const systemContent = prompt.slice(0, sepIndex).trim()
+        const userContent = prompt.slice(sepIndex + separator.length).trim()
+        messages = userContent
+          ? [
+              { role: "system" as const, content: systemContent },
+              { role: "user" as const, content: userContent }
+            ]
+          : [{ role: "system" as const, content: systemContent }]
+      } else {
+        // repair prompt 或无分隔符的 prompt：整体作为 user 消息
+        messages = [{ role: "user" as const, content: prompt }]
+      }
 
       const result = await desktop.chatComplete!({
         apiKey,

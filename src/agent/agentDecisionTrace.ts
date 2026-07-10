@@ -1,19 +1,114 @@
 /**
- * AgentDecisionTrace：dev-only 决策追踪（阶段 2C 复盘）
+ * AgentDecisionTrace：dev-only 决策追踪（贯穿 decide → interpretAndRoute → askTurnInterpreterLlm / askHouseholdAssistant）。
  *
- * 真实窗口中 pendingCollection 下输入「拼夕夕 / PDD / p'd'd」未被识别为平台补充，
- * mock 测试却通过。本模块记录 decideSync → interpretAndRoute → askTurnInterpreterLlm
- * 全链路中间状态，便于人工验收时在 console / window.__agentLastTrace 中定位断点。
+ * 每条用户输入对应一条 trace，记录 9 个字段：
+ *   1. userInput          用户原始输入
+ *   2. currentState       当前会话 pending 上下文（pendingPlan / pendingDraft / pendingCollection / pendingBatch）
+ *   3. routeDecision      命中的 handler / 规则 / 是否被本地规则提前拦截 / 是否走向 route_to_llm
+ *   4. llmRequest         发给 LLM 的核心 prompt 与上下文摘要
+ *   5. llmResponse        LLM 原始返回文本
+ *   6. parseResult        LLM 输出解析后的结构化结果
+ *   7. validationResult   validator 是否通过；失败时给出 rejectReason
+ *   8. finalDecision      最终采取的动作（answer / confirm / writeDraft / fallback / needLlm ...）
+ *   9. finalMessage       最终展示给用户的回复（不截断，便于复制给 reviewer）
  *
  * 设计原则：
- *   1. 纯数据结构，不依赖 React / DOM。orchestrator 填充字段，App.tsx 读取并暴露。
- *   2. 不影响正式生产 UI，不改变用户界面。仅 dev 环境或 localStorage.agentDebug="1" 时 console.info。
+ *   1. 纯数据结构，不依赖 React / DOM。orchestrator / App.tsx / askHouseholdAssistant 填充字段。
+ *   2. 不影响正式生产 UI，不改变用户界面。仅 dev 环境或 localStorage.agentDebug="1" 时 console 输出。
  *   3. window.__agentLastTrace 始终暴露最近一条 trace（生产环境也暴露，便于现场调试）。
- *   4. 不写入 state，不写入持久化存储，不发送网络请求。
+ *   4. window.__copyAgentTrace() 返回可复制的完整文本；window.__agentTraceHistory 保留最近 20 条。
+ *   5. 不写入 state，不写入持久化存储，不发送网络请求。
  */
 
 import type { TurnInterpretation } from "./turnInterpretation"
 import type { FocusDecision } from "./focusResolver"
+import type { AgentPlan } from "./actions"
+import type { AgentDraft } from "./drafts"
+import type { DraftCollection } from "./draftCollection"
+
+// ---------- 2. currentState ----------
+
+/** 当前会话 pending 上下文快照（只读，不修改 state）。 */
+export type TraceCurrentState = {
+  hasPendingPlan?: boolean
+  pendingPlanStatus?: string
+  pendingPlanRisk?: string
+  /** 形如 "2 actions: deleteItem(猫砂), deleteCategory(卫生间)" */
+  pendingPlanSummary?: string
+  hasPendingDraft?: boolean
+  pendingDraftSummary?: string
+  hasPendingCollection?: boolean
+  pendingCollectionSummary?: string
+  hasPendingBatch?: boolean
+  pendingBatchCount?: number
+}
+
+// ---------- 3. routeDecision ----------
+
+/** 路由决策：命中哪个 handler / 是否被规则提前拦截 / 是否走向 route_to_llm。 */
+export type TraceRouteDecision = {
+  /** pendingPlan / pendingCollection / pendingBatch / pendingDraft / writeDraft / boundary / needLlm / needTurnInterpreterLlm */
+  handler: string
+  /** 命中的具体规则或分支，如 "awaitingSecondConfirm.isSecondConfirmMatch" / "boundary.casual" / "planner.planOnly" / "focus.route_to_llm" */
+  rule?: string
+  /** true 表示被本地规则提前拦截，未走 LLM */
+  interceptedByRule?: boolean
+  /** true 表示最终走向 route_to_llm（needLlm / needTurnInterpreterLlm） */
+  routeToLlm?: boolean
+  /** needLlm / needTurnInterpreterLlm 时给出的原因 */
+  reason?: string
+}
+
+// ---------- 4. llmRequest ----------
+
+/** 发给 LLM 的请求摘要。区分常规 answer LLM 与 turn interpreter。 */
+export type TraceLlmRequest = {
+  /** answerLlm：常规 askHouseholdAssistant；turnInterpreter：askTurnInterpreterLlm */
+  kind: "answerLlm" | "turnInterpreter"
+  model?: string
+  /** 系统提示预览（前 1500 字符） */
+  systemPromptPreview?: string
+  /** 压缩后传入 LLM 的最近对话条数 */
+  recentMessageCount?: number
+  /** 相关业务事实摘要（前 800 字符） */
+  relevantFactsPreview?: string
+  /** 当前对话焦点 */
+  activeFocus?: string
+  /** 允许的动作 */
+  allowedActions?: string[]
+}
+
+// ---------- 5. llmResponse ----------
+
+/** LLM 原始返回（不截断 content，便于复制给 reviewer 定位问题）。 */
+export type TraceLlmResponse = {
+  ok: boolean
+  content?: string
+  error?: string
+  elapsedMs?: number
+}
+
+// ---------- 6. parseResult ----------
+
+/** parseAgentResponse 解析后的结构化结果。 */
+export type TraceParseResult = {
+  ok: boolean
+  /** 解析出的 kind：queryAnswer / clarification / draft */
+  kind?: string
+  /** 解析失败原因 */
+  error?: string
+}
+
+// ---------- 7. validationResult ----------
+
+/** normalizeLlmResponse 是否通过。 */
+export type TraceValidationResult = {
+  passed: boolean
+  /** 失败原因：normalize_returned_null / parse_failed */
+  rejectReason?: string
+  /** normalize 后的 turn kind */
+  turnKind?: string
+}
 
 /** 完整决策 trace。每条用户输入对应一条。 */
 export type AgentDecisionTrace = {
@@ -21,17 +116,23 @@ export type AgentDecisionTrace = {
   id: string
   /** 创建时间戳 */
   createdAt: number
-  /** 用户这一轮输入原文 */
+  /** 1. 用户这一轮输入原文 */
   userText: string
 
-  /** 当前 pending 上下文快照（只读，不修改 state） */
+  /** 2. 当前 pending 上下文快照（只读，不修改 state） */
+  currentState?: TraceCurrentState
+
+  /** @deprecated 旧字段，仅保留 pendingCollection 子集；新代码请用 currentState。测试仍依赖。 */
   pending: {
     collectionItemName?: string
     collectionStatus?: string
     missingFields?: string[]
   }
 
-  /** 本地 turnInterpretation 解释结果 */
+  /** 3. 路由决策 */
+  routeDecision?: TraceRouteDecision
+
+  /** 本地 turnInterpretation 解释结果（pendingCollection 路径下填充） */
   localInterpretation?: TurnInterpretation
 
   /** 第一次 focusResolver 决策（基于本地解释） */
@@ -47,7 +148,19 @@ export type AgentDecisionTrace = {
   /** decideSync 返回的 decision.kind（在 App.tsx dispatch 之前） */
   decisionBeforeAppDispatch?: string
 
-  /** LLM Turn Interpreter 调用详情 */
+  /** 4. 发给常规 answer LLM 的请求摘要（区别于 llmInterpreter） */
+  llmRequest?: TraceLlmRequest
+
+  /** 5. 常规 answer LLM 的原始返回 */
+  llmResponse?: TraceLlmResponse
+
+  /** 6. parseAgentResponse 解析结果 */
+  parseResult?: TraceParseResult
+
+  /** 7. normalizeLlmResponse 校验结果 */
+  validationResult?: TraceValidationResult
+
+  /** LLM Turn Interpreter 调用详情（pendingCollection 下本地低置信时触发） */
   llmInterpreter?: {
     /** 是否应该调用（即 decideSync 返回 needTurnInterpreterLlm） */
     shouldCall: boolean
@@ -71,6 +184,16 @@ export type AgentDecisionTrace = {
     rejected?: boolean
     /** 拒绝原因 */
     rejectReason?: string
+    /** validator 放宽后的 warning（如 confidence 缺失默认 medium） */
+    validationWarning?: string
+    /** 是否尝试过一次 JSON repair retry */
+    repairAttempted?: boolean
+    /** repair retry 的 LLM 原始返回文本（前 2000 字符） */
+    repairRawResponse?: string
+    /** repair retry 的 parse 结果（可能为 null） */
+    repairParsed?: unknown
+    /** repair retry 仍被拒绝时的 rejectReason；undefined 表示 repair 成功或未尝试 */
+    repairRejectReason?: string
   }
 
   /** 第二次 focusResolver 决策（基于 LLM 解释） */
@@ -79,14 +202,20 @@ export type AgentDecisionTrace = {
   /** 合成输入（如「拼多多」），供 handlePendingCollectionIntent 复用 */
   synthesizedInput?: string
 
-  /** 最终 decision */
+  /** 8. 最终 decision */
   finalDecision?: {
     kind: string
     turnKind?: string
-    /** 最终 turn 的 message 预览（前 300 字符） */
+    /** 最终 turn 的 message 预览（前 300 字符），向后兼容用；完整文本见 finalMessage */
     message?: string
   }
+
+  /** 9. 最终展示给用户的完整回复（不截断，便于复制给 reviewer） */
+  finalMessage?: string
 }
+
+/** trace 历史上限（window.__agentTraceHistory） */
+const TRACE_HISTORY_LIMIT = 20
 
 /**
  * 判断 trace 是否应该输出到 console。
@@ -109,18 +238,22 @@ export function isTraceEnabled(): boolean {
 }
 
 /**
- * 创建一条新的 trace。仅初始化 id / createdAt / userText / pending，
- * 其他字段由 orchestrator 在执行过程中逐步填充。
+ * 创建一条新的 trace。仅初始化 id / createdAt / userText / pending / currentState，
+ * 其他字段由 orchestrator / App.tsx / askHouseholdAssistant 在执行过程中逐步填充。
+ *
+ * currentState 为可选第三参；不传时仅保留旧 pending 子集（向后兼容现有测试）。
  */
 export function createTrace(
   userText: string,
-  pending: AgentDecisionTrace["pending"]
+  pending: AgentDecisionTrace["pending"],
+  currentState?: TraceCurrentState
 ): AgentDecisionTrace {
   return {
     id: generateTraceId(),
     createdAt: Date.now(),
     userText,
-    pending
+    pending,
+    currentState
   }
 }
 
@@ -130,20 +263,158 @@ function generateTraceId(): string {
 }
 
 /**
- * 把 trace 暴露到 window.__agentLastTrace，并在 dev 环境下 console.info。
+ * 从当前 pending 对象构建 currentState 快照（纯函数，不修改入参）。
+ * App.tsx 在调用 createTrace 前用本函数把 pendingPlan/Draft/Collection/Batch 转成可读摘要。
+ */
+export function buildTraceCurrentState(params: {
+  pendingPlan?: AgentPlan | null
+  pendingDraft?: AgentDraft | null
+  pendingCollection?: DraftCollection | null
+  pendingBatch?: AgentDraft[] | null
+}): TraceCurrentState {
+  const state: TraceCurrentState = {}
+  if (params.pendingPlan) {
+    state.hasPendingPlan = true
+    state.pendingPlanStatus = params.pendingPlan.status
+    state.pendingPlanRisk = params.pendingPlan.risk
+    state.pendingPlanSummary = summarizePendingPlan(params.pendingPlan)
+  }
+  if (params.pendingDraft) {
+    state.hasPendingDraft = true
+    state.pendingDraftSummary = summarizePendingDraft(params.pendingDraft)
+  }
+  if (params.pendingCollection) {
+    state.hasPendingCollection = true
+    state.pendingCollectionSummary = summarizePendingCollection(params.pendingCollection)
+  }
+  if (params.pendingBatch && params.pendingBatch.length > 0) {
+    state.hasPendingBatch = true
+    state.pendingBatchCount = params.pendingBatch.length
+  }
+  return state
+}
+
+/** pendingPlan 摘要：动作数 + 每条动作简述。 */
+function summarizePendingPlan(plan: AgentPlan): string {
+  const actions = plan.actions.map((a) => summarizeActionType(a))
+  return `${actions.length} actions: ${actions.join(", ")}`
+}
+
+function summarizeActionType(action: import("./actions").AgentAction): string {
+  switch (action.type) {
+    case "createCategory": return `createCategory(${action.name})`
+    case "createItem": return `createItem(${action.name})`
+    case "updateItem": return `updateItem(${action.itemName || action.itemId})`
+    case "addPurchaseOption": return `addPurchaseOption(${action.productName})`
+    case "recordRestock": return `recordRestock(${action.itemName})`
+    case "updateRestockRecord": return `updateRestockRecord(${action.itemId})`
+    case "setMonthlyBudget": return `setMonthlyBudget(¥${action.amount})`
+    case "renameCategory": return `renameCategory(${action.oldName}→${action.newName})`
+    case "moveItem": return `moveItem(${action.itemName || action.itemId}→${action.targetCategory})`
+    case "updateItemUnit": return `updateItemUnit(${action.itemName || action.itemId}→${action.unit})`
+    case "updateItemReminder": return `updateItemReminder(${action.itemName || action.itemId},${action.bufferDays}d)`
+    case "updatePurchaseOption": return `updatePurchaseOption(${action.productName || action.optionId})`
+    case "setDefaultPurchaseOption": return `setDefaultPurchaseOption(${action.productName || action.optionId})`
+    case "deletePurchaseOption": return `deletePurchaseOption(${action.productName || action.optionId})`
+    case "deleteRestockRecord": return `deleteRestockRecord(${action.itemName})`
+    case "deleteItem": return `deleteItem(${action.itemName})`
+    case "deleteCategory": return `deleteCategory(${action.categoryName})`
+    default: return "(unknown)"
+  }
+}
+
+/** pendingDraft 摘要：kind + 物品名 + 关键字段。 */
+function summarizePendingDraft(draft: AgentDraft): string {
+  if (draft.kind === "restock") {
+    return `restock(${draft.itemName}, qty=${draft.qty ?? "?"}${draft.unit ? draft.unit : ""}${draft.platform ? `, ${draft.platform}` : ""}${draft.price !== undefined ? `, ¥${draft.price}` : ""})`
+  }
+  if (draft.kind === "createItem") {
+    return `createItem(${draft.itemName}, ${draft.category})`
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return `createItemWithRestock(${draft.item.itemName}, ${draft.item.category})`
+  }
+  if (draft.kind === "addPurchaseOption") {
+    return `addPurchaseOption(${draft.productName})`
+  }
+  return "unknown"
+}
+
+/** pendingCollection 摘要：物品名 + 缺失字段。 */
+function summarizePendingCollection(collection: DraftCollection): string {
+  const draft = collection.draft
+  let itemName: string | undefined
+  if (draft.kind === "restock") itemName = draft.itemName
+  else if (draft.kind === "createItemWithRestock") itemName = draft.item.itemName
+  const missing = [...collection.requiredMissingSlots, ...collection.qualityMissingSlots]
+  return `${itemName ?? "?"}, completeness=${collection.completeness}, missing=[${missing.join(",") || "none"}]`
+}
+
+/**
+ * 在 orchestrator 各决策点设置 routeDecision。trace 为 undefined 时安全跳过。
+ */
+export function setRouteDecision(
+  trace: AgentDecisionTrace | undefined,
+  handler: string,
+  opts?: { rule?: string; interceptedByRule?: boolean; routeToLlm?: boolean; reason?: string }
+): void {
+  if (!trace) return
+  trace.routeDecision = {
+    handler,
+    rule: opts?.rule,
+    interceptedByRule: opts?.interceptedByRule,
+    routeToLlm: opts?.routeToLlm,
+    reason: opts?.reason
+  }
+}
+
+/**
+ * 设置最终 decision 与完整 finalMessage（集中处理，避免散落 slice(0,300)）。
+ * finalDecision.message 保留 300 字符预览以兼容旧测试；finalMessage 保留完整文本。
+ */
+export function setFinalDecision(
+  trace: AgentDecisionTrace | undefined,
+  opts: {
+    kind: string
+    turnKind?: string
+    /** 完整最终消息（不截断） */
+    message?: string
+  }
+): void {
+  if (!trace) return
+  trace.finalDecision = {
+    kind: opts.kind,
+    turnKind: opts.turnKind,
+    message: opts.message ? opts.message.slice(0, 300) : undefined
+  }
+  if (opts.message !== undefined) {
+    trace.finalMessage = opts.message
+  }
+}
+
+/**
+ * 把 trace 暴露到 window.__agentLastTrace，并追加到 __agentTraceHistory（上限 20），
+ * 同时注册 window.__copyAgentTrace。dev 环境下 console 输出可复制的完整 trace。
  *
- * 注意：window.__agentLastTrace 始终暴露（即使生产环境），便于现场调试。
- * console.info 仅在 isTraceEnabled() 为 true 时输出，避免污染生产 console。
+ * 注意：window.__agentLastTrace / __copyAgentTrace / __agentTraceHistory 始终暴露（即使生产环境），
+ * 便于现场调试。console 输出仅在 isTraceEnabled() 为 true 时执行，避免污染生产 console。
  */
 export function commitTrace(trace: AgentDecisionTrace): void {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const g = (globalThis as any)
-    if (g?.window) {
-      g.window.__agentLastTrace = trace
-    } else {
-      // Node 测试环境：暴露到 globalThis，便于测试读取
-      g.__agentLastTrace = trace
+    const target = g?.window ?? g
+    if (target) {
+      target.__agentLastTrace = trace
+      target.__copyAgentTrace = () => formatTraceForCopy(trace)
+      // 追加到历史（上限 TRACE_HISTORY_LIMIT）
+      if (!Array.isArray(target.__agentTraceHistory)) {
+        target.__agentTraceHistory = []
+      }
+      target.__agentTraceHistory.push(trace)
+      if (target.__agentTraceHistory.length > TRACE_HISTORY_LIMIT) {
+        target.__agentTraceHistory.splice(0, target.__agentTraceHistory.length - TRACE_HISTORY_LIMIT)
+      }
     }
   } catch {
     // 忽略：暴露失败不应影响主流程
@@ -151,7 +422,7 @@ export function commitTrace(trace: AgentDecisionTrace): void {
 
   if (isTraceEnabled()) {
     // eslint-disable-next-line no-console
-    console.info("[agentDecisionTrace]", summarizeTrace(trace))
+    console.info("[agentDecisionTrace]", summarizeTrace(trace), "\n— 完整可复制 trace：调用 copy(__agentLastTrace) 或 __copyAgentTrace()")
   }
 }
 
@@ -162,9 +433,16 @@ function summarizeTrace(trace: AgentDecisionTrace): {
   id: string
   userText: string
   pendingItem?: string
+  currentState?: TraceCurrentState
+  routeHandler?: string
+  routeRule?: string
   localIntent?: string
   firstFocus?: string
   decisionBeforeDispatch?: string
+  llmRequestKind?: string
+  llmResponseOk?: boolean
+  parseOk?: boolean
+  validationPassed?: boolean
   llmCalled?: boolean
   llmRejected?: boolean
   llmRejectReason?: string
@@ -177,9 +455,16 @@ function summarizeTrace(trace: AgentDecisionTrace): {
     id: trace.id,
     userText: trace.userText,
     pendingItem: trace.pending.collectionItemName,
+    currentState: trace.currentState,
+    routeHandler: trace.routeDecision?.handler,
+    routeRule: trace.routeDecision?.rule,
     localIntent: trace.localInterpretation?.intent,
     firstFocus: trace.firstFocusDecision?.focus,
     decisionBeforeDispatch: trace.decisionBeforeAppDispatch,
+    llmRequestKind: trace.llmRequest?.kind,
+    llmResponseOk: trace.llmResponse?.ok,
+    parseOk: trace.parseResult?.ok,
+    validationPassed: trace.validationResult?.passed,
     llmCalled: trace.llmInterpreter?.called,
     llmRejected: trace.llmInterpreter?.rejected,
     llmRejectReason: trace.llmInterpreter?.rejectReason,
@@ -188,6 +473,163 @@ function summarizeTrace(trace: AgentDecisionTrace): {
     finalKind: trace.finalDecision?.kind,
     finalTurnKind: trace.finalDecision?.turnKind
   }
+}
+
+/**
+ * 把 trace 格式化成可复制的纯文本（含全部 9 个字段），供外部 reviewer 判断问题出在
+ * route / LLM / validator / state 残留。
+ */
+export function formatTraceForCopy(trace: AgentDecisionTrace): string {
+  const lines: string[] = []
+  lines.push("==================== AGENT DECISION TRACE ====================")
+  lines.push(`id: ${trace.id}`)
+  lines.push(`createdAt: ${new Date(trace.createdAt).toISOString()} (${trace.createdAt})`)
+  lines.push("")
+  lines.push("【1. userInput】")
+  lines.push(trace.userText)
+  lines.push("")
+  lines.push("【2. currentState】")
+  if (trace.currentState) {
+    const cs = trace.currentState
+    const parts: string[] = []
+    if (cs.hasPendingPlan) parts.push(`pendingPlan(status=${cs.pendingPlanStatus ?? "?"}, risk=${cs.pendingPlanRisk ?? "?"}, ${cs.pendingPlanSummary ?? ""})`)
+    if (cs.hasPendingDraft) parts.push(`pendingDraft(${cs.pendingDraftSummary ?? "?"})`)
+    if (cs.hasPendingCollection) parts.push(`pendingCollection(${cs.pendingCollectionSummary ?? "?"})`)
+    if (cs.hasPendingBatch) parts.push(`pendingBatch(count=${cs.pendingBatchCount ?? "?"})`)
+    if (parts.length === 0) parts.push("(no pending)")
+    lines.push(parts.join(" | "))
+  } else {
+    lines.push("(not captured)")
+  }
+  // 兼容旧 pending 字段
+  if (trace.pending && (trace.pending.collectionItemName || trace.pending.missingFields)) {
+    lines.push(`  [legacy pending] item=${trace.pending.collectionItemName ?? "-"}, status=${trace.pending.collectionStatus ?? "-"}, missing=[${trace.pending.missingFields?.join(",") ?? ""}]`)
+  }
+  lines.push("")
+  lines.push("【3. routeDecision】")
+  if (trace.routeDecision) {
+    const rd = trace.routeDecision
+    lines.push(`handler=${rd.handler}`)
+    if (rd.rule) lines.push(`rule=${rd.rule}`)
+    if (rd.interceptedByRule !== undefined) lines.push(`interceptedByRule=${rd.interceptedByRule}`)
+    if (rd.routeToLlm !== undefined) lines.push(`routeToLlm=${rd.routeToLlm}`)
+    if (rd.reason) lines.push(`reason=${rd.reason}`)
+  } else {
+    lines.push("(not captured)")
+  }
+  if (trace.decisionBeforeAppDispatch) {
+    lines.push(`decisionBeforeAppDispatch=${trace.decisionBeforeAppDispatch}`)
+  }
+  lines.push("")
+  lines.push("【3b. localInterpretation / focus (pendingCollection 路径)】")
+  if (trace.localInterpretation) {
+    lines.push(`localInterpretation.intent=${trace.localInterpretation.intent}`)
+    lines.push(`localInterpretation.fields=${JSON.stringify(trace.localInterpretation.fields)}`)
+    lines.push(`localInterpretation.confidence=${trace.localInterpretation.confidence ?? "?"}`)
+  } else {
+    lines.push("localInterpretation=(none)")
+  }
+  if (trace.firstFocusDecision) {
+    lines.push(`firstFocus=${trace.firstFocusDecision.focus}${trace.firstFocusDecision.reason ? ` (${trace.firstFocusDecision.reason})` : ""}`)
+  }
+  if (trace.collectionFallback) {
+    lines.push(`collectionFallback={tried=${trace.collectionFallback.tried}, producedTurn=${trace.collectionFallback.producedTurn}, turnKind=${trace.collectionFallback.turnKind ?? "?"}}`)
+  }
+  lines.push("")
+  lines.push("【4. llmRequest】")
+  if (trace.llmRequest) {
+    const r = trace.llmRequest
+    lines.push(`kind=${r.kind}`)
+    if (r.model) lines.push(`model=${r.model}`)
+    if (r.activeFocus) lines.push(`activeFocus=${r.activeFocus}`)
+    if (r.recentMessageCount !== undefined) lines.push(`recentMessageCount=${r.recentMessageCount}`)
+    if (r.allowedActions) lines.push(`allowedActions=[${r.allowedActions.join(", ")}]`)
+    if (r.relevantFactsPreview) {
+      lines.push("relevantFactsPreview:")
+      lines.push(indent(r.relevantFactsPreview))
+    }
+    if (r.systemPromptPreview) {
+      lines.push("systemPromptPreview:")
+      lines.push(indent(r.systemPromptPreview))
+    }
+  } else if (trace.llmInterpreter) {
+    lines.push(`(turnInterpreter) shouldCall=${trace.llmInterpreter.shouldCall}, called=${trace.llmInterpreter.called}, model=${trace.llmInterpreter.model ?? "?"}`)
+    if (trace.llmInterpreter.promptPreview) {
+      lines.push("promptPreview:")
+      lines.push(indent(trace.llmInterpreter.promptPreview))
+    }
+  } else {
+    lines.push("(no LLM call)")
+  }
+  lines.push("")
+  lines.push("【5. llmResponse】")
+  if (trace.llmResponse) {
+    const r = trace.llmResponse
+    lines.push(`ok=${r.ok}, elapsedMs=${r.elapsedMs ?? "?"}`)
+    if (r.error) lines.push(`error=${r.error}`)
+    if (r.content !== undefined) {
+      lines.push("content:")
+      lines.push(indent(r.content))
+    }
+  } else if (trace.llmInterpreter?.called) {
+    lines.push(`(turnInterpreter) rawResponse:`)
+    lines.push(indent(trace.llmInterpreter.rawResponse ?? "(empty)"))
+  } else {
+    lines.push("(no LLM response)")
+  }
+  lines.push("")
+  lines.push("【6. parseResult】")
+  if (trace.parseResult) {
+    lines.push(`ok=${trace.parseResult.ok}, kind=${trace.parseResult.kind ?? "?"}`)
+    if (trace.parseResult.error) lines.push(`error=${trace.parseResult.error}`)
+  } else if (trace.llmInterpreter) {
+    lines.push(`(turnInterpreter) parsed=${trace.llmInterpreter.parsed ? JSON.stringify(trace.llmInterpreter.parsed) : "null"}`)
+    if (trace.llmInterpreter.normalizedInterpretation) {
+      lines.push(`normalizedInterpretation=${JSON.stringify(trace.llmInterpreter.normalizedInterpretation)}`)
+    }
+  } else {
+    lines.push("(not captured)")
+  }
+  lines.push("")
+  lines.push("【7. validationResult】")
+  if (trace.validationResult) {
+    lines.push(`passed=${trace.validationResult.passed}, turnKind=${trace.validationResult.turnKind ?? "?"}`)
+    if (trace.validationResult.rejectReason) lines.push(`rejectReason=${trace.validationResult.rejectReason}`)
+  } else if (trace.llmInterpreter) {
+    lines.push(`(turnInterpreter) rejected=${trace.llmInterpreter.rejected}, rejectReason=${trace.llmInterpreter.rejectReason ?? "?"}`)
+  } else {
+    lines.push("(not captured)")
+  }
+  if (trace.llmInterpreter?.rejected) {
+    lines.push(`llmInterpreter.rejectReason=${trace.llmInterpreter.rejectReason}`)
+  }
+  if (trace.secondFocusDecision) {
+    lines.push(`secondFocus=${trace.secondFocusDecision.focus}${trace.secondFocusDecision.reason ? ` (${trace.secondFocusDecision.reason})` : ""}`)
+  }
+  if (trace.synthesizedInput) {
+    lines.push(`synthesizedInput=${trace.synthesizedInput}`)
+  }
+  lines.push("")
+  lines.push("【8. finalDecision】")
+  if (trace.finalDecision) {
+    lines.push(`kind=${trace.finalDecision.kind}, turnKind=${trace.finalDecision.turnKind ?? "?"}`)
+  } else {
+    lines.push("(not captured)")
+  }
+  lines.push("")
+  lines.push("【9. finalMessage】")
+  if (trace.finalMessage !== undefined) {
+    lines.push(trace.finalMessage)
+  } else {
+    lines.push("(not captured; preview: " + (trace.finalDecision?.message ?? "none") + ")")
+  }
+  lines.push("==================== END TRACE ====================")
+  return lines.join("\n")
+}
+
+/** 缩进辅助：每行前加 2 个空格。 */
+function indent(text: string): string {
+  return text.split("\n").map((l) => `  ${l}`).join("\n")
 }
 
 /** 读取最近一条 trace（用于测试断言）。 */
@@ -201,13 +643,31 @@ export function peekLastTrace(): AgentDecisionTrace | null {
   }
 }
 
-/** 仅测试用：清空 lastTrace。 */
+/** 读取 trace 历史（最近 TRACE_HISTORY_LIMIT 条）。 */
+export function peekTraceHistory(): AgentDecisionTrace[] {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const g = (globalThis as any)
+    const target = g?.window ?? g
+    return Array.isArray(target?.__agentTraceHistory) ? target.__agentTraceHistory as AgentDecisionTrace[] : []
+  } catch {
+    return []
+  }
+}
+
+/** 仅测试用：清空 lastTrace 与 history。 */
 export function resetLastTraceForTest(): void {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const g = (globalThis as any)
-    if (g?.window) delete g.window.__agentLastTrace
+    if (g?.window) {
+      delete g.window.__agentLastTrace
+      delete g.window.__copyAgentTrace
+      delete g.window.__agentTraceHistory
+    }
     delete g.__agentLastTrace
+    delete g.__copyAgentTrace
+    delete g.__agentTraceHistory
   } catch {
     // ignore
   }

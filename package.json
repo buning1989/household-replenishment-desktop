@@ -18,7 +18,7 @@
     "package:win": "npm run test && npm run build && electron-builder --win --x64",
     "test": "node --test tests/*.mjs",
     "smoke:agent-llm": "node scripts/smoke-agent-llm-fallback.mjs",
-    "smoke:agent-llm:real": "SMOKE_REAL_LLM=1 node scripts/smoke-agent-llm-fallback.mjs",
+    "smoke:agent-llm:real": "node scripts/smoke-agent-llm-real.mjs",
     "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64"
   },
   "dependencies": {

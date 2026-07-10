@@ -24,7 +24,8 @@ registerHooks({
   }
 })
 
-const { parseLlmTurnInterpretation, askTurnInterpreterLlm } = await import("../src/agent/turnInterpreterLlm.ts")
+const { parseLlmTurnInterpretation, askTurnInterpreterLlm, resolveTurnInterpreterModel } = await import("../src/agent/turnInterpreterLlm.ts")
+const { createTrace } = await import("../src/agent/agentDecisionTrace.ts")
 const { buildLocalDraftFromText } = await import("../src/agent/drafts.ts")
 const { createDraftCollection } = await import("../src/agent/draftCollection.ts")
 const { buildChatDateContext } = await import("../src/llm/householdChat.ts")
@@ -117,15 +118,17 @@ test("4. parseLlmTurnInterpretation 非法 intent 返回 null", () => {
   assert.equal(parseLlmTurnInterpretation(raw), null)
 })
 
-// ---------- 5. parseLlmTurnInterpretation：缺少 confidence ----------
+// ---------- 5. parseLlmTurnInterpretation：缺少 confidence → 默认 medium（放宽） ----------
 
-test("5. parseLlmTurnInterpretation 缺少 confidence 返回 null", () => {
+test("5. parseLlmTurnInterpretation 缺少 confidence 默认 medium（放宽）", () => {
   const raw = JSON.stringify({
     intent: "smalltalk",
     fields: {},
     reason: "test"
   })
-  assert.equal(parseLlmTurnInterpretation(raw), null)
+  const parsed = parseLlmTurnInterpretation(raw)
+  assert.ok(parsed, "放宽后应返回对象而非 null")
+  assert.equal(parsed.confidence, "medium", "缺失 confidence 应默认 medium")
 })
 
 // ---------- 6. askTurnInterpreterLlm：supplement + platform=拼多多 ----------
@@ -312,4 +315,238 @@ test("14. askTurnInterpreterLlm 返回 correct_current_collection", async () => 
   assert.ok(result)
   assert.equal(result.intent, "correct_current_collection")
   assert.equal(result.fields.itemName, "五常大米")
+})
+
+// ---------- 15. resolveTurnInterpreterModel：aiChatModel 优先 ----------
+
+test("15. resolveTurnInterpreterModel 优先返回 aiChatModel", () => {
+  assert.equal(
+    resolveTurnInterpreterModel({ aiChatModel: "qwen-max", aiModel: "qwen-plus" }),
+    "qwen-max",
+    "aiChatModel 非空时应直接返回"
+  )
+})
+
+// ---------- 16. resolveTurnInterpreterModel：视觉模型被拒绝 ----------
+
+test("16. resolveTurnInterpreterModel 拒绝视觉模型 fallback 到 qwen-plus", () => {
+  // aiChatModel 为空，aiModel 是视觉模型 → 不允许，fallback qwen-plus
+  assert.equal(
+    resolveTurnInterpreterModel({ aiChatModel: "", aiModel: "qwen3-vl-plus" }),
+    "qwen-plus",
+    "qwen3-vl-plus 含 vl 关键词，应被拒绝"
+  )
+  assert.equal(
+    resolveTurnInterpreterModel({ aiChatModel: undefined, aiModel: "some-vision-model" }),
+    "qwen-plus",
+    "vision 关键词应被拒绝"
+  )
+  assert.equal(
+    resolveTurnInterpreterModel({ aiChatModel: undefined, aiModel: "视觉模型A" }),
+    "qwen-plus",
+    "「视觉」中文关键词应被拒绝"
+  )
+})
+
+// ---------- 17. resolveTurnInterpreterModel：aiModel 非视觉可作为 fallback ----------
+
+test("17. resolveTurnInterpreterModel 非视觉 aiModel 可作为 fallback", () => {
+  assert.equal(
+    resolveTurnInterpreterModel({ aiChatModel: "", aiModel: "qwen-turbo" }),
+    "qwen-turbo",
+    "非视觉 aiModel 可作为 fallback"
+  )
+})
+
+// ---------- 18. resolveTurnInterpreterModel：全空默认 qwen-plus ----------
+
+test("18. resolveTurnInterpreterModel 全空默认 qwen-plus", () => {
+  assert.equal(resolveTurnInterpreterModel({}), "qwen-plus")
+  assert.equal(resolveTurnInterpreterModel(undefined), "qwen-plus")
+})
+
+// ---------- 19. parseLlmTurnInterpretation：fields 缺失默认 {}（放宽） ----------
+
+test("19. parseLlmTurnInterpretation fields 缺失默认空对象（放宽）", () => {
+  const raw = JSON.stringify({
+    intent: "smalltalk",
+    confidence: "medium",
+    reason: "test"
+  })
+  const parsed = parseLlmTurnInterpretation(raw)
+  assert.ok(parsed, "放宽后 fields 缺失应返回对象而非 null")
+  assert.ok(parsed.fields, "fields 应被填成对象")
+  assert.equal(Object.keys(parsed.fields).length, 0, "fields 应为空对象")
+})
+
+// ---------- 20. parseLlmTurnInterpretation：fields 不是对象默认 {} ----------
+
+test("20. parseLlmTurnInterpretation fields 非对象默认空对象（放宽）", () => {
+  const raw = JSON.stringify({
+    intent: "smalltalk",
+    fields: "不是对象",
+    confidence: "medium",
+    reason: "test"
+  })
+  const parsed = parseLlmTurnInterpretation(raw)
+  assert.ok(parsed, "放宽后 fields 非对象应返回对象而非 null")
+  assert.equal(Object.keys(parsed.fields).length, 0)
+})
+
+// ---------- 21. askTurnInterpreterLlm：repair retry 成功 ----------
+
+test("21. askTurnInterpreterLlm 第一次非法 JSON 第二次合法 → repair 成功", async () => {
+  const state = makeState()
+  const collection = buildWipesCollection()
+  const trace = createTrace("pdd")
+  let callCount = 0
+  const client = {
+    async complete(_prompt) {
+      callCount++
+      if (callCount === 1) {
+        // 第一次返回被 markdown + 自然语言包裹的非纯 JSON，但仍能被 parse 提取
+        // 这里故意返回完全无法解析的内容，触发 repair
+        return "抱歉，我理解你的意思是：拼多多。但是这不是 JSON 格式。"
+      }
+      // 第二次 repair：返回合法 JSON
+      return JSON.stringify({
+        intent: "supplement_current_collection",
+        fields: { platform: "拼多多" },
+        confidence: "high",
+        reason: "pdd 是拼多多缩写"
+      })
+    }
+  }
+  const result = await askTurnInterpreterLlm({
+    text: "pdd",
+    pendingCollection: collection,
+    state,
+    itemViews: [],
+    dateContext: DATE_CONTEXT,
+    client,
+    trace
+  })
+  assert.ok(result, "repair 后应返回 TurnInterpretation")
+  assert.equal(result.intent, "supplement_current_collection")
+  assert.equal(result.fields.platform, "拼多多")
+  assert.equal(callCount, 2, "应调用 client 两次（首次 + repair）")
+  assert.equal(trace.llmInterpreter.repairAttempted, true, "trace 应记录 repairAttempted")
+  assert.equal(trace.llmInterpreter.rejected, false, "repair 成功后 rejected 应为 false")
+  assert.ok(trace.llmInterpreter.repairRawResponse, "trace 应记录 repairRawResponse")
+})
+
+// ---------- 22. askTurnInterpreterLlm：repair retry 仍失败 ----------
+
+test("22. askTurnInterpreterLlm 两次都非法 JSON → 返回 null + repairRejectReason", async () => {
+  const state = makeState()
+  const collection = buildWipesCollection()
+  const trace = createTrace("pdd")
+  let callCount = 0
+  const client = {
+    async complete(_prompt) {
+      callCount++
+      // 两次都返回非 JSON
+      return "这不是 JSON，是一句话。"
+    }
+  }
+  const result = await askTurnInterpreterLlm({
+    text: "pdd",
+    pendingCollection: collection,
+    state,
+    itemViews: [],
+    dateContext: DATE_CONTEXT,
+    client,
+    trace
+  })
+  assert.equal(result, null, "两次都失败应返回 null")
+  assert.equal(callCount, 2, "应调用 client 两次")
+  assert.equal(trace.llmInterpreter.repairAttempted, true)
+  assert.equal(trace.llmInterpreter.rejected, true)
+  assert.equal(trace.llmInterpreter.repairRejectReason, "json_parse_failed", "应记录 repairRejectReason")
+  assert.equal(trace.llmInterpreter.rejectReason, "json_parse_failed")
+})
+
+// ---------- 23. askTurnInterpreterLlm：supplement 空 fields 不 repair ----------
+
+test("23. askTurnInterpreterLlm supplement 空 fields 不触发 repair（业务拒绝不可 repair）", async () => {
+  const state = makeState()
+  const collection = buildWipesCollection()
+  const trace = createTrace("随便")
+  let callCount = 0
+  const client = {
+    async complete(_prompt) {
+      callCount++
+      return JSON.stringify({
+        intent: "supplement_current_collection",
+        fields: {},
+        confidence: "high",
+        reason: "不知道补什么"
+      })
+    }
+  }
+  const result = await askTurnInterpreterLlm({
+    text: "随便",
+    pendingCollection: collection,
+    state,
+    itemViews: [],
+    dateContext: DATE_CONTEXT,
+    client,
+    trace
+  })
+  assert.equal(result, null, "supplement 空 fields 应返回 null")
+  assert.equal(callCount, 1, "业务拒绝不应触发 repair")
+  assert.equal(trace.llmInterpreter.repairAttempted, undefined, "不应记录 repairAttempted")
+  assert.equal(trace.llmInterpreter.rejectReason, "supplement_with_empty_fields")
+})
+
+// ---------- 24. askTurnInterpreterLlm：trace.model 记录最终模型 ----------
+
+test("24. askTurnInterpreterLlm trace.model 记录 resolveTurnInterpreterModel 结果", async () => {
+  const state = makeState({
+    settings: { aiChatModel: "qwen-max", aiApiKey: "k" }
+  })
+  const collection = buildWipesCollection()
+  const trace = createTrace("pdd")
+  const result = await askTurnInterpreterLlm({
+    text: "pdd",
+    pendingCollection: collection,
+    state,
+    itemViews: [],
+    dateContext: DATE_CONTEXT,
+    client: mockClient({
+      intent: "supplement_current_collection",
+      fields: { platform: "拼多多" },
+      confidence: "high",
+      reason: "test"
+    }),
+    trace
+  })
+  assert.ok(result)
+  assert.equal(trace.llmInterpreter.model, "qwen-max", "trace.model 应记录 aiChatModel")
+})
+
+// ---------- 25. askTurnInterpreterLlm：视觉模型 fallback 后 trace.model = qwen-plus ----------
+
+test("25. askTurnInterpreterLlm aiModel 视觉模型时 trace.model = qwen-plus", async () => {
+  const state = makeState({
+    settings: { aiModel: "qwen3-vl-plus", aiApiKey: "k" }
+  })
+  const collection = buildWipesCollection()
+  const trace = createTrace("pdd")
+  const result = await askTurnInterpreterLlm({
+    text: "pdd",
+    pendingCollection: collection,
+    state,
+    itemViews: [],
+    dateContext: DATE_CONTEXT,
+    client: mockClient({
+      intent: "supplement_current_collection",
+      fields: { platform: "拼多多" },
+      confidence: "high",
+      reason: "test"
+    }),
+    trace
+  })
+  assert.ok(result)
+  assert.equal(trace.llmInterpreter.model, "qwen-plus", "视觉模型应 fallback 到 qwen-plus")
 })
