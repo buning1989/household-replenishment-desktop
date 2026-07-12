@@ -814,6 +814,10 @@ export function composeBoundaryAnswer(boundary: ConversationBoundary, text: stri
   }
 
   if (boundary === "casual") {
+    // 问候语：早安/晚安/你好等，给自然回应
+    if (normalized.includes("晚安") || normalized.includes("早安") || normalized.includes("早上好") || normalized.includes("晚上好") || normalized.includes("午安") || normalized.includes("你好")) {
+      return "你好，家里的消耗品我盯着呢。有什么要记的或者想查的，直接说就行。"
+    }
     return "行，你直接说要我看哪件事就行。"
   }
 

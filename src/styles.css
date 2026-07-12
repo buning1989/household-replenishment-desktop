@@ -4319,9 +4319,12 @@ input[aria-invalid="true"] { border-color: var(--urgent); }
 .chat-suggestions {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 8px;
+  margin-bottom: 10px;
 }
 .chat-suggestions button {
+  white-space: nowrap;
   min-height: 34px;
   padding: 0 11px;
   border: 1px solid var(--line);

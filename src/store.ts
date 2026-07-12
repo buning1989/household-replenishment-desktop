@@ -16,8 +16,15 @@ import type {
   ResidentCount,
   RestockEvent
 } from "./types"
+import { isDesktopRuntime } from "./runtime/runtimeBridge"
+import { ensureCompetitionDemoState } from "./demo/competitionDemoState"
 
-const STORAGE_KEY = "household_replenishment_desktop_v1"
+// 运行时隔离：桌面端和 Web 端使用独立 localStorage Key
+// 桌面端：原有 Key，保持不变
+// Web 端：独立 Key，禁止覆盖桌面端数据
+const STORAGE_KEY = isDesktopRuntime
+  ? "household_replenishment_desktop_v1"
+  : "household_replenishment_competition_web_v1"
 
 export type PersistenceIssue = {
   kind: "read" | "write" | "sync"
@@ -348,6 +355,12 @@ function backupCorruptRaw(raw: string): boolean {
 }
 
 export function loadState(): AppState {
+  // Web 首次访问：自动注入比赛 Demo State（桌面端不做任何处理）
+  const demoState = ensureCompetitionDemoState()
+  if (demoState) {
+    return demoState
+  }
+
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (raw) {

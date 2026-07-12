@@ -7,6 +7,7 @@ import type { DraftCollection } from "../agent/draftCollection"
 import type { OrderImportRow } from "../OrderImportReview"
 import { buildManagerObservations, filterUnseenObservations, markObservationsSeen, observationKey, pickObservationByPreference, serializeHouseholdProfile, type ManagerObservation } from "../agent/observations"
 import type { AgentContextPack, ConversationFocus } from "../agent/conversationContext"
+import { chatComplete } from "../runtime/runtimeBridge"
 
 const DEFAULT_CHAT_MODEL = "qwen-plus"
 
@@ -1026,18 +1027,11 @@ export async function askHouseholdAssistant({
   }
 
   const llmStart = Date.now()
-  let result: { ok: true; content: string } | { ok: false; error: string }
-  if (window.desktop?.chatComplete) {
-    result = await window.desktop.chatComplete({
-      apiKey,
-      model: model?.trim() || DEFAULT_CHAT_MODEL,
-      messages: requestMessages
-    })
-  } else if (window.desktop) {
-    result = { ok: false, error: "当前窗口还没有加载家庭问答服务，请关闭并重新启动 403家庭管家后再试。" }
-  } else {
-    result = { ok: false, error: "当前是浏览器预览，无法连接本机对话服务。请在 403家庭管家桌面应用中使用。" }
-  }
+  const result = await chatComplete({
+    apiKey,
+    model: model?.trim() || DEFAULT_CHAT_MODEL,
+    messages: requestMessages
+  })
 
   // 填充 trace.llmResponse（接收后快照，content 不截断）
   if (trace) {

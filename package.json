@@ -8,10 +8,11 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "dev:web": "vite --host 127.0.0.1 --strictPort",
+    "dev:web": "vite --config vite.web.config.ts --host 0.0.0.0",
     "dev:landing": "vite --host 127.0.0.1 --strictPort --open /landing/",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
+    "build:web": "npm run typecheck && vite build --config vite.web.config.ts",
     "build:landing": "vite build --config vite.landing.config.ts",
     "start": "electron .",
     "package:mac": "npm run test && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg",

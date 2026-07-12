@@ -25,8 +25,8 @@ function normalize(text: string): string {
   return text.trim().toLocaleLowerCase("zh-CN")
 }
 
-/** 短闲聊/寒暄/吐槽判定：长度 ≤ 6 且命中关键词 */
-const CASUAL_KEYWORDS = ["哈哈", "好的", "好吧", "行吧", "你真笨", "没事", "随便聊聊", "随便", "嗯嗯", "哦哦", "算了", "谢谢", "辛苦"]
+/** 短闲聊/寒暄/吐槽判定：长度 ≤ 8 且命中关键词 */
+const CASUAL_KEYWORDS = ["哈哈", "好的", "好吧", "行吧", "你真笨", "没事", "随便聊聊", "随便", "嗯嗯", "哦哦", "算了", "谢谢", "辛苦", "晚安", "早安", "早上好", "晚上好", "午安", "你好", " hi"]
 
 /** 身份/元对话关键词 */
 const IDENTITY_KEYWORDS = [

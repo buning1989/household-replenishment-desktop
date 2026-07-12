@@ -23,6 +23,7 @@ import type { DraftCollection } from "./draftCollection"
 import type { AgentPlan } from "./actions"
 import type { TurnInterpretation, TurnIntent } from "./turnInterpretation"
 import type { AgentDecisionTrace } from "./agentDecisionTrace"
+import { chatComplete, requiresUserApiKey } from "../runtime/runtimeBridge"
 
 /**
  * LLM 客户端抽象。complete(prompt) 返回原始文本（应是 JSON）。
@@ -789,21 +790,22 @@ function describeDraftFields(draft: AgentDraft): {
 }
 
 /**
- * 构造真实运行时的 LLM 客户端（接 window.desktop.chatComplete）。
- * 仅在浏览器/Electron 主世界有 desktop bridge 时可用；否则返回 null。
+ * 构造真实运行时的 LLM 客户端（通过 runtime bridge）。
+ * Desktop 模式走 window.desktop.chatComplete IPC；Web 模式走 /api/chat Vercel Function。
  *
  * 注意：
- *   1. 使用 `window.desktop?.chatComplete`（typed global），而非 `(globalThis as any).window`。
- *      后者在某些打包配置下可能拿不到真实 window。
+ *   1. Desktop 模式需要用户填写 API Key；Web 模式由服务端管理，不需要。
  *   2. system + user 双消息结构：system 段是固定规则，user 段是上下文 + 用户输入。
  *      qwen-plus 等模型对「system 规则 + user 输入」结构比纯 system 更可靠地输出 JSON。
  *   3. 模型由 resolveTurnInterpreterModel 决定，避免视觉模型做纯文本 JSON interpreter。
  */
 function createDesktopTurnInterpreterLlmClient(state: AppState, model: string): TurnInterpreterLlmClient | null {
-  const apiKey = state.settings?.aiApiKey
-  // 优先用 typed window（与 askHouseholdAssistant 一致），避免 globalThis.window 在某些环境拿不到
-  const desktop = typeof window !== "undefined" ? window.desktop : undefined
-  if (!desktop?.chatComplete || !apiKey) return null
+  // 非浏览器环境（Node.js 测试等）：无 LLM 调用能力
+  if (typeof window === "undefined") return null
+
+  const apiKey = state.settings?.aiApiKey || ""
+  // Desktop 模式需要用户填写 API Key；Web 模式由服务端管理，不需要
+  if (requiresUserApiKey() && !apiKey.trim()) return null
 
   return {
     async complete(prompt: string): Promise<string> {
@@ -827,7 +829,7 @@ function createDesktopTurnInterpreterLlmClient(state: AppState, model: string): 
         messages = [{ role: "user" as const, content: prompt }]
       }
 
-      const result = await desktop.chatComplete!({
+      const result = await chatComplete({
         apiKey,
         model: model || "qwen-plus",
         messages

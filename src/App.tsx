@@ -59,6 +59,8 @@ import { loadState, persistState, reconcileState, takePendingLoadIssue, type Per
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, ItemComputed, ItemDraft, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
+import { isDesktopRuntime, isWebRuntime, requiresUserApiKey } from "./runtime/runtimeBridge"
+import { resetCompetitionDemoState, clearCompetitionTempState } from "./demo/competitionDemoState"
 
 const EMPTY_DRAFT: ItemDraft = {
   name: "",
@@ -428,44 +430,50 @@ function App() {
     setDemoResetStatus("loading")
     setDemoResetError("")
     try {
-      // 诊断日志：确认 Electron preload 注入状态
-      const desktopKeys = window.desktop ? Object.keys(window.desktop) : []
-      if (import.meta.env.DEV) {
-        console.log("[demo-reset] electron api available:", !!window.desktop)
-        console.log("[demo-reset] reset method available:", !!window.desktop?.resetToDemoState)
-        console.log("[demo-reset] desktop keys:", desktopKeys)
-      }
-      if (!window.desktop?.resetToDemoState) {
-        throw new Error(
-          window.desktop
-            ? `恢复功能未就绪：desktop 上缺少 resetToDemoState（可用方法: ${desktopKeys.join(", ") || "无"}）。请完全退出应用后重新执行 npm run dev。`
-            : "恢复功能未就绪：Electron preload 未注入（window.desktop 不存在）。请完全退出应用后重新执行 npm run dev。"
-        )
-      }
-      const result = await window.desktop.resetToDemoState(state)
-      if (!result.ok) {
-        throw new Error(result.error || "恢复失败")
-      }
-      // 覆盖 localStorage，确保 reconcileState 不会用旧 localStorage 覆盖 Demo State
-      const STORAGE_KEY = "household_replenishment_desktop_v1"
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(result.state))
-      // 清除损坏数据备份键（如有）
-      for (let i = localStorage.length - 1; i >= 0; i--) {
-        const key = localStorage.key(i)
-        if (key && key.startsWith(`${STORAGE_KEY}_corrupt_backup_`)) {
-          localStorage.removeItem(key)
+      if (isDesktopRuntime) {
+        // 桌面端：走 Electron IPC
+        const desktopKeys = window.desktop ? Object.keys(window.desktop) : []
+        if (import.meta.env.DEV) {
+          console.log("[demo-reset] electron api available:", !!window.desktop)
+          console.log("[demo-reset] reset method available:", !!window.desktop?.resetToDemoState)
+          console.log("[demo-reset] desktop keys:", desktopKeys)
         }
+        if (!window.desktop?.resetToDemoState) {
+          throw new Error(
+            window.desktop
+              ? `恢复功能未就绪：desktop 上缺少 resetToDemoState（可用方法: ${desktopKeys.join(", ") || "无"}）。请完全退出应用后重新执行 npm run dev。`
+              : "恢复功能未就绪：Electron preload 未注入（window.desktop 不存在）。请完全退出应用后重新执行 npm run dev。"
+          )
+        }
+        const result = await window.desktop.resetToDemoState(state)
+        if (!result.ok) {
+          throw new Error(result.error || "恢复失败")
+        }
+        const STORAGE_KEY = "household_replenishment_desktop_v1"
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(result.state))
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const key = localStorage.key(i)
+          if (key && key.startsWith(`${STORAGE_KEY}_corrupt_backup_`)) {
+            localStorage.removeItem(key)
+          }
+        }
+        setHouseholdChatMessages([])
+        setHouseholdChatLastQuestion("")
+        seenObservationKeysRef.current = new Set()
+        setState(result.state)
+      } else {
+        // Web 端：使用比赛 Demo State，直接写 localStorage
+        const demoState = resetCompetitionDemoState()
+        const WEB_STORAGE_KEY = "household_replenishment_competition_web_v1"
+        localStorage.setItem(WEB_STORAGE_KEY, JSON.stringify(demoState))
+        clearCompetitionTempState()
+        setHouseholdChatMessages([])
+        setHouseholdChatLastQuestion("")
+        seenObservationKeysRef.current = new Set()
+        setState(demoState)
       }
-      // 清空对话消息和 pending 状态
-      setHouseholdChatMessages([])
-      setHouseholdChatLastQuestion("")
-      seenObservationKeysRef.current = new Set()
-      // 更新 React state
-      setState(result.state)
       setDemoResetStatus("success")
-      // 关闭设置面板
       setSettingsClosing(true)
-      // 短暂延迟后重新加载页面，确保完全干净的状态
       window.setTimeout(() => {
         window.location.reload()
       }, 600)
@@ -951,7 +959,7 @@ function App() {
                 setActiveCategory(category)
               }}
               onOpenSettings={() => setSettingsOpen(true)}
-              orderImageApiKey={state.settings.aiApiKey}
+              orderImageApiKey={requiresUserApiKey() ? state.settings.aiApiKey : "web"}
               orderImageModel={state.settings.aiOrderModel ?? state.settings.aiModel}
               orderRecognitionMode={state.settings.aiOrderMode ?? "accurate"}
               seenObservationKeys={seenObservationKeysRef.current}
@@ -1129,7 +1137,7 @@ function App() {
         onClose={() => setOrderImportOpen(false)}
         items={state.items}
         categories={state.categories}
-        apiKey={state.settings.aiApiKey}
+        apiKey={requiresUserApiKey() ? state.settings.aiApiKey : "web"}
         model={state.settings.aiOrderModel ?? state.settings.aiModel}
         recognitionMode={state.settings.aiOrderMode ?? "accurate"}
         onOpenSettings={() => {
@@ -1914,11 +1922,22 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   const lastVisibleIsTransient = visibleMessages.length > 0
     ? Boolean(visibleMessages[visibleMessages.length - 1].message.isTransient)
     : false
-		  const quickQuestions = [
-	    "家里现在有哪些快用完了？",
-	    "洗衣液还能用多久？",
-	    "我刚买了 2 瓶洗衣液",
-	    "把猫粮提醒提前 3 天"
+  // 预设问题展示条件：
+  // 1. 当前会话中还没有任何非 transient 的用户消息（assistant 开场消息不算）
+  // 2. 不存在 pendingDraft / pendingPlan / pendingCollection
+  // 3. 不存在 clarification / orderImportRows 待确认
+  // 4. 不在 loading / sending 状态
+  const hasUserMessage = messages.some((m) => m.role === "user" && !m.isTransient)
+  const hasPendingDraft = messages.some((m) => m.agentDraft && m.draftStatus === "pending")
+  const hasPendingCollection = messages.some((m) => m.agentCollection && m.collectionStatus === "pending")
+  const hasPendingPlan = messages.some((m) => m.agentPlan && (m.planStatus === "pending" || m.planStatus === "awaitingSecondConfirm"))
+  const hasClarification = messages.some((m) => m.clarification)
+  const hasPendingOrderImport = messages.some((m) => m.orderImportRows && m.orderImportStatus === "pending")
+  const shouldShowChatSuggestions = !hasUserMessage && !hasPendingDraft && !hasPendingCollection && !hasPendingPlan && !hasClarification && !hasPendingOrderImport && !loading
+	  const quickQuestions = [
+	    "这周有哪些东西需要补货？",
+	    "猫砂最近一次补货记录是什么？",
+	    "今天买了两提抽纸，花了 39.9 元，帮我记一下"
 	  ]
 	  function latestPendingDraftMessageIndex(list: HouseholdChatMessage[]): number {
 	    for (let index = list.length - 1; index >= 0; index -= 1) {
@@ -2380,7 +2399,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     // - 解释失败 / 低置信 → 降级为 needLlm，走下面常规 LLM answer 路径
     // 不改 UI 渲染逻辑，不改 executor，不直接写 state。
     if (decision.kind === "needTurnInterpreterLlm") {
-      if (!state.settings.aiApiKey?.trim()) {
+      if (requiresUserApiKey() && !state.settings.aiApiKey?.trim()) {
         setError("还没有设置 AI API Key。这个问题需要模型分析，设置后就可以继续问。")
         inputRef.current?.focus()
         return
@@ -2611,7 +2630,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       onMessagesChange([...nextMessages, agentTurnToMessage(turn)])
       return
     }
-    if (!state.settings.aiApiKey?.trim()) {
+    if (requiresUserApiKey() && !state.settings.aiApiKey?.trim()) {
       setError("还没有设置 AI API Key。这个问题需要模型分析，设置后就可以继续问。")
       inputRef.current?.focus()
       return
@@ -2641,7 +2660,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
       seenObservationKeys
     })
     const result = await askHouseholdAssistant({
-      apiKey: state.settings.aiApiKey,
+      apiKey: state.settings.aiApiKey ?? "",
       model: state.settings.aiChatModel ?? state.settings.aiModel,
       contextPack,
       trace
@@ -2817,11 +2836,6 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
               <div className="chat-empty">
                 <strong>你可以直接问我家里还缺什么，也可以告诉我刚买了什么、什么快用完了。</strong>
                 {starter ? <span className="chat-empty-hint">{starter}</span> : null}
-                <div className="chat-suggestions">
-                  {quickQuestions.map((question) => (
-                    <button key={question} type="button" onClick={() => void sendMessage(question)} disabled={loading}>{question}</button>
-                  ))}
-                </div>
               </div>
             ) : (
 	              visibleMessages.map(({ message, index }, visibleIndex) => {
@@ -2980,11 +2994,18 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 
       <footer className="chat-page-footer">
         <div className="chat-content-shell">
+        {shouldShowChatSuggestions && (
+          <div className="chat-suggestions" role="group" aria-label="试试这些问题">
+            {quickQuestions.map((question) => (
+              <button key={question} type="button" onClick={() => void sendMessage(question)} disabled={loading}>{question}</button>
+            ))}
+          </div>
+        )}
         <form className="chat-composer" onSubmit={submit}>
           {error && (
             <div className="chat-error" role="alert">
               <span>{error}</span>
-              {!state.settings.aiApiKey?.trim() && <button type="button" onClick={onOpenSettings}>去设置</button>}
+              {requiresUserApiKey() && !state.settings.aiApiKey?.trim() && <button type="button" onClick={onOpenSettings}>去设置</button>}
             </div>
           )}
           <div className="chat-input-row">
@@ -4244,6 +4265,7 @@ function SettingsPanel({ state, onChange, onClose, isClosing, demoResetStatus, d
               </div>
             </div>
           </div>
+          {requiresUserApiKey() && (
           <div className="settings-row">
             <span className="settings-row-label">AI API Key</span>
             <div className="settings-row-control settings-api-key-control">
@@ -4282,7 +4304,8 @@ function SettingsPanel({ state, onChange, onClose, isClosing, demoResetStatus, d
               )}
             </div>
           </div>
-          {(import.meta.env.DEV || import.meta.env.VITE_DEMO_MODE === "true") && (
+          )}
+          {(import.meta.env.DEV || import.meta.env.VITE_DEMO_MODE === "true" || isWebRuntime) && (
             <div className="settings-row settings-row-multiline demo-data-row">
               <div className="settings-row-label">
                 <div className="settings-row-title">演示数据</div>

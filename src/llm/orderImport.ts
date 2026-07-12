@@ -1,5 +1,6 @@
 import type { PurchaseOption, ReplenishmentItem } from "../types"
 import { PLATFORM_OPTIONS } from "../types"
+import { ocrExtract } from "../runtime/runtimeBridge"
 
 /**
  * 默认识别模型。需要通用视觉理解模型（VLM）而非 OCR 特化模型：
@@ -202,47 +203,12 @@ export async function extractOrderFromImage(
 ): Promise<{ ok: true; order: ExtractedOrder } | { ok: false; error: string }> {
   const prompt = buildOrderExtractPrompt(catalog)
   const resolvedModel = model?.trim() || (mode === "fast" ? FAST_ORDER_MODEL : DEFAULT_ORDER_MODEL)
-  let content: string
-  if (window.desktop?.ocrExtract) {
-    const result = await window.desktop.ocrExtract({ apiKey, model: resolvedModel, imageDataUrl, prompt })
-    if (!result.ok) return { ok: false, error: result.error }
-    if (result.diagnostics) {
-      console.log(`[orderImport] model=${resolvedModel} elapsed=${result.diagnostics.elapsedSeconds}s completion_tokens=${result.diagnostics.completionTokens} reasoning=${result.diagnostics.hasReasoning}`)
-    }
-    content = result.content
-  } else {
-    try {
-      const response = await fetch("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify({
-          model: resolvedModel,
-          messages: [{
-            role: "user",
-            content: [
-              { type: "image_url", image_url: { url: imageDataUrl } },
-              { type: "text", text: prompt }
-            ]
-          }],
-          // 提取任务不需要思维链：关闭思考模式可大幅降低延迟
-          enable_thinking: false,
-          max_tokens: 2048,
-          temperature: 0.1
-        })
-      })
-      if (!response.ok) {
-        return { ok: false, error: `识别服务返回错误（${response.status}），请稍后重试。` }
-      }
-      const data = await response.json() as { choices?: Array<{ message?: { content?: string } }> }
-      const raw = data?.choices?.[0]?.message?.content
-      if (typeof raw !== "string" || !raw.trim()) {
-        return { ok: false, error: "识别服务没有返回内容，请换一张更清晰的截图重试。" }
-      }
-      content = raw
-    } catch {
-      return { ok: false, error: "无法连接识别服务（浏览器预览模式可能受跨域限制，请在桌面应用中使用）。" }
-    }
+  const result = await ocrExtract({ apiKey, model: resolvedModel, imageDataUrl, prompt })
+  if (!result.ok) return { ok: false, error: result.error }
+  if ("diagnostics" in result && result.diagnostics) {
+    console.log(`[orderImport] model=${resolvedModel} elapsed=${result.diagnostics.elapsedSeconds}s completion_tokens=${result.diagnostics.completionTokens} reasoning=${result.diagnostics.hasReasoning}`)
   }
+  const content = result.content
   const order = parseOrderExtractResponse(content)
   if (!order) {
     return { ok: false, error: "没有从截图中识别出商品条目，请确认是订单或购物明细截图后重试。" }
