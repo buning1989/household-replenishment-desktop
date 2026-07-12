@@ -1,6 +1,7 @@
 import { addDays, DEFAULT_CYCLES, startOfDay } from "../domain"
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import type { AppState } from "../types"
+import { isManagementRequest } from "./managementGuard"
 
 export type AgentDraftStatus = "pending" | "confirmed" | "cancelled" | "superseded"
 
@@ -151,12 +152,35 @@ export function parsePrice(text: string): number | undefined {
   // 兜底匹配「前缀 + 数字」（如 花了128，帮我记一下）
   const withPrefix = text.match(/(?:花了|花|价格|金额|共|一共|￥|¥)\s*(\d+(?:\.\d+)?)/)
   if (withPrefix) return Number(withPrefix[1])
+  // 403：匹配「前缀 + 改成/改为 + 数字」（如 金额改成78、价格改成128）
+  const withRevise = text.match(/(?:金额|价格)\s*(?:改成|改为|是|不是)\s*(\d+(?:\.\d+)?)/)
+  if (withRevise) return Number(withRevise[1])
   return undefined
 }
 
+/**
+ * 阶段 4B.5：平台别名归一化表。
+ * 本地 parsePlatform 只认标准名，别名（pdd/拼夕夕/jd 等）走 LLM。
+ * 这里补一层本地别名识别，避免采集态下短句补充被误判为新补货记录。
+ */
+const PLATFORM_ALIASES: Record<string, string> = {
+  pdd: "拼多多", pdd买的: "拼多多",
+  拼夕夕: "拼多多", 多多: "拼多多",
+  jd: "京东", 狗东: "京东", 东哥: "京东",
+  tb: "淘宝", 某宝: "淘宝",
+  tmall: "天猫",
+}
+
 export function parsePlatform(text: string): string | undefined {
+  // 1. 标准名直接匹配
   const match = text.match(/京东|淘宝|天猫|拼多多|抖音|1688|盒马|山姆|美团|超市|线下/)
-  return match?.[0]
+  if (match) return match[0]
+  // 2. 别名归一化（大小写不敏感）
+  const lower = text.toLowerCase()
+  for (const [alias, canonical] of Object.entries(PLATFORM_ALIASES)) {
+    if (lower.includes(alias.toLowerCase())) return canonical
+  }
+  return undefined
 }
 
 // ---------- 分类与别名 ----------
@@ -256,11 +280,74 @@ function cleanItemName(raw: string): string {
   return cleanText(raw)
     .replace(/^帮我|^请帮我|^我想|^给我/, "")
     .replace(/^(添加一个|添加|新建一个|新建|创建一个|创建|录入|登记|加一个|加个)/, "")
+    // 403 修复：「消耗品叫洗衣液」→「洗衣液」——「叫」是分隔词，前面是类型，后面才是真名
+    .replace(/^消耗品叫|^消耗品名为|^名为|^叫做|^叫作/, "")
+    // 403 修复：「消耗品：洗衣液」→「洗衣液」——冒号也是分隔符
+    .replace(/^消耗品[:：]|^物品[:：]/, "")
     .replace(/(消耗品|补货单|补货记录|管理项|吧|一下)$/g, "")
     .replace(/[，。,.!！?？]/g, "")
     .replace(/的/g, "")
+    // 阶段 4B.5：去除句末语气词，避免「我买了5袋啊」抽出 itemName="啊"
+    .replace(/[啊呢吧哦呀啦嘛呗喽哈]+$/g, "")
     .trim()
 }
+
+/**
+ * 403 修复：识别显式 createItem 语义。
+ *
+ * 以下表达明确表示用户要「创建/添加消耗品」，不是补货：
+ *   - 消耗品叫 / 消耗品名为 / 消耗品：/ 消耗品：
+ *   - 新建消耗品 / 创建消耗品 / 添加消耗品
+ *   - 帮我管理 / 以后提醒 / 加入清单
+ *
+ * 这些信号必须优先于 restock 回退（避免「帮我加个消耗品叫洗衣液」被误判为补货）。
+ */
+export function isExplicitCreateItemSignal(text: string): boolean {
+  const compact = cleanText(text)
+  return /消耗品叫|消耗品名为|消耗品[:：]|新建消耗品|创建消耗品|添加消耗品|帮我管理|以后提醒|加入清单/.test(compact)
+}
+
+/**
+ * 403 修复：从显式 createItem 语义中提取物品名。
+ *
+ * 「帮我加个消耗品叫洗衣液」→「洗衣液」
+ * 「创建一个消耗品：洗衣液」→「洗衣液」
+ * 「帮我管理洗衣液」→「洗衣液」
+ * 「以后提醒洗衣液」→「洗衣液」
+ */
+export function extractCreateItemName(text: string): string | undefined {
+  const compact = cleanText(text)
+  // 「消耗品叫X」「消耗品：X」「消耗品名为X」
+  const colonMatch = compact.match(/消耗品(?:叫|名为|[:：])\s*(.+?)(?:[，,。!！?？]|$)/)
+  if (colonMatch) {
+    const cleaned = cleanItemName(colonMatch[1])
+    if (cleaned && !QTY_UNIT_ONLY_RE.test(cleaned)) return cleaned
+  }
+  // 「帮我管理X」「以后提醒X」「加入清单X」
+  const verbMatch = compact.match(/(?:帮我管理|以后提醒|加入清单)\s*(.+?)(?:[，,。!！?？]|$)/)
+  if (verbMatch) {
+    const cleaned = cleanItemName(verbMatch[1])
+    if (cleaned && !QTY_UNIT_ONLY_RE.test(cleaned)) return cleaned
+  }
+  // 「新建/创建/添加一个消耗品 X」/「帮我加个消耗品 X」
+  const createMatch = compact.match(/(?:新建|创建|添加|帮我加个|加个)\s*(?:一个)?\s*消耗品\s*(.+?)(?:[，,。!！?？]|$)/)
+  if (createMatch) {
+    const cleaned = cleanItemName(createMatch[1])
+    if (cleaned && !QTY_UNIT_ONLY_RE.test(cleaned)) return cleaned
+  }
+  // 「新建/创建/添加一个X」/「帮我加一个X」/「帮我加个X」(无"消耗品"字样但有显式建档动词)
+  // 403 修复：加入「帮我加一个|帮我加个|帮我加」，支持「帮我加一个洗发水，以后提醒」这种
+  // 「以后提醒」作后缀修饰的句式（此时 pattern 2 的 PREFIX 匹配因后缀后无字符而失败）。
+  const simpleCreateMatch = compact.match(/(?:新建|创建|添加|帮我加一个|帮我加个|帮我加)\s*(?:一个)?\s*(.+?)(?:[，,。!！?？]|$)/)
+  if (simpleCreateMatch) {
+    const cleaned = cleanItemName(simpleCreateMatch[1])
+    if (cleaned && !QTY_UNIT_ONLY_RE.test(cleaned) && cleaned !== "一个" && cleaned !== "个") return cleaned
+  }
+  return undefined
+}
+
+/** 纯数量+单位模式（如「5袋」「两包」），不是有效物品名。 */
+const QTY_UNIT_ONLY_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)$/
 
 function extractPurchasedName(text: string): string | undefined {
   const compact = cleanText(text)
@@ -268,18 +355,32 @@ function extractPurchasedName(text: string): string | undefined {
   if (qty.unit) {
     const qtyMatch = compact.match(new RegExp(`[一二两三四五六七八九十\\d]+${qty.unit}`))
     if (qtyMatch?.index !== undefined) {
+      // 先尝试从数量后面提取物品名（如「买了2袋猫砂」→ 猫砂）
       const afterQty = compact.slice(qtyMatch.index + qtyMatch[0].length)
-      const name = afterQty
+      const nameAfter = afterQty
         .replace(/(，|,|。).*$/, "")
         .replace(/花了.*$/, "")
         .replace(/帮我.*$/, "")
         .replace(/创建.*$/, "")
-      const cleaned = cleanItemName(name)
-      if (cleaned) return cleaned
+      const cleanedAfter = cleanItemName(nameAfter)
+      if (cleanedAfter && !QTY_UNIT_ONLY_RE.test(cleanedAfter)) return cleanedAfter
+
+      // 403 修复：数量前面也可能是物品名（如「猫砂两袋，花了68」→ 猫砂）
+      // 同时剥离「我买了」「今天买了」等前缀，避免「我买了5袋啊」抽出 itemName="我"
+      const beforeQty = compact.slice(0, qtyMatch.index)
+        .replace(/^(今天|昨天|前天)?我?买了?/, "")
+        .replace(/^(今天|昨天|前天)我?/, "")
+      const cleanedBefore = cleanItemName(beforeQty)
+      if (cleanedBefore && !QTY_UNIT_ONLY_RE.test(cleanedBefore)) return cleanedBefore
     }
   }
   const boughtMatch = compact.match(/买了(.+?)(?:，|,|。|花了|帮我|创建|$)/)
-  return boughtMatch ? cleanItemName(boughtMatch[1]) : undefined
+  if (boughtMatch) {
+    const cleaned = cleanItemName(boughtMatch[1])
+    // 阶段 4B.5：纯数量+单位（如「5袋」）不是有效物品名，避免「我买了5袋啊」被误判为新物品
+    if (cleaned && !QTY_UNIT_ONLY_RE.test(cleaned)) return cleaned
+  }
+  return undefined
 }
 
 // ---------- 物品匹配 ----------
@@ -595,7 +696,12 @@ export function parseItemNameRevision(text: string): { from: string; to: string 
   const compacted = cleanText(text)
   // 允许第一组和「是」之间出现标点（如「不是抽纸，是卷纸」）
   const m = compacted.match(/(?:这个)?不是([^\s，。,!.！？?是]+)[，。,!.！？?\s]*是([^\s，。,!.！？?]+)/)
-  if (m && m[1] && m[2] && m[1] !== "不") return { from: m[1], to: m[2] }
+  if (m && m[1] && m[2] && m[1] !== "不") {
+    // 阶段 4B.5：纯数量/单位修正（如「不是1袋，是5袋」）不是物品名修订
+    const QTY_UNIT_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)$/
+    if (QTY_UNIT_RE.test(m[1]) && QTY_UNIT_RE.test(m[2])) return undefined
+    return { from: m[1], to: m[2] }
+  }
   return undefined
 }
 
@@ -603,6 +709,11 @@ export function parseItemNameRevision(text: string): { from: string; to: string 
 
 export function buildLocalDraftFromText(text: string, state: AppState): AgentDraft | null {
   const compact = cleanText(text)
+
+  // 403：管理请求统一拦截——删除/编辑/预算/周期/提醒/常购商品管理/默认商品设置
+  // 这些请求不得生成任何写入草稿（包括 addPurchaseOption），只能返回导航回答。
+  // 此守卫是兜底，即使 interpretUserTurn 未正确分类，此处也能拦住。
+  if (isManagementRequest(text)) return null
 
   // 常购商品优先级最高：把 X 加为某物品的常购商品
   // 必须在补货信号判断之前，避免「加成卷纸的常购商品」被「加+卷」误吞
@@ -623,10 +734,30 @@ export function buildLocalDraftFromText(text: string, state: AppState): AgentDra
     }
   }
 
+  // 403 修复：显式 createItem 语义优先于一切补货判断。
+  // 「帮我加个消耗品叫洗衣液」「以后提醒洗衣液」「帮我管理洗衣液」等表达
+  // 必须走 createItem 流程，不得被「加个」误判为 restock。
+  // 已存在 → 返回 null（由 orchestrator 生成 alreadyExists/navigate turn）
+  // 不存在 → 返回 createItem draft
+  if (isExplicitCreateItemSignal(text)) {
+    const itemName = extractCreateItemName(text)
+    if (itemName) {
+      const match = findItemMatch(state, itemName)
+      if (match.item && (match.confidence === "exact" || match.confidence === "synonym")) {
+        // 已存在 → 返回 null，orchestrator 负责生成「已存在」回答
+        return null
+      }
+      // 不存在 → 生成 createItem 待确认草稿
+      return createItemDraftFromName(itemName, state)
+    }
+    // 显式 createItem 信号但提取不出物品名 → 不走补货回退，返回 null
+    return null
+  }
+
   // 「加一袋猫砂」「加一瓶洗发水」这种「加+量词」也算补货信号，走 restock/createItemWithRestock
   // 但要排除「加一个」「加个」这种建档信号（无量词）
   const hasQtyWithAdd = /(?:加|补|买|购入).{0,4}(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)/.test(compact)
-  const hasPurchaseSignal = hasQtyWithAdd || /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|京东|淘宝|天猫|拼多多/.test(compact)
+  const hasPurchaseSignal = hasQtyWithAdd || /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|金额|价格|京东|淘宝|天猫|拼多多/.test(compact)
   if (hasPurchaseSignal) {
     const itemName = extractPurchasedName(compact)
     if (!itemName) return null
@@ -718,7 +849,16 @@ function applyRestockRevision(restock: RestockDraftDetails, text: string): { res
       price = Number(cleanedRevision)
     }
   }
+  // 阶段 4B.5：混合字符串中的逗号后纯数字视为价格（如「pdd 买的，110」→ price=110）
+  if (price === undefined) {
+    const commaNumMatch = text.match(/[，,]\s*(\d+(?:\.\d+)?)\s*(?:，|,|。|$)/)
+    if (commaNumMatch) {
+      price = Number(commaNumMatch[1])
+    }
+  }
   const platform = parsePlatform(revisionSource)
+  // 阶段 4B.5：platform 从完整 text 中提取（revisionSource 可能被「不是X是Y」截断）
+  const platformFromFullText = platform || parsePlatform(text)
   const spec = parseSpec(revisionSource)
   const review = parseReview(text)
   const date = parseNaturalDate(text)
@@ -728,7 +868,7 @@ function applyRestockRevision(restock: RestockDraftDetails, text: string): { res
   if (qty.qty !== undefined) { next.qty = qty.qty; changed = true }
   if (qty.unit) { next.unit = qty.unit; changed = true }
   if (price !== undefined) { next.price = price; changed = true }
-  if (platform) { next.platform = platform; changed = true }
+  if (platformFromFullText) { next.platform = platformFromFullText; changed = true }
   if (spec) { next.purchaseMeasureAmount = spec.amount; next.purchaseMeasureUnit = spec.unit; changed = true }
   if (review) { next.review = review; changed = true }
   if (date !== undefined) { next.restockDate = date; changed = true }
@@ -985,8 +1125,11 @@ export function parseAgentResponse(content: string, state?: AppState): AgentResp
       const draft = normalizeDraft(parsed.draft, state)
       return draft ? { kind: "draft", draft, message: typeof parsed.message === "string" ? parsed.message.trim() : undefined } : null
     }
-    const draft = normalizeDraft(parsed, state)
-    return draft ? { kind: "draft", draft } : null
+    // 阶段 4B.4：未知 kind 不再兜底转 normalizeDraft。
+    // 写入必须显式：只有 parsed.kind === "draft" 才进入写入侧。
+    // unknown kind / answer / queryAnswer / 非标准 kind 一律不进写入侧。
+    // 如果包含 message/answer，由 normalizeLlm 的 answer 抢救逻辑处理。
+    return null
   } catch {
     return null
   }
@@ -1011,6 +1154,13 @@ export function describeAgentDraft(draft: AgentDraft): string {
  */
 export function buildLocalClarification(text: string, state: AppState): AgentClarification | null {
   const compact = cleanText(text)
+  // 403 修复：显式 createItem 语义（消耗品叫/新建消耗品/创建消耗品/添加消耗品/帮我管理/以后提醒/加入清单）
+  // 不走 clarification 的「已有物品 → 补货还是改节奏」分支。这类输入应交回 orchestrator：
+  //   - 若物品已存在 → 返回 navigate turn（打开已有物品详情）
+  //   - 若不存在 → 生成 createItem 待确认草稿
+  // 否则「添加一个消耗品叫洗衣液」会被这里抢先返回 clarification（"补货还是改节奏"），
+  // 与用户明确的「创建」语义冲突。
+  if (isExplicitCreateItemSignal(text)) return null
   const hasAddSignal = /加一个|添加一个|新建一个|帮我加|加个|创建一个/.test(compact)
   if (!hasAddSignal) return null
 

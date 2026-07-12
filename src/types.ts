@@ -143,6 +143,34 @@ export type AppState = {
   settings: ReminderSettings
   householdProfile: HouseholdProfile | null
   updatedAt: number
+  /** 403：最近一次 Agent 写入的轻量记录，用于有限纠错和撤销。 */
+  lastAgentMutation?: LastAgentMutation
+}
+
+/**
+ * 403：最近一次 Agent 写入的轻量记录。
+ * 仅支持当前会话中最近一次由 Agent 成功创建的记录的纠错与撤销。
+ * 手动 UI 创建或修改的数据不纳入该快捷纠错权限。
+ */
+export type LastAgentMutation = {
+  /** 写入类型 */
+  mutationType: "createRestockRecord" | "createItem" | "createItemWithRestock" | "addPurchaseOption" | "createCategory" | "batchCommit"
+  /** 写入时间戳 */
+  createdAt: number
+  /** 受影响的物品 id（如有） */
+  itemId?: string
+  /** 受影响的补货记录 id（如有） */
+  recordId?: string
+  /** 受影响的物品名（用于消息展示） */
+  itemName?: string
+  /** 写入前的物品快照（仅记录受影响物品，不保存全量 state） */
+  beforeSnapshot?: ReplenishmentItem
+  /** 写入后的物品快照 */
+  afterSnapshot?: ReplenishmentItem
+  /** 新创建的分类名（createCategory 时） */
+  createdCategoryName?: string
+  /** 是否已被撤销或纠错（防止重复操作） */
+  consumed?: boolean
 }
 
 export type ItemComputed = {

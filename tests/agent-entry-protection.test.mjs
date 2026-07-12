@@ -13,11 +13,11 @@
 //   6. 取消信号 → cancelled，不写入
 //   7. 强制保存「就这样」→ proposal，带「未补全」标记
 //   8. 查询类输入 → 不生成补货 collection / proposal
-//   9. 删除请求 → planProposal（高风险，需二次确认）
-//   10. 删除二次确认状态机：确认→awaitingSecondConfirm；awaiting+确认→answer（不执行）；
+//   9. 删除请求 → answer（403 收缩，删除走导航，不创建 plan）
+//   10. 删除二次确认状态机（手动注入 pendingPlan 回归保护）：确认→awaitingSecondConfirm；awaiting+确认→answer（不执行）；
 //       awaiting+确认删除→planSecondConfirm
 //   11. awaitingSecondConfirm 下输入新补货句 → 不执行删除（无 planSecondConfirm/planConfirm）
-//   12. 预算设置 → planProposal
+//   12. 预算设置 → answer（403 收缩，预算走导航，不创建 plan）
 //
 // 注意：「串物品」bug 场景（pendingCollection=宠物擦脚湿巾 + 输入「今天买了 3 袋五常大米」
 //   被误改成旧物品 3 袋）不属于保护范围——那是阶段 2 要修复的目标，故此处不覆盖。
@@ -40,6 +40,7 @@ registerHooks({
 })
 
 const { createHouseholdOrchestrator } = await import("../src/agent/householdOrchestrator.ts")
+const { createAgentPlan } = await import("../src/agent/actions.ts")
 const { buildChatDateContext } = await import("../src/llm/householdChat.ts")
 
 // 固定日期上下文，避免「今天/昨天」随运行时间漂移
@@ -196,7 +197,7 @@ test("6. pendingCollection + 「算了」→ cancelled，无 executableDraft", (
 
 // ---------- 7. 强制保存「就这样」→ proposal 带「未补全」 ----------
 
-test("7. pendingCollection（缺 price）+ 「就这样」→ proposal，message 含「未补全」", () => {
+test("7. pendingCollection（缺 price）+ 「就这样」→ planCommand/draftCommit", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
   const orch = createHouseholdOrchestrator()
   const d1 = decide(orch, { text: "今天买了 5 袋猫砂", state, itemViews: viewsOf(state.items) })
@@ -204,8 +205,8 @@ test("7. pendingCollection（缺 price）+ 「就这样」→ proposal，message
 
   const d2 = decide(orch, { text: "就这样", state, itemViews: viewsOf(state.items), pendingCollection })
   assert.equal(d2.kind, "sync")
-  assert.equal(d2.turn.kind, "proposal", "「就这样」应触发 forceProposal 转 proposal")
-  assert.ok(d2.turn.message.includes("未补全"), `应含「未补全」, 实际：${d2.turn.message}`)
+  assert.equal(d2.turn.kind, "planCommand", "「就这样」应触发 forceProposal 转 planCommand/draftCommit")
+  assert.equal(d2.turn.command.command, "draftCommit")
 })
 
 // ---------- 8. 查询类输入 → 不生成补货 collection / proposal ----------
@@ -226,9 +227,9 @@ test("8. 「猫砂还能用多久」→ 不生成 collection / proposal / clarif
   }
 })
 
-// ---------- 9. 删除请求 → planProposal（高风险） ----------
+// ---------- 9. 删除请求 → answer（403 收缩，走导航） ----------
 
-test("9. 「删除卫生间下的消耗品」→ planProposal，risk=high，requiresSecondConfirm=true", () => {
+test("9. 「删除卫生间下的消耗品」→ navigate（403 收缩，不创建 plan）", () => {
   const state = makeState({
     items: [
       makeItem("i1", "卫生纸", "卫生间"),
@@ -238,30 +239,27 @@ test("9. 「删除卫生间下的消耗品」→ planProposal，risk=high，requ
   const orch = createHouseholdOrchestrator()
   const d = decide(orch, { text: "删除卫生间下的消耗品", state, itemViews: viewsOf(state.items) })
   assert.equal(d.kind, "sync")
-  assert.equal(d.turn.kind, "planProposal", "删除请求应生成 planProposal，不能直接执行")
-  assert.equal(d.turn.plan.risk, "high")
-  assert.equal(d.turn.plan.requiresSecondConfirm, true)
-  assert.equal(d.turn.plan.status, "pending")
-  // 应包含 deleteItem 动作
-  assert.ok(
-    d.turn.plan.actions.some((a) => a.type === "deleteItem"),
-    "应包含 deleteItem 动作"
-  )
+  assert.equal(d.turn.kind, "navigate", "403 收缩后删除请求应返回 navigate，不创建 plan")
+  assert.ok(!("plan" in d.turn), "不应创建 planProposal")
 })
 
-// ---------- 10. 删除二次确认状态机 ----------
+// ---------- 10. 删除二次确认状态机（手动注入 pendingPlan 回归保护） ----------
 
-test("10. 删除二次确认：确认→awaitingSecondConfirm；awaiting+确认→answer；awaiting+确认删除→planSecondConfirm", () => {
+test("10. 删除二次确认状态机（手动注入 pendingPlan）：确认→awaitingSecondConfirm；awaiting+确认→answer；awaiting+确认删除→planSecondConfirm", () => {
   const state = makeState({
     items: [makeItem("i1", "卫生纸", "卫生间")]
   })
   const orch = createHouseholdOrchestrator()
   const itemViews = viewsOf(state.items)
 
-  // 10a. 首轮生成 high-risk plan
-  const d1 = decide(orch, { text: "删除卫生间下的消耗品", state, itemViews })
-  assert.equal(d1.turn.kind, "planProposal")
-  const pendingPlan = d1.turn.plan
+  // 403 收缩后不再通过自然语言创建删除 plan，手动注入 pendingPlan 测试状态机回归保护
+  const pendingPlan = createAgentPlan(
+    [{ type: "deleteItem", itemName: "卫生纸", itemId: "i1" }],
+    "删除卫生间下的消耗品",
+    NOW
+  )
+  assert.equal(pendingPlan.risk, "high")
+  assert.equal(pendingPlan.requiresSecondConfirm, true)
 
   // 10b. pending 状态 + 「确认」→ planAwaitingSecondConfirm（不执行写入）
   const d2 = decide(orch, { text: "确认", state, itemViews, pendingPlan })
@@ -314,15 +312,13 @@ test("11. awaitingSecondConfirm + 「今天买了 3 袋五常大米」→ 不执
   }
 })
 
-// ---------- 12. 预算设置 → planProposal ----------
+// ---------- 12. 预算设置 → answer（403 收缩，走导航） ----------
 
-test("12. 「把月预算设成 800」→ planProposal，含 setMonthlyBudget 动作", () => {
+test("12. 「把月预算设成 800」→ navigate（403 收缩，不创建 plan）", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const d = decide(orch, { text: "把月预算设成 800", state, itemViews: [] })
   assert.equal(d.kind, "sync")
-  assert.equal(d.turn.kind, "planProposal")
-  const budgetAction = d.turn.plan.actions.find((a) => a.type === "setMonthlyBudget")
-  assert.ok(budgetAction, "应包含 setMonthlyBudget 动作")
-  assert.equal(budgetAction.amount, 800)
+  assert.equal(d.turn.kind, "navigate", "403 收缩后预算请求应返回 navigate，不创建 plan")
+  assert.ok(!("plan" in d.turn), "不应创建 planProposal")
 })

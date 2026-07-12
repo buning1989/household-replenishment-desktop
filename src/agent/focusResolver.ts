@@ -24,7 +24,7 @@
  * 本文件不修改任何现有行为，只是阶段 2B 路由层的纯输入。
  */
 
-import type { TurnInterpretation } from "./turnInterpretation"
+import { isCurrentEntryFieldRevision, type TurnInterpretation } from "./turnInterpretation"
 import type { DraftCollection } from "./draftCollection"
 import type { AgentDraft } from "./drafts"
 import type { AgentPlan } from "./actions"
@@ -44,10 +44,17 @@ export type FocusDecision =
   | { focus: "route_to_query"; reason: string }
   | { focus: "route_to_smalltalk"; reason: string }
   | { focus: "route_to_llm"; reason: string }
+  | { focus: "query_current_pending"; reason: string; targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary" }
+  | { focus: "route_to_navigate"; reason: string }
+  | { focus: "report_inventory_status"; reason: string }
+  | { focus: "correct_last_mutation"; reason: string }
+  | { focus: "undo_last_mutation"; reason: string }
 
 /** focusResolver 的输入：本轮解释 + 只读 pending 上下文。 */
 export type FocusResolverInput = {
   interpretation: TurnInterpretation
+  /** 原始用户输入文本，用于 isCurrentEntryFieldRevision 等精细判定 */
+  text: string
   pendingCollection?: DraftCollection
   pendingPlan?: AgentPlan
   pendingDraft?: AgentDraft
@@ -60,7 +67,7 @@ export type FocusResolverInput = {
  * 返回 FocusDecision。不执行任何 action，不生成文案，不修改 pending。
  */
 export function resolveConversationFocus(input: FocusResolverInput): FocusDecision {
-  const { interpretation, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
+  const { interpretation, text, pendingCollection, pendingPlan, pendingDraft, pendingBatch } = input
   const intent = interpretation.intent
 
   // ---------- a. pendingPlan 优先 ----------
@@ -112,17 +119,18 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
     }
 
     // 3. 新补货记录：判断是否「串物品」
-    //    - 本轮物品名 ≠ 当前 collection 物品名 → start_new_collection（旧 collection 由调用方标 superseded）
-    //    - 物品名相同或无法判断 → continue_pending_collection（在原 collection 上叠加字段）
+    //    阶段 4B.6 补口：复用共享 helper，与 pendingDraft 仲裁逻辑对齐。
+    //    - different_item / explicit_new → start_new_collection（旧 collection 由调用方标 superseded）
+    //    - same_item / no_item_name → continue_pending_collection（在原 collection 上叠加字段）
     if (intent === "new_restock_record") {
+      const outcome = classifyNewRestockAgainstPending(interpretation, currentItemName)
       const mentioned = interpretation.fields.itemName
-      const different = Boolean(
-        mentioned && currentItemName && mentioned.trim() !== currentItemName.trim()
-      )
-      if (different) {
+      if (outcome === "different_item" || outcome === "explicit_new") {
         return {
           focus: "start_new_collection",
-          reason: `本轮提到「${mentioned}」与当前采集态「${currentItemName}」不同，视为开启新补货采集`,
+          reason: outcome === "explicit_new"
+            ? `含明确新增信号，允许开启新补货采集（当前采集态「${currentItemName}」由调用方标 superseded）`
+            : `本轮提到「${mentioned}」与当前采集态「${currentItemName}」不同，视为开启新补货采集`,
           mentionedDifferentItem: true
         }
       }
@@ -135,7 +143,17 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
       }
     }
 
-    // 4. 查询 → 不打断采集态，路由到查询（collection 由调用方保留）
+    // 4. 阶段 4B.6：查询当前待确认草稿的字段（price/platform/qty/status）
+    //    直接从 pending 回答，不打断采集态，不新建 collection。
+    if (intent === "query_current_pending") {
+      return {
+        focus: "query_current_pending",
+        reason: `查询当前采集态字段：${interpretation.fields.targetField ?? "summary"}`,
+        targetField: interpretation.fields.targetField
+      }
+    }
+
+    // 5. 查询 → 不打断采集态，路由到查询（collection 由调用方保留）
     if (intent === "query_inventory") {
       return {
         focus: "route_to_query",
@@ -143,7 +161,7 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
       }
     }
 
-    // 5. 闲聊 → 路由到闲聊（不打断采集态）
+    // 6. 闲聊 → 路由到闲聊（不打断采集态）
     if (intent === "smalltalk") {
       return {
         focus: "route_to_smalltalk",
@@ -151,7 +169,7 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
       }
     }
 
-    // 6. 明确的写入类意图（manage_item / manage_budget / delete_request）：
+    // 7. 明确的写入类意图（manage_item / manage_budget / delete_request）：
     //    与当前采集态不相关，开启新任务，旧 collection 由调用方标 superseded。
     if (
       intent === "manage_item" ||
@@ -164,7 +182,7 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
       }
     }
 
-    // 7. unknown / batch_revision：不强行开启新任务，交回调用方用旧 collection
+    // 8. unknown / batch_revision：不强行开启新任务，交回调用方用旧 collection
     //    处理逻辑兜底字段抽取（如「45块」这类短句价格词被 interpretUserTurn 判为 unknown，
     //    但旧 reviseDraftCollection 能抽出 price）。具体能否抽出字段由调用方决定。
     return {
@@ -200,6 +218,11 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
   // 「确认吧」「就这样」在 interpretUserTurn 中被判为 force_proposal，
   // 但在 pendingDraft 上下文中应视为确认当前 draft（force_proposal 仅在
   // pendingCollection 上下文中才表示「强制保存采集态」）。
+  //
+  // 阶段 4B.6：pendingDraft 同物品仲裁 + query_current_pending。
+  // - new_restock_record + 同物品 + 无明确新增信号 → continue_pending_draft（走 revise）
+  // - new_restock_record + 不同物品 或 明确新增信号 → start_new_collection
+  // - query_current_pending → 直接从 pending 回答字段
   if (pendingDraft) {
     if (
       intent === "confirm_current_task" ||
@@ -211,7 +234,51 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
         reason: draftContinueReason(intent)
       }
     }
-    // 其他意图（新补货记录 / 查询 / 闲聊 / 删除 / 物品管理）落到下方路由。
+
+    // 阶段 4B.6 补口：supplement_current_collection 在 pendingDraft 上下文中视为修订当前草稿。
+    // LLM Turn Interpreter 返回 supplement 时（如「p'd'd 买的」→ platform=拼多多），
+    // 应走 continue_pending_draft 交 reviseAgentDraft 修订字段，而不是 route_to_llm。
+    if (intent === "supplement_current_collection") {
+      return {
+        focus: "continue_pending_draft",
+        reason: `补充字段，视为修订当前待确认草稿${describeFields(interpretation)}`
+      }
+    }
+
+    // 阶段 4B.6：查询当前待确认草稿的字段（price/platform/qty/status）
+    if (intent === "query_current_pending") {
+      return {
+        focus: "query_current_pending",
+        reason: `查询当前待确认草稿字段：${interpretation.fields.targetField ?? "summary"}`,
+        targetField: interpretation.fields.targetField
+      }
+    }
+
+    // 阶段 4B.6 补口：pendingDraft 同物品仲裁，复用共享 helper。
+    // - same_item → continue_pending_draft（走 revise 修订字段）
+    // - different_item → 落到下方 hasActivePending 分支返回 start_new_collection
+    // - explicit_new → 落到下方 hasActivePending 分支返回 start_new_collection
+    // - no_item_name → route_to_llm（低置信，draft 态无 collection 的字段叠加能力，
+    //   不允许 start_new_collection 覆盖 pending，交 LLM 结合 pendingDraft 判断）
+    if (intent === "new_restock_record") {
+      const draftItemName = extractDraftItemName(pendingDraft)
+      const outcome = classifyNewRestockAgainstPending(interpretation, draftItemName)
+      const mentioned = interpretation.fields.itemName
+      if (outcome === "same_item") {
+        return {
+          focus: "continue_pending_draft",
+          reason: `本轮提到「${mentioned}」与当前待确认草稿「${draftItemName}」一致，视为修订当前草稿字段`
+        }
+      }
+      if (outcome === "no_item_name") {
+        return {
+          focus: "route_to_llm",
+          reason: `new_restock_record 低置信（未抽出物品名），draft 态不允许直接覆盖，交 LLM 结合 pendingDraft 判断`
+        }
+      }
+      // different_item / explicit_new：落到下方 hasActivePending 分支返回 start_new_collection
+    }
+    // 其他意图（查询 / 闲聊 / 删除 / 物品管理）落到下方路由。
     // 关键修复：新补货记录不再被旧 draft handler 的 reviseDraft 吞掉，
     // 而是走到下方 hasActivePending 分支返回 start_new_collection。
   }
@@ -227,15 +294,75 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
     (pendingBatch && pendingBatch.length > 0 ? true : false) ||
     Boolean(pendingDraft)
 
-  // 写入类意图：新补货记录 / 物品管理 / 预算管理 / 删除请求 / 批量修订
+  // 能力收缩：管理类意图（删除 / 物品管理 / 预算管理）不再进入写入流程。
+  //   - 不创建 pendingPlan
+  //   - 不写入 state
+  //   - 不进入二次确认
+  //   - 只定位对象并导航到对应 UI
+  //   - 不影响当前 pending 状态（导航是只读回答）
+  //
+  // 例外（403 收窄）：有活跃 pending 时，仅当文本命中 isCurrentEntryFieldRevision
+  //      （即只修订当前录入草稿的字段：物品名/数量/单位/金额/平台/日期/订单商品信息），
+  //      才允许进入修订链路。其他管理类请求（周期/提醒/分类/预算/历史记录/常购商品/默认商品/删除）
+  //      无论是否有 pending，都只能导航。
   if (
-    intent === "new_restock_record" ||
-    intent === "manage_item" ||
     intent === "manage_budget" ||
     intent === "delete_request" ||
-    intent === "batch_revision"
+    (intent === "manage_item" && !isCurrentEntryFieldRevision(text))
+  ) {
+    return {
+      focus: "route_to_navigate",
+      reason: `管理类意图「${intent}」已关闭对话执行，路由到导航回答（定位不执行）`
+    }
+  }
+
+  // 403：库存状态报告——用户陈述当前库存状态，进入校准流程
+  if (intent === "report_inventory_status") {
+    return {
+      focus: "report_inventory_status",
+      reason: "库存状态报告，进入校准流程"
+    }
+  }
+
+  // 403：最近一次 Agent 写入的纠错和撤销
+  if (intent === "undo_last_mutation") {
+    return {
+      focus: "undo_last_mutation",
+      reason: "请求撤销最近一次 Agent 写入"
+    }
+  }
+  if (intent === "correct_last_mutation") {
+    return {
+      focus: "correct_last_mutation",
+      reason: "请求修正最近一次 Agent 写入的字段"
+    }
+  }
+
+  // 写入类意图：新补货记录 / 创建消耗品 / 批量修订 / 有 pending 时的当前草稿字段修订
+  //   注意：manage_item 已在上方通过 isCurrentEntryFieldRevision 筛选——
+  //   只有录入字段修订（如「改成 3 袋」「金额改成 78」）才到达这里，
+  //   周期/提醒/分类/预算/历史记录等管理类已被路由到导航。
+  //
+  // 403 修复：create_item 必须路由到 writeDraft——buildLocalDraftFromText 内部会先做
+  //   显式 createItem 信号 + 已存在物品去重（返回 null），由 orchestrator 生成
+  //   alreadyExists/navigate turn；不存在才生成 createItem 待确认草稿。若不路由到
+  //   writeDraft，create_item 会落到 LLM 兜底，已存在物品时无法返回 navigate。
+  if (
+    intent === "new_restock_record" ||
+    intent === "create_item" ||
+    intent === "batch_revision" ||
+    (hasActivePending && intent === "manage_item" && isCurrentEntryFieldRevision(text))
   ) {
     if (hasActivePending) {
+      // 阶段 4B.6 补口：low confidence new_restock_record 不得 start_new_collection。
+      // 覆盖 pending 是半破坏性操作，必须有明确分歧证据（高置信不同物品名或显式新增信号）。
+      // 低置信（无 itemName）只能升级 interpreter 或澄清，禁止直接覆盖。
+      if (intent === "new_restock_record" && interpretation.confidence === "low") {
+        return {
+          focus: "route_to_llm",
+          reason: "低置信 new_restock_record（无明确物品名），不允许覆盖当前 pending，交 LLM 澄清"
+        }
+      }
       return {
         focus: "start_new_collection",
         reason: `本轮意图「${intent}」与当前 pending 任务不相关，开启新写入任务（旧 pending 由调用方标 superseded）`
@@ -252,6 +379,15 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
     return {
       focus: "route_to_query",
       reason: "查询意图，路由到查询回答"
+    }
+  }
+
+  // 阶段 4B.6：query_current_pending 在无 pendingDraft/pendingCollection 时
+  //（如 pendingPlan/pendingBatch 活跃，或无 pending）→ route_to_llm 兜底
+  if (intent === "query_current_pending") {
+    return {
+      focus: "route_to_llm",
+      reason: "query_current_pending 但无 pendingDraft/pendingCollection 可查，交 LLM 兜底"
     }
   }
 
@@ -272,11 +408,57 @@ export function resolveConversationFocus(input: FocusResolverInput): FocusDecisi
 
 // ---------- 辅助 ----------
 
+/**
+ * 阶段 4B.6 补口：new_restock_record 与当前 pending 的物品名比对结果。
+ * pendingCollection 和 pendingDraft 共用此判定，保证同物品仲裁逻辑一致。
+ */
+export type NewRestockArbitrationOutcome =
+  | "same_item"
+  | "different_item"
+  | "explicit_new"
+  | "no_item_name"
+
+/**
+ * 把 new_restock_record 与当前 pending 的物品名做结构化比对。
+ *
+ * 判定规则：
+ *   - hasExplicitNewRecord（又买了/另外买了/还买了/重新记一条）→ explicit_new
+ *   - 有明确 itemName 且与当前 pending 物品名不同 → different_item
+ *   - 有明确 itemName 且与当前 pending 物品名相同 → same_item
+ *   - 无明确 itemName（低置信）→ no_item_name
+ */
+export function classifyNewRestockAgainstPending(
+  interpretation: TurnInterpretation,
+  currentItemName: string | undefined
+): NewRestockArbitrationOutcome {
+  const mentioned = interpretation.fields.itemName
+  const hasExplicitNew = interpretation.signals.hasExplicitNewRecord === true
+
+  if (hasExplicitNew) return "explicit_new"
+
+  if (mentioned && currentItemName) {
+    return mentioned.trim() === currentItemName.trim()
+      ? "same_item"
+      : "different_item"
+  }
+
+  // 无明确 itemName（低置信 fallback）
+  return "no_item_name"
+}
+
 /** 取出当前 collection 草稿对应的物品名。 */
 function extractCollectionItemName(collection: DraftCollection): string | undefined {
   const draft = collection.draft
   if (draft.kind === "restock") return draft.itemName
   if (draft.kind === "createItemWithRestock") return draft.item.itemName
+  return undefined
+}
+
+/** 阶段 4B.6：取出 pendingDraft 对应的物品名。 */
+function extractDraftItemName(draft: AgentDraft): string | undefined {
+  if (draft.kind === "restock") return draft.itemName
+  if (draft.kind === "createItemWithRestock") return draft.item.itemName
+  if (draft.kind === "createItem") return draft.itemName
   return undefined
 }
 

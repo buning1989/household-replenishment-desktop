@@ -329,15 +329,10 @@ const cases = [
       return { state, itemViews: [], pendingCollection: buildWipesCollection() }
     },
     expect: ({ decision, trace, restockFields: rf }) => {
-      assertEqual(trace.decisionBeforeAppDispatch, "needTurnInterpreterLlm", "first decision")
-      assertEqual(trace.llmInterpreter?.called, true, "llm called")
-      assertEqual(trace.llmInterpreter?.rejected, false, "llm not rejected")
-      assertEqual(
-        trace.llmInterpreter?.normalizedInterpretation?.fields?.platform,
-        "拼多多",
-        "normalized platform"
-      )
-      assertEqual(trace.synthesizedInput, "拼多多", "synthesized input")
+      // 阶段 4B.5：本地 PLATFORM_ALIASES 已能识别「拼夕夕」→ 拼多多，
+      // 因此可能走本地 high confidence（sync，LLM 不调用），
+      // 也可能走 LLM interpreter（needTurnInterpreterLlm）。
+      // 两条路径都合法，关键是最终 platform=拼多多 且不报「超出家务范围」。
       assertEqual(decision.kind, "sync", "final decision kind")
       assertOk(
         decision.turn.kind === "collection" || decision.turn.kind === "proposal",
@@ -361,13 +356,9 @@ const cases = [
       return { state, itemViews: [], pendingCollection: buildWipesCollection() }
     },
     expect: ({ decision, trace, restockFields: rf }) => {
-      assertEqual(trace.llmInterpreter?.called, true, "llm called")
-      assertEqual(trace.llmInterpreter?.rejected, false, "llm not rejected")
-      assertEqual(
-        trace.llmInterpreter?.normalizedInterpretation?.fields?.platform,
-        "拼多多",
-        "normalized platform"
-      )
+      // 阶段 4B.5：本地 PLATFORM_ALIASES 已能识别「PDD」→ 拼多多，
+      // 因此可能走本地 high confidence（sync，LLM 不调用），
+      // 也可能走 LLM interpreter（needTurnInterpreterLlm）。
       assertEqual(decision.kind, "sync", "final decision kind")
       const draft =
         decision.turn.kind === "collection"

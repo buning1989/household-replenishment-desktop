@@ -26,6 +26,7 @@ import {
   type AgentAction,
   type AgentPlan
 } from "./actions"
+import { isPlanFullyExecutable, planContainsClosedActions } from "./capabilities"
 
 export type BuildAgentPlanInput = {
   text: string
@@ -495,6 +496,20 @@ function buildDeletePurchaseOptionPlan(itemName: string, productName: string, st
 }
 
 /**
+ * 阶段 4B.7 补口：指代词检测。
+ *
+ * 当用户说「删除这条补货记录」「删掉那次记录」「把这条记录删掉」时，
+ * 提取出的 itemName 可能是「这条」「那次」等指代词，而非真实物品名。
+ * 此时不应把指代词当物品名去 findItemMatch，也不应建议「帮我加」，
+ * 而应直接追问用户指定物品名和日期。
+ */
+const DEICTIC_REFERENCE_PATTERN = /^(这条|这笔|这次|那条|那笔|那次|这条记录|这笔记录|那条记录|这次补货|那条补货|这|那)$/
+
+function isDeicticReference(s: string): boolean {
+  return DEICTIC_REFERENCE_PATTERN.test(s.trim())
+}
+
+/**
  * 删除补货记录：「删除猫砂最近一条补货记录」「删除猫砂昨天那条补货记录」「删除猫砂价格 58 的那条补货记录」
  * 无法唯一定位时返回 clarification，不生成 plan。
  */
@@ -505,6 +520,12 @@ function tryParseDeleteRestockRecord(text: string, state: AppState): BuildAgentP
   const m = compact.match(/(?:删除|删掉|去掉|移除|把)([^\s，。,!.！？?把的最近一条昨天前天今天价格元块那补货记录删掉]+)/)
   if (!m) return { kind: "noPlan" }
   const itemName = cleanName(m[1])
+  // 阶段 4B.7 补口：指代词检测。
+  //   「删除这条补货记录」「删掉那次记录」等没指定物品名，不应把「这条」当物品名，
+  //   也不应建议「帮我加」。直接追问物品名和日期。
+  if (isDeicticReference(itemName)) {
+    return { kind: "clarification", message: "你想删除哪一条补货记录？可以告诉我物品名和日期。" }
+  }
   const match = findItemMatch(state, itemName)
   if (!match.item) {
     return { kind: "clarification", message: `找不到消耗品「${itemName}」。` }
@@ -938,9 +959,15 @@ export function buildAgentPlan(input: BuildAgentPlanInput): BuildAgentPlanResult
   const { text, state, dateContext } = input
 
   // 1. pendingPlan 修订优先
+  //    注意：仅保留对录入类 plan 的修订（补货/创建）。管理类 plan 不再生成，
+  //    所以正常新会话不会进入此分支；旧 pendingPlan 兼容兜底仍保留。
   if (input.pendingPlan) {
     const revised = tryRevisePendingPlan(input)
     if (revised) {
+      // 能力收缩：修订后的 plan 若包含已关闭的管理类 action，不再返回
+      if (planContainsClosedActions(revised.actions.map((a) => a.type))) {
+        return { kind: "noPlan" }
+      }
       return { kind: "plan", plan: revised }
     }
     // pendingPlan 存在但本轮不是修订：交给 orchestrator 判断是 confirm/cancel/新请求
@@ -948,81 +975,42 @@ export function buildAgentPlan(input: BuildAgentPlanInput): BuildAgentPlanResult
     return { kind: "noPlan" }
   }
 
-  // 2. 建分类
+  // 2. 建分类（录入域必要能力，保留）
   const categoryAction = tryParseCreateCategory(text, state)
   if (categoryAction) {
     return { kind: "plan", plan: createAgentPlan([categoryAction], text) }
   }
 
-  // 3. 设置预算
-  const budgetAction = tryParseSetMonthlyBudget(text)
-  if (budgetAction) {
-    return { kind: "plan", plan: createAgentPlan([budgetAction], text) }
-  }
+  // 能力收缩：以下管理类入口已关闭，不再通过对话生成 pendingPlan。
+  //   - 设置预算（setMonthlyBudget）         → 导航到设置页
+  //   - 修改消耗品周期（updateItem）          → 定位到物品详情
+  //   - 重命名分类（renameCategory）         → 定位到分类设置
+  //   - 移动消耗品（moveItem）               → 定位到物品详情
+  //   - 改单位（updateItemUnit）             → 定位到物品详情
+  //   - 改提醒（updateItemReminder）         → 定位到物品详情
+  //   - 改常购商品（updatePurchaseOption）   → 定位到物品详情
+  //   - 设默认常购商品（setDefaultPurchaseOption） → 定位到物品详情
+  //   - 删除消耗品/分类/常购商品/补货记录    → 定位到对应详情/列表
+  //
+  // 这些请求由 turnInterpretation 识别为 delete_request / manage_item / manage_budget，
+  // 再由 focusResolver 路由到 route_to_navigate，由 householdOrchestrator 返回导航回答。
+  // 旧 tryParse* 函数保留（兼容已有测试和 executor），但不再从主链路调用。
 
-  // 4. 修改消耗品周期
-  const updateAction = tryParseUpdateItem(text, state)
-  if (updateAction) {
-    return { kind: "plan", plan: createAgentPlan([updateAction], text) }
-  }
-
-  // 4b. 第二期编辑类：重命名分类、移动分类、改单位、改提醒、改常购商品、设默认
-  const renameAction = tryParseRenameCategory(text, state)
-  if (renameAction) {
-    return { kind: "plan", plan: createAgentPlan([renameAction], text) }
-  }
-  const moveAction = tryParseMoveItem(text, state)
-  if (moveAction) {
-    return { kind: "plan", plan: createAgentPlan([moveAction], text) }
-  }
-  const unitAction = tryParseUpdateItemUnit(text, state)
-  if (unitAction) {
-    return { kind: "plan", plan: createAgentPlan([unitAction], text) }
-  }
-  const reminderAction = tryParseUpdateItemReminder(text, state)
-  if (reminderAction) {
-    return { kind: "plan", plan: createAgentPlan([reminderAction], text) }
-  }
-  const updateOptAction = tryParseUpdatePurchaseOption(text, state)
-  if (updateOptAction) {
-    return { kind: "plan", plan: createAgentPlan([updateOptAction], text) }
-  }
-  const setDefaultAction = tryParseSetDefaultPurchaseOption(text, state)
-  if (setDefaultAction) {
-    return { kind: "plan", plan: createAgentPlan([setDefaultAction], text) }
-  }
-
-  // 4c. 第三期删除类：删除分类、删除消耗品、删除常购商品、删除补货记录
-  //     删除类返回 BuildAgentPlanResult（含 clarification），直接透传
-  //     顺序：分类范围批量删除 → 删除分类 → 常购商品 → 补货记录 → 消耗品
-  //     "删除卫生间下的消耗品"比"删除卫生间"更具体，必须优先识别
-  const deleteItemsInCategoryResult = tryParseDeleteItemsInCategory(text, state)
-  if (deleteItemsInCategoryResult.kind !== "noPlan") return deleteItemsInCategoryResult
-
-  const deleteCategoryResult = tryParseDeleteCategory(text, state)
-  if (deleteCategoryResult.kind !== "noPlan") return deleteCategoryResult
-
-  const deletePurchaseOptionResult = tryParseDeletePurchaseOption(text, state)
-  if (deletePurchaseOptionResult.kind !== "noPlan") return deletePurchaseOptionResult
-
-  const deleteRestockRecordResult = tryParseDeleteRestockRecord(text, state)
-  if (deleteRestockRecordResult.kind !== "noPlan") return deleteRestockRecordResult
-
-  const deleteItemResult = tryParseDeleteItem(text, state)
-  if (deleteItemResult.kind !== "noPlan") return deleteItemResult
-
-  // 5. 复用 buildLocalDraftFromText 处理「买了/添加/常购商品」
+  // 3. 复用 buildLocalDraftFromText 处理「买了/添加/常购商品」
   const draft = buildLocalDraftFromText(text, state)
   if (draft) {
     let actions = draftToActions(draft, state)
     // 后处理：从「N 天提醒一次」「周期 N 天」中提取 cycleDays，补到 createItem / recordRestock
     actions = applyCycleDaysFromText(actions, text)
     if (actions.length > 0) {
-      return { kind: "plan", plan: createAgentPlan(actions, text) }
+      // 能力收缩：仅保留可执行 action（createItem / addPurchaseOption / recordRestock / createCategory）
+      if (isPlanFullyExecutable(actions.map((a) => a.type))) {
+        return { kind: "plan", plan: createAgentPlan(actions, text) }
+      }
     }
   }
 
-  // 6. 本地解析失败
+  // 4. 本地解析失败
   return { kind: "noPlan" }
 }
 
@@ -1155,6 +1143,12 @@ function summarizeActionLocal(action: AgentAction, state: AppState): string {
     }
     case "deleteCategory": {
       return `删除分类「${action.categoryName}」`
+    }
+    case "calibrateInventory": {
+      const daysText = action.remainingDays === 0
+        ? "已用完"
+        : `还能用 ${action.remainingDays} 天`
+      return `更新「${action.itemName}」的库存状态：${daysText}`
     }
     default:
       return "（未实现的动作）"

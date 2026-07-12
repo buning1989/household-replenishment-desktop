@@ -326,7 +326,9 @@ function migrateState(raw: unknown): AppState {
     items,
     settings: migrateSettings(raw.settings),
     householdProfile: migrateHouseholdProfile(raw.householdProfile),
-    updatedAt: asFiniteNumber(raw.updatedAt) ?? Date.now()
+    updatedAt: asFiniteNumber(raw.updatedAt) ?? Date.now(),
+    // 403：保留 lastAgentMutation（可选字段，旧数据无此字段时为 undefined）
+    lastAgentMutation: isObject(raw.lastAgentMutation) ? raw.lastAgentMutation as AppState["lastAgentMutation"] : undefined
   }
 }
 

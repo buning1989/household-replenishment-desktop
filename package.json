@@ -20,6 +20,9 @@
     "smoke:agent-llm": "node scripts/smoke-agent-llm-fallback.mjs",
     "smoke:agent-llm:real": "node scripts/smoke-agent-llm-real.mjs",
     "smoke:agent-focus-regression": "node scripts/smoke-agent-focus-regression.mjs",
+    "demo:seed": "node scripts/demo-seed.mjs",
+    "demo:verify": "node scripts/demo-verify.mjs",
+    "demo:reset": "node scripts/demo-reset.mjs",
     "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64"
   },
   "dependencies": {

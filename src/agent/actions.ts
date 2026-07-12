@@ -256,7 +256,22 @@ export type DeleteCategoryAction = {
   categoryName: string
 }
 
-/** 第一期 + 第二期 + 第三期 Action 联合类型。 */
+/**
+ * 库存状态校准：用户报告当前库存状态（快没了/用完了/还剩两包等），
+ * Agent 调用 calibrateRemainingDays 更新 inventoryDepletionAt 锚点。
+ * 不创建补货记录，不新建消耗品。
+ */
+export type CalibrateInventoryAction = {
+  type: "calibrateInventory"
+  itemId: string
+  itemName: string
+  /** 预计还能用多少天；0 表示已用完 */
+  remainingDays: number
+  /** 用户原始状态描述，用于消息展示 */
+  statusLabel: string
+}
+
+/** 第一期 + 第二期 + 第三期 + 403 期 Action 联合类型。 */
 export type AgentAction =
   | CreateCategoryAction
   | CreateItemAction
@@ -275,6 +290,7 @@ export type AgentAction =
   | DeleteRestockRecordAction
   | DeleteItemAction
   | DeleteCategoryAction
+  | CalibrateInventoryAction
 
 /** 第一期支持的所有 action type 字面量，用于 registry 类型守卫。 */
 export type AgentActionType = AgentAction["type"]
@@ -339,6 +355,7 @@ export function actionRisk(action: AgentAction): AgentActionRisk {
     case "addPurchaseOption":
     case "recordRestock":
     case "setMonthlyBudget":
+    case "calibrateInventory":
       return "low"
     case "updateItem":
     case "updateRestockRecord":

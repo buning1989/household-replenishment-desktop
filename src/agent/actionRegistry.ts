@@ -596,6 +596,28 @@ const deleteCategoryDef: ActionDefinition<Extract<AgentAction, { type: "deleteCa
   }
 }
 
+// ---------- 403 期：calibrateInventory ----------
+
+const calibrateInventoryDef: ActionDefinition<import("./actions").CalibrateInventoryAction> = {
+  type: "calibrateInventory",
+  risk: "low",
+  requiredFields: ["itemId", "itemName", "remainingDays"],
+  validate(action, state) {
+    const errors: string[] = []
+    const warnings: string[] = []
+    if (!action.itemName?.trim()) errors.push("物品名不能为空")
+    if (!Number.isFinite(action.remainingDays) || action.remainingDays < 0) errors.push("remainingDays 必须是 >= 0 的数字")
+    const target = state.items.find((it) => it.id === action.itemId || it.name === action.itemName)
+    if (!target) warnings.push(`找不到消耗品「${action.itemName}」，将跳过`)
+    return { ok: errors.length === 0, errors, warnings }
+  },
+  summarize(action) {
+    const days = action.remainingDays
+    const label = days === 0 ? "已用完" : `还能用 ${days} 天`
+    return `库存校准：「${action.itemName}」${label}`
+  }
+}
+
 // ---------- Registry 表 ----------
 
 const REGISTRY: Record<AgentActionType, ActionDefinition> = {
@@ -615,7 +637,8 @@ const REGISTRY: Record<AgentActionType, ActionDefinition> = {
   deletePurchaseOption: deletePurchaseOptionDef as ActionDefinition,
   deleteRestockRecord: deleteRestockRecordDef as ActionDefinition,
   deleteItem: deleteItemDef as ActionDefinition,
-  deleteCategory: deleteCategoryDef as ActionDefinition
+  deleteCategory: deleteCategoryDef as ActionDefinition,
+  calibrateInventory: calibrateInventoryDef as ActionDefinition
 }
 
 /** 取某个 action type 的 definition。未知 type 抛错（不应发生，类型已约束）。 */

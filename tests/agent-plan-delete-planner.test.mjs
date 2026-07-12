@@ -1,12 +1,15 @@
 // AgentPlan 第三期：删除类句式的 planner 解析测试
 // 运行方式：node --test tests/agent-plan-delete-planner.test.mjs
 //
+// 403 能力收缩后：删除类请求不再通过对话生成 plan，buildAgentPlan 一律返回 noPlan，
+// 由 orchestrator 的导航处理器返回 answer 引导用户到对应 UI 手动操作。
+//
 // 覆盖：
-//   - deletePurchaseOption：「删除猫砂的 pidan 豆腐猫砂常购商品」「把猫砂里的 pidan 删掉」
-//   - deleteRestockRecord：「删除猫砂最近一条补货记录」「删除猫砂昨天那条」「价格 58 那条」
-//   - deleteItem：「删除猫砂」「把猫砂这个消耗品删掉」「不再管理猫砂」
-//   - deleteCategory：「删除猫咪用品分类」「把猫咪用品分类删掉」
-//   - 目标不明确时生成 clarification
+//   - deletePurchaseOption：「删除猫砂的 pidan 豆腐猫砂常购商品」「把猫砂里的 pidan 删掉」→ noPlan
+//   - deleteRestockRecord：「删除猫砂最近一条补货记录」「删除猫砂昨天那条」「价格 58 那条」→ noPlan
+//   - deleteItem：「删除猫砂」「把猫砂这个消耗品删掉」「不再管理猫砂」→ noPlan
+//   - deleteCategory：「删除猫咪用品分类」「把猫咪用品分类删掉」→ noPlan
+//   - 物品/商品/记录/分类不存在时同样返回 noPlan（不再生成 clarification）
 //   - 查询句式不生成删除 plan
 
 import { test } from "node:test"
@@ -60,87 +63,93 @@ function makeEvent(id, at, extra = {}) {
 
 const dateContext = buildChatDateContext(1000)
 
+// 403 能力收缩后已关闭的删除类 action（不应通过对话生成）
+const CLOSED_DELETE_TYPES = ["deletePurchaseOption", "deleteRestockRecord", "deleteItem", "deleteCategory"]
+
 // ---------- deletePurchaseOption ----------
 
-test("planner: 「删除猫砂的 pidan 豆腐猫砂常购商品」 → deletePurchaseOption plan", () => {
+test("planner: 「删除猫砂的 pidan 豆腐猫砂常购商品」不生成删除类 action（能力已关闭）", () => {
   const state = makeState({
     items: [{ ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan 豆腐猫砂")] }]
   })
   const result = buildAgentPlan({ text: "删除猫砂的 pidan 豆腐猫砂常购商品", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deletePurchaseOption")
-  assert.equal(result.plan.actions[0].itemName, "猫砂")
+  // 能力收缩后：不再生成 deletePurchaseOption；含商品名的句式可能回退到录入域 addPurchaseOption，
+  // 但不应出现任何已关闭的删除类 action。
+  if (result.kind === "plan") {
+    const hasClosedDelete = result.plan.actions.some((a) => CLOSED_DELETE_TYPES.includes(a.type))
+    assert.equal(hasClosedDelete, false, "不应生成已关闭的删除类 action")
+  }
 })
 
-test("planner: 「把猫砂里的 pidan 删掉」 → deletePurchaseOption plan", () => {
+test("planner: 「把猫砂里的 pidan 删掉」 → noPlan（能力已关闭）", () => {
   const state = makeState({
     items: [{ ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan")] }]
   })
   const result = buildAgentPlan({ text: "把猫砂里的 pidan 删掉", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deletePurchaseOption")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除常购商品时物品不存在 → clarification", () => {
+test("planner: 删除常购商品时物品不存在 → noPlan（不再生成 clarification）", () => {
   const state = makeState()
   const result = buildAgentPlan({ text: "删除猫砂的 pidan 常购商品", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /找不到/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除常购商品时商品不存在 → clarification", () => {
+test("planner: 删除常购商品时商品不存在 → 不生成删除类 action（不再生成 clarification）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "删除猫砂的 pidan 常购商品", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /没有/)
+  // 能力收缩后：不再生成 clarification；含商品名的句式可能回退到录入域 addPurchaseOption，
+  // 但不应出现任何已关闭的删除类 action。
+  if (result.kind === "plan") {
+    const hasClosedDelete = result.plan.actions.some((a) => CLOSED_DELETE_TYPES.includes(a.type))
+    assert.equal(hasClosedDelete, false, "不应生成已关闭的删除类 action")
+  }
 })
 
-test("planner: 删除常购商品 risk = high", () => {
+test("planner: 删除常购商品 → 不生成删除类 action（不再生成 risk plan）", () => {
   const state = makeState({
     items: [{ ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan")] }]
   })
   const result = buildAgentPlan({ text: "删除猫砂的 pidan 常购商品", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.risk, "high")
-  assert.equal(result.plan.requiresSecondConfirm, true)
+  // 能力收缩后：不再生成 risk plan；含商品名的句式可能回退到录入域 addPurchaseOption，
+  // 但不应出现任何已关闭的删除类 action。
+  if (result.kind === "plan") {
+    const hasClosedDelete = result.plan.actions.some((a) => CLOSED_DELETE_TYPES.includes(a.type))
+    assert.equal(hasClosedDelete, false, "不应生成已关闭的删除类 action")
+  }
 })
 
 // ---------- deleteRestockRecord ----------
 
-test("planner: 「删除猫砂最近一条补货记录」 → deleteRestockRecord plan", () => {
+test("planner: 「删除猫砂最近一条补货记录」 → noPlan（能力已关闭）", () => {
   const state = makeState({
     items: [{ ...makeItem("i1", "猫砂"), history: [makeEvent("e1", 1000)] }]
   })
   const result = buildAgentPlan({ text: "删除猫砂最近一条补货记录", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteRestockRecord")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 「删除猫砂价格 58 的那条补货记录」 → deleteRestockRecord plan with price", () => {
+test("planner: 「删除猫砂价格 58 的那条补货记录」 → noPlan（能力已关闭）", () => {
   const state = makeState({
     items: [{ ...makeItem("i1", "猫砂"), history: [makeEvent("e1", 1000, { price: 58 })] }]
   })
   const result = buildAgentPlan({ text: "删除猫砂价格 58 的那条补货记录", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteRestockRecord")
-  assert.equal(result.plan.actions[0].price, 58)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除补货记录时物品不存在 → clarification", () => {
+test("planner: 删除补货记录时物品不存在 → noPlan（不再生成 clarification）", () => {
   const state = makeState()
   const result = buildAgentPlan({ text: "删除猫砂最近一条补货记录", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /找不到/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除补货记录时无记录 → clarification", () => {
+test("planner: 删除补货记录时无记录 → noPlan（不再生成 clarification）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "删除猫砂最近一条补货记录", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /没有补货记录/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除补货记录多匹配 → clarification", () => {
+test("planner: 删除补货记录多匹配 → noPlan（不再生成 clarification）", () => {
   const state = makeState({
     items: [{
       ...makeItem("i1", "猫砂"),
@@ -148,88 +157,74 @@ test("planner: 删除补货记录多匹配 → clarification", () => {
     }]
   })
   const result = buildAgentPlan({ text: "删除猫砂价格 58 的那条补货记录", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /2 条/)
+  assert.equal(result.kind, "noPlan")
 })
 
 // ---------- deleteItem ----------
 
-test("planner: 「删除猫砂」 → deleteItem plan", () => {
+test("planner: 「删除猫砂」 → noPlan（能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "删除猫砂", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteItem")
-  assert.equal(result.plan.actions[0].itemName, "猫砂")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 「把猫砂这个消耗品删掉」 → deleteItem plan", () => {
+test("planner: 「把猫砂这个消耗品删掉」 → noPlan（能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "把猫砂这个消耗品删掉", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteItem")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 「不再管理猫砂」 → deleteItem plan", () => {
+test("planner: 「不再管理猫砂」 → noPlan（能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "不再管理猫砂", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteItem")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除物品不存在 → clarification", () => {
+test("planner: 删除物品不存在 → noPlan（不再生成 clarification）", () => {
   const state = makeState()
   const result = buildAgentPlan({ text: "删除猫砂", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /找不到/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除物品 risk = high + requiresSecondConfirm", () => {
+test("planner: 删除物品 → noPlan（不再生成 risk plan）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const result = buildAgentPlan({ text: "删除猫砂", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.risk, "high")
-  assert.equal(result.plan.requiresSecondConfirm, true)
+  assert.equal(result.kind, "noPlan")
 })
 
 // ---------- deleteCategory ----------
 
-test("planner: 「删除猫咪用品分类」 → deleteCategory plan（空分类）", () => {
+test("planner: 「删除猫咪用品分类」 → noPlan（空分类也不再生成 plan）", () => {
   const state = makeState({ categories: ["猫咪用品", "其他"], items: [] })
   const result = buildAgentPlan({ text: "删除猫咪用品分类", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteCategory")
-  assert.equal(result.plan.actions[0].categoryName, "猫咪用品")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 「把猫咪用品分类删掉」 → deleteCategory plan", () => {
+test("planner: 「把猫咪用品分类删掉」 → noPlan（能力已关闭）", () => {
   const state = makeState({ categories: ["猫咪用品", "其他"], items: [] })
   const result = buildAgentPlan({ text: "把猫咪用品分类删掉", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "deleteCategory")
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除非空分类 → clarification（不生成可确认 plan）", () => {
+test("planner: 删除非空分类 → noPlan（不再生成 clarification）", () => {
   const state = makeState({
     categories: ["宠物用品"],
     items: [makeItem("i1", "猫砂", "宠物用品")]
   })
   const result = buildAgentPlan({ text: "删除宠物用品分类", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /还有.*消耗品/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除不存在的分类 → clarification", () => {
+test("planner: 删除不存在的分类 → noPlan（不再生成 clarification）", () => {
   const state = makeState()
   const result = buildAgentPlan({ text: "删除不存在的分类分类", state, dateContext })
-  assert.equal(result.kind, "clarification")
-  assert.match(result.message, /不存在/)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("planner: 删除分类 risk = high", () => {
+test("planner: 删除分类 → noPlan（不再生成 risk plan）", () => {
   const state = makeState({ categories: ["猫咪用品"], items: [] })
   const result = buildAgentPlan({ text: "删除猫咪用品分类", state, dateContext })
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.risk, "high")
+  assert.equal(result.kind, "noPlan")
 })
 
 // ---------- 查询句式不生成删除 plan ----------

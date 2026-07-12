@@ -196,27 +196,20 @@ function traceSummary(trace) {
 const collectionCases = [
   {
     group: "pendingCollection",
-    name: "1.1 拼夕夕 → platform=拼多多（mock LLM）",
-    async: true,
-    run: async () => {
+    name: "1.1 拼夕夕 → platform=拼多多（本地别名，不送 LLM）",
+    run: () => {
       const orch = createHouseholdOrchestrator()
       const state = makeState({ items: [] })
       const pendingCollection = buildWipesCollection()
       const trace = createTrace("拼夕夕", {})
 
       const d = decide(orch, { text: "拼夕夕", state, itemViews: [], pendingCollection, trace })
-      assertEqual(d.kind, "needTurnInterpreterLlm", "decide kind")
-
-      const llmDecision = await orch.interpretAndRoute(
-        { text: "拼夕夕", state, itemViews: [], pendingCollection, dateContext: DATE_CONTEXT, trace },
-        mockClient({ intent: "supplement_current_collection", fields: { platform: "拼多多" }, confidence: "high", reason: "拼夕夕是拼多多别名" })
-      )
-      assertEqual(llmDecision.kind, "sync", "llmDecision kind")
-      assertEqual(llmDecision.turn.kind, "collection", "turn kind")
-      const draft = llmDecision.turn.collection?.draft
+      // 阶段 4B.5：拼夕夕现在由本地 parsePlatform 别名表处理，不再送 LLM
+      assertEqual(d.kind, "sync", "decide kind")
+      assertOk(d.turn.kind === "collection" || d.turn.kind === "proposal", "turn kind")
+      const draft = d.turn.kind === "collection" ? d.turn.collection?.draft : d.turn.executableDraft
       assertEqual(restockFields(draft).platform, "拼多多", "platform")
-      assertEqual(trace.llmInterpreter.called, true, "llm called")
-      assertEqual(trace.llmInterpreter.schemaValid, true, "schemaValid")
+      assertEqual(trace.llmInterpreter.called, false, "llm not called")
       return { trace }
     }
   },
@@ -495,13 +488,14 @@ const traceCases = [
       const orch = createHouseholdOrchestrator()
       const state = makeState({ items: [] })
       const pendingCollection = buildWipesCollection()
-      const trace = createTrace("拼夕夕", {})
+      // 阶段 4B.5：使用 p'd'd（带撇号）确保仍需 LLM 解释
+      const trace = createTrace("p'd'd", {})
 
-      const d = decide(orch, { text: "拼夕夕", state, itemViews: [], pendingCollection, trace })
+      const d = decide(orch, { text: "p'd'd", state, itemViews: [], pendingCollection, trace })
       assertEqual(d.kind, "needTurnInterpreterLlm", "decide kind")
 
       const llmDecision = await orch.interpretAndRoute(
-        { text: "拼夕夕", state, itemViews: [], pendingCollection, dateContext: DATE_CONTEXT, trace },
+        { text: "p'd'd", state, itemViews: [], pendingCollection, dateContext: DATE_CONTEXT, trace },
         mockClient({ intent: "supplement_current_collection", fields: { platform: "拼多多" }, confidence: "high", reason: "test" })
       )
       assertEqual(llmDecision.kind, "sync", "llmDecision kind")

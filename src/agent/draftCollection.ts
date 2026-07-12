@@ -18,6 +18,7 @@
  */
 
 import { reviseAgentDraft, extractReviewText, type AgentDraft, type RestockDraftDetails } from "./drafts"
+import { classifyAgentIntent } from "./intent"
 import type { AppState } from "../types"
 
 export type DraftCompleteness =
@@ -53,6 +54,38 @@ const FORCE_PROPOSAL_PATTERNS = [
   /就这样记/,
   /先记上/
 ]
+
+/**
+ * 阶段 4B.5：采集态下的轻量确认信号。
+ * - "好的"/"可以"/"对"/"ok" 等：仅当 completeness === "readyToConfirm" 时才触发转 proposal
+ * - "确认"：在 readyToConfirm 或 missingQualityFields 时都触发转 proposal
+ *   （"确认"是比"好的"更强的信号，允许跳过质量字段追问）
+ */
+const COLLECTION_CONFIRM_PATTERNS = [
+  /^好的$/, /^好吧$/, /^可以$/, /^ok$/i, /^OK$/,
+  /^对$/, /^对的$/, /^是$/, /^是的$/, /^行$/,
+  /^确认$/
+]
+
+export function isCollectionConfirmSignal(text: string): boolean {
+  const compact = text.trim().replace(/\s+/g, "")
+  return COLLECTION_CONFIRM_PATTERNS.some((pattern) => pattern.test(compact))
+}
+
+/**
+ * 阶段 4B.5：强确认信号（如"确认"/"确定"/"保存"/"提交"/"就这么记"），
+ * 允许在 missingQualityFields 时也触发 draftCommit。
+ *
+ * 403 修复：统一确认意图——任何被 classifyAgentIntent 识别为 confirmDraft 的明确确认短语
+ * 都视为强确认信号。旧实现只识别 /^确认$/，导致"确定"/"保存"/"提交"/"就这么记"等确认词
+ * 在采集态 missingQualityFields（如平台缺失）时无法直接提交，形成确认死循环。
+ *
+ * classifyAgentIntent 的 isConfirmMatch 已含疑问信号防护（吗/？/怎么/什么/多少），
+ * 不会把"确定要删除吗"误判为确认。
+ */
+export function isCollectionStrongConfirmSignal(text: string): boolean {
+  return classifyAgentIntent(text, true) === "confirmDraft"
+}
 
 /** 用户取消当前 collection 的信号。 */
 const CANCEL_COLLECTION_PATTERNS = [
@@ -146,8 +179,12 @@ export function isCollectableDraft(draft: AgentDraft): boolean {
 /**
  * 计算缺失字段。
  *   required: itemName / qty / unit / restockDate
- *   quality (阻塞 readyToConfirm): price / platform
- *   quality (非阻塞，仅记录): purchaseProductName / 规格
+ *   quality (阻塞 readyToConfirm): price
+ *   optional (不阻塞，不追问): platform / purchaseProductName / 规格
+ *
+ * 403 修复：platform 从 qualityMissing 中移除。
+ * 平台是可选字段，缺失时绝不能触发采集态或追问「在哪个平台买的」。
+ * 只有 price 缺失时才进入采集态给参考，用户可说「就这样」跳过。
  */
 export function computeMissingSlots(draft: AgentDraft): {
   requiredMissing: string[]
@@ -165,9 +202,8 @@ export function computeMissingSlots(draft: AgentDraft): {
   if (!details.unit || !details.unit.trim()) requiredMissing.push("unit")
   if (details.restockDate === undefined || details.restockDate === null) requiredMissing.push("restockDate")
 
-  // 阻塞型 quality
+  // 阻塞型 quality：仅 price
   if (details.price === undefined || details.price === null) qualityMissing.push("price")
-  if (!details.platform || !details.platform.trim()) qualityMissing.push("platform")
 
   return { requiredMissing, qualityMissing }
 }
@@ -261,9 +297,10 @@ export function reviseDraftCollection(
  *
  * 规则：
  *   - 非 restock 类草稿（createItem / addPurchaseOption）不进采集态
- *   - 草稿已 readyToConfirm（required + price + platform 都齐）→ 不进采集态，直接 proposal
+ *   - 草稿已 readyToConfirm（required + price 都齐）→ 不进采集态，直接 proposal
  *   - 用户明确 force-proposal → 不进采集态
- *   - 否则 → 进采集态
+ *   - price 缺失 → 进采集态（给历史价格参考，用户可说「就这样」跳过）
+ *   - platform 缺失 → 不进采集态（平台是可选字段，绝不追问）
  */
 export function shouldEnterCollection(draft: AgentDraft, userText: string): boolean {
   if (!isCollectableDraft(draft)) return false

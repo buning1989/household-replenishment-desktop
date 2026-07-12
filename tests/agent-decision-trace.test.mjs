@@ -189,47 +189,26 @@ test("2. commitTrace 暴露到 globalThis（测试环境无 window）", () => {
   assert.equal(last, trace)
 })
 
-// ---------- 3. mock client 返回 platform=拼多多 时 final turn 更新 collection.platform ----------
+// ---------- 3. 拼夕夕 本地 parsePlatform 处理为 platform=拼多多（不再调用 LLM） ----------
 
-test("3. 拼夕夕 + LLM 返回 platform=拼多多 → trace 完整，final collection.platform=拼多多", async () => {
+test("3. 拼夕夕 → 本地 parsePlatform 处理为 platform=拼多多, 不调用 LLM", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const { input, trace } = makeDecideInput("拼夕夕", state)
 
   const d = orch.decide(input)
-  assert.equal(d.kind, "needTurnInterpreterLlm")
-  assert.equal(trace.decisionBeforeAppDispatch, "needTurnInterpreterLlm")
-  assert.equal(trace.firstFocusDecision?.focus, "route_to_llm")
-  assert.equal(trace.collectionFallback?.tried, true)
-  assert.equal(trace.collectionFallback?.producedTurn, false)
-
-  const llmDecision = await orch.interpretAndRoute(
-    input,
-    mockClient({
-      intent: "supplement_current_collection",
-      fields: { platform: "拼多多" },
-      confidence: "high",
-      reason: "拼夕夕是拼多多别名"
-    })
-  )
-  assert.equal(llmDecision.kind, "sync")
-  assert.ok(trace.llmInterpreter?.called, "LLM 必须被调用")
-  assert.equal(trace.llmInterpreter?.rejected, false)
-  assert.equal(trace.llmInterpreter?.normalizedInterpretation?.fields.platform, "拼多多")
-  assert.equal(trace.secondFocusDecision?.focus, "continue_pending_collection")
-  assert.equal(trace.synthesizedInput, "拼多多")
-  assert.equal(trace.finalDecision?.kind, "sync")
+  assert.equal(d.kind, "sync")
   assert.ok(
-    trace.finalDecision?.turnKind === "collection" || trace.finalDecision?.turnKind === "proposal",
-    `期望 collection 或 proposal, 实际: ${trace.finalDecision?.turnKind}`
+    d.turn.kind === "collection" || d.turn.kind === "proposal",
+    `期望 collection 或 proposal, 实际: ${d.turn.kind}`
   )
+  // 本地 parsePlatform 处理「拼夕夕」→ 拼多多，不进入 LLM
+  assert.equal(trace.firstFocusDecision?.focus, "continue_pending_collection")
+  assert.equal(trace.llmInterpreter?.called, false)
 
   // 验证 collection.platform 真正更新
-  if (llmDecision.turn.kind === "collection") {
-    assert.equal(restockFields(llmDecision.turn.collection.draft).platform, "拼多多")
-  } else if (llmDecision.turn.kind === "proposal") {
-    assert.equal(restockFields(llmDecision.turn.executableDraft).platform, "拼多多")
-  }
+  const draft = d.turn.kind === "collection" ? d.turn.collection.draft : d.turn.executableDraft
+  assert.equal(restockFields(draft).platform, "拼多多")
 })
 
 // ---------- 4. mock client 返回 malformed JSON → rejectReason = json_parse_failed ----------
@@ -310,19 +289,33 @@ test("7. LLM 返回 low confidence → trace.rejectReason = confidence_low", asy
   assert.equal(trace.finalDecision?.turnKind, "clarification")
 })
 
-// ---------- 8. PDD / p'd'd / 拼夕夕 不能在未调用 LLM 的情况下直接 clarification ----------
+// ---------- 8. 拼夕夕 / PDD / pdd / 多多 本地处理 (sync), p'd'd 仍需 LLM ----------
 
-test("8. 拼夕夕 / PDD / p'd'd 必须进入 needTurnInterpreterLlm，不能直接 clarification", () => {
+test("8. 拼夕夕 / PDD / pdd / 多多 本地处理 (sync), p'd'd 仍需 LLM (needTurnInterpreterLlm)", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
 
-  for (const text of ["拼夕夕", "PDD", "pdd", "p'd'd", "多多"]) {
+  // 本地 parsePlatform 处理的别名 → sync, 不调用 LLM
+  for (const text of ["拼夕夕", "PDD", "pdd", "多多"]) {
     const { input, trace } = makeDecideInput(text, state)
     const d = orch.decide(input)
     assert.equal(
       d.kind,
+      "sync",
+      `「${text}」应本地处理为 sync, 实际: ${d.kind}`
+    )
+    assert.equal(trace.firstFocusDecision?.focus, "continue_pending_collection")
+    assert.equal(trace.llmInterpreter?.called, false)
+  }
+
+  // p'd'd 仍需 LLM（撇号破坏别名匹配，parsePlatform 返回 undefined）
+  {
+    const { input, trace } = makeDecideInput("p'd'd", state)
+    const d = orch.decide(input)
+    assert.equal(
+      d.kind,
       "needTurnInterpreterLlm",
-      `「${text}」应进入 needTurnInterpreterLlm, 实际: ${d.kind}`
+      `「p'd'd」应进入 needTurnInterpreterLlm, 实际: ${d.kind}`
     )
     assert.equal(trace.decisionBeforeAppDispatch, "needTurnInterpreterLlm")
     assert.equal(trace.firstFocusDecision?.focus, "route_to_llm")
@@ -330,7 +323,7 @@ test("8. 拼夕夕 / PDD / p'd'd 必须进入 needTurnInterpreterLlm，不能直
     assert.equal(trace.collectionFallback?.tried, true)
     assert.equal(trace.collectionFallback?.producedTurn, false)
     // 不应直接走 sync clarification
-    assert.notEqual(trace.finalDecision?.turnKind, "clarification", `「${text}」不应直接 clarification`)
+    assert.notEqual(trace.finalDecision?.turnKind, "clarification", `「p'd'd」不应直接 clarification`)
   }
 })
 
@@ -712,20 +705,24 @@ test("31. normalizeLlm queryAnswer → parseResult.ok=true, validationResult.pas
 
 // ---------- 32. normalizeLlm：解析失败填充 parseResult + validationResult ----------
 
-test("32. normalizeLlm 非 JSON → parseResult.ok=false, validationResult.rejectReason=normalize_returned_null", () => {
+test("32. normalizeLlm JSON-like 无 answer/message → 中性兜底 answer, parseResult.ok=false", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const trace = createTrace("随便说", {})
-  // 含 JSON 结构但解析失败的内容不放宽为纯文本 answer（避免 LLM 用半结构化内容绕过写入校验）
+  // 阶段 4B.4：含 JSON 结构但无 answer/message 字段时，不再返回 null 走 unsupported。
+  // 改为返回中性兜底 answer，不把原始 JSON 吐给用户。
   const turn = orch.normalizeLlmResponse(
     '{ "kind": "invalid", "data": ... }',
     { text: "随便说", state, itemViews: [], dateContext: DATE_CONTEXT, trace }
   )
-  assert.equal(turn, null, "含 JSON 结构但解析失败应返回 null")
+  assert.ok(turn, "应返回 turn（不应 null）")
+  assert.equal(turn.kind, "answer")
+  assert.ok(!turn.message.includes("超出家务范围"), "不应包含「超出家务范围」")
+  assert.ok(!turn.message.includes("不太属于我能直接处理"), "不应包含旧 unsupported 文案")
   assert.equal(trace.parseResult?.ok, false)
-  assert.equal(trace.parseResult?.error, "parse_failed")
-  assert.equal(trace.validationResult?.passed, false)
-  assert.equal(trace.validationResult?.rejectReason, "normalize_returned_null")
+  assert.equal(trace.parseResult?.error, "parse_failed_but_answer_salvaged")
+  assert.equal(trace.validationResult?.passed, true)
+  assert.equal(trace.validationResult?.turnKind, "answer")
 })
 
 // ---------- 33. normalizeLlm：draft 填充 parseResult + validationResult ----------

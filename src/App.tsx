@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent } from "react"
+import { Fragment, useEffect, useMemo, useRef, useState, type FormEvent, type MutableRefObject } from "react"
 import { AnimatedIcon as Icon } from "./AnimatedIcon"
 import catIcon from "./assets/cat-icon.png?inline"
 import managerAvatar from "./assets/manager-avatar.png"
@@ -26,9 +26,9 @@ import { answerHouseholdQuickly, askHouseholdAssistant, buildChatDateContext, bu
 import { buildManagerBriefing, buildManagerObservations } from "./agent/observations"
 import { buildLocalClarification, buildLocalDraftFromText, buildNotificationRestockDraft, buildNotificationRestockMessage, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft, type AgentDraftStatus, type OrderRow } from "./agent/drafts"
 import { classifyBatchIntent, classifyAgentIntent } from "./agent/intent"
-import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, commitAgentPlan, mapOrderLinesToDrafts, type AgentMessageLink } from "./agent/executor"
+import { buildAgentDraftsFromOrderRows, commitAgentDraft, commitAgentDraftBatch, commitAgentPlan, correctLastAgentMutation, mapOrderLinesToDrafts, undoLastAgentMutation, type AgentMessageLink } from "./agent/executor"
 import { buildAgentContextPack, supersedeOldPendingBatch, supersedeOldPendingDraft, supersedeOldPendingCollection, supersedeOldPendingPlan } from "./agent/conversationContext"
-import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
+import { composeBoundaryAnswer, composeDraftStatusLabel, composeFallbackMessage, composeMatchHintText, composeOrderImportSummary, composeOrderRecognizingMessage, composeParseFailedMessage, composePendingReminder, composeProposalMessage, composeRevisedMessage, isProductNameRedundant } from "./agent/responseComposer"
 import { classifyConversationBoundary } from "./agent/conversationBoundary"
 import { computeRemainingDelay, getResponseTiming } from "./agent/responsePacing"
 import {
@@ -286,9 +286,10 @@ function App() {
   const [categoryCreatorClosing, setCategoryCreatorClosing] = useState(false)
   const [categoryManagerClosing, setCategoryManagerClosing] = useState(false)
   const [householdChatOpen, setHouseholdChatOpen] = useState(false)
-  const [householdChatClosing, setHouseholdChatClosing] = useState(false)
   const [householdChatMessages, setHouseholdChatMessages] = useState<HouseholdChatMessage[]>([])
   const [householdChatLastQuestion, setHouseholdChatLastQuestion] = useState("")
+  // 跨页面切换的对话滚动位置记忆：离开对话页时保存 scrollTop 与消息数量，重新进入时恢复。
+  const chatScrollMemoryRef = useRef<{ pos: number; count: number }>({ pos: 0, count: 0 })
   // 任务四 A：会话级观察去重状态。同一会话内已展示过的观察（按 kind+itemId）不再重复出现；面板关闭时重置。
   const seenObservationKeysRef = useRef<Set<string>>(new Set())
   // Item creator dialog state
@@ -408,7 +409,6 @@ function App() {
       if (pendingCategoryDelete) setPendingCategoryDelete(null)
       else if (categoryDialog) setCategoryDialog(null)
       else if (detailItemId) deferredClose(setDetailPanelClosing, () => setDetailItemId(null))
-      else if (householdChatOpen) closeChatWithSessionUpdate()
       else if (settingsOpen) deferredClose(setSettingsClosing, () => setSettingsOpen(false))
       else if (categoryCreatorOpen) deferredClose(setCategoryCreatorClosing, () => setCategoryCreatorOpen(false), 150)
     }
@@ -418,6 +418,61 @@ function App() {
 
   function commit(next: AppState) {
     setState({ ...next, updatedAt: Date.now() })
+  }
+
+  // ---- Demo Reset ----
+  const [demoResetStatus, setDemoResetStatus] = useState<"idle" | "confirming" | "loading" | "success" | "error">("idle")
+  const [demoResetError, setDemoResetError] = useState("")
+
+  async function handleResetToDemo() {
+    setDemoResetStatus("loading")
+    setDemoResetError("")
+    try {
+      // 诊断日志：确认 Electron preload 注入状态
+      const desktopKeys = window.desktop ? Object.keys(window.desktop) : []
+      if (import.meta.env.DEV) {
+        console.log("[demo-reset] electron api available:", !!window.desktop)
+        console.log("[demo-reset] reset method available:", !!window.desktop?.resetToDemoState)
+        console.log("[demo-reset] desktop keys:", desktopKeys)
+      }
+      if (!window.desktop?.resetToDemoState) {
+        throw new Error(
+          window.desktop
+            ? `恢复功能未就绪：desktop 上缺少 resetToDemoState（可用方法: ${desktopKeys.join(", ") || "无"}）。请完全退出应用后重新执行 npm run dev。`
+            : "恢复功能未就绪：Electron preload 未注入（window.desktop 不存在）。请完全退出应用后重新执行 npm run dev。"
+        )
+      }
+      const result = await window.desktop.resetToDemoState(state)
+      if (!result.ok) {
+        throw new Error(result.error || "恢复失败")
+      }
+      // 覆盖 localStorage，确保 reconcileState 不会用旧 localStorage 覆盖 Demo State
+      const STORAGE_KEY = "household_replenishment_desktop_v1"
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(result.state))
+      // 清除损坏数据备份键（如有）
+      for (let i = localStorage.length - 1; i >= 0; i--) {
+        const key = localStorage.key(i)
+        if (key && key.startsWith(`${STORAGE_KEY}_corrupt_backup_`)) {
+          localStorage.removeItem(key)
+        }
+      }
+      // 清空对话消息和 pending 状态
+      setHouseholdChatMessages([])
+      setHouseholdChatLastQuestion("")
+      seenObservationKeysRef.current = new Set()
+      // 更新 React state
+      setState(result.state)
+      setDemoResetStatus("success")
+      // 关闭设置面板
+      setSettingsClosing(true)
+      // 短暂延迟后重新加载页面，确保完全干净的状态
+      window.setTimeout(() => {
+        window.location.reload()
+      }, 600)
+    } catch (error) {
+      setDemoResetStatus("error")
+      setDemoResetError(error instanceof Error ? error.message : String(error))
+    }
   }
 
   function updateItems(ids: string[], updater: (item: ReplenishmentItem) => ReplenishmentItem) {
@@ -491,17 +546,26 @@ function App() {
     setHouseholdChatOpen(true)
   }
 
-  function closeChatWithSessionUpdate() {
-    commit({
-      ...state,
-      settings: {
-        ...state.settings,
-        lastChatSessionAt: Date.now()
-      }
-    })
-    // 任务四 A：面板关闭，重置会话级观察去重状态
-    seenObservationKeysRef.current = new Set()
-    deferredClose(setHouseholdChatClosing, () => setHouseholdChatOpen(false))
+  function exitChatView(updateSession = true) {
+    if (!householdChatOpen) return
+    if (updateSession) {
+      commit({
+        ...state,
+        settings: {
+          ...state.settings,
+          lastChatSessionAt: Date.now()
+        }
+      })
+      // 任务四 A：离开对话页，重置会话级观察去重状态
+      seenObservationKeysRef.current = new Set()
+    }
+    setHouseholdChatOpen(false)
+  }
+
+  // 侧边栏切换分类/首页：与对话页采用相同路由切换逻辑，离开对话页时保留对话记录与 Agent 状态。
+  function handleSelectCategory(category: string | null) {
+    exitChatView(true)
+    setActiveCategory(category)
   }
 
   function calibrateItem(item: ReplenishmentItem, remainingDays: number) {
@@ -522,6 +586,18 @@ function App() {
     })
   }
 
+  // 403：UI 手动写入时，若影响了 lastAgentMutation 指向的物品或分类，
+  // 应使旧 mutation 失效（置 consumed=true），避免撤销时用陈旧快照覆盖手动修改。
+  function invalidateMutationIfTouched(itemId?: string, categoryName?: string) {
+    const mutation = state.lastAgentMutation
+    if (!mutation || mutation.consumed) return
+    const touched = (itemId && mutation.itemId === itemId)
+      || (categoryName && mutation.createdCategoryName === categoryName)
+    if (touched) {
+      commit({ ...state, lastAgentMutation: { ...mutation, consumed: true } })
+    }
+  }
+
   function saveItem(draft: ItemDraft) {
     if (!draft.name.trim()) return
     const nextItem = editingItem ? updateItemFromDraft(editingItem, draft) : createItem(draft)
@@ -529,6 +605,8 @@ function App() {
     const categories = state.categories.includes(nextItem.category)
       ? state.categories
       : [...state.categories, nextItem.category]
+    // 403：手动编辑物品时使旧 mutation 失效（若同一物品）
+    invalidateMutationIfTouched(editingItem?.id)
     commit({
       ...state,
       categories,
@@ -567,6 +645,22 @@ function App() {
     return { summary: result.summary, links: result.links, observation: result.observation, insight: result.insight }
   }
 
+  // 403：撤销最近一次 Agent 写入（直接执行，不需二次确认）。
+  // 仅操作 lastAgentMutation 记录的最近一次写入，不进入通用删除/二次确认。
+  function handleUndoLastMutation(): string {
+    const result = undoLastAgentMutation(state, Date.now())
+    if (result.state !== state) commit(result.state)
+    return result.message
+  }
+
+  // 403：修正最近一次 Agent 写入的字段（直接执行，不需二次确认）。
+  // 仅修改最近一条记录，不新增第二条。
+  function handleCorrectLastMutation(field: "price" | "qty" | "platform" | "date", value: number | string): string {
+    const result = correctLastAgentMutation(state, field, value, Date.now())
+    if (result.state !== state) commit(result.state)
+    return result.message
+  }
+
   function addCategory(name: string): string | undefined {
     const normalized = name.trim()
     if (!normalized) return undefined
@@ -596,6 +690,8 @@ function App() {
   function deleteCategory(category: string, options?: DeleteCategoryOptions) {
     // 安全门：非空分类必须显式选择迁移目标或确认删除物品，避免一个轻量 confirm 误删真实数据。
     // applyDeleteCategory 在条件不满足时返回 ok:false，state 不会被改动。
+    // 403：手动删除分类时使旧 mutation 失效（若同一分类）
+    invalidateMutationIfTouched(undefined, category)
     setState((current) => {
       const result = applyDeleteCategory(current, category, options)
       if (!result.ok) {
@@ -610,6 +706,8 @@ function App() {
   }
 
   function deleteItem(item: ReplenishmentItem) {
+    // 403：手动删除物品时使旧 mutation 失效（若同一物品）
+    invalidateMutationIfTouched(item.id)
     commit({ ...state, items: state.items.filter((current) => current.id !== item.id) })
     setDetailItemId(null)
     setEditingItem(undefined)
@@ -638,6 +736,8 @@ function App() {
   }
 
   function deleteItemById(id: string) {
+    // 403：手动删除物品时使旧 mutation 失效（若同一物品）
+    invalidateMutationIfTouched(id)
     setState(prev => ({
       ...prev,
       items: prev.items.filter(item => item.id !== id),
@@ -821,7 +921,7 @@ function App() {
           allItems={state.items}
           now={now}
           activeCategory={activeCategory}
-          onSelectCategory={setActiveCategory}
+          onSelectCategory={handleSelectCategory}
           onCreateCategory={() => setCategoryCreatorOpen(true)}
           onOpenSettings={() => setSettingsOpen(true)}
           onRenameCategory={renameCategory}
@@ -833,7 +933,31 @@ function App() {
           isChatOpen={householdChatOpen}
         />
         <main className="work-area">
-          {activeCategory ? (
+          {householdChatOpen ? (
+            <HouseholdChatPanel
+              state={state}
+              itemViews={itemViews}
+              messages={householdChatMessages}
+              onMessagesChange={setHouseholdChatMessages}
+              onQuestionSent={setHouseholdChatLastQuestion}
+              onConfirmDraft={handleAgentDraftConfirm}
+              onConfirmBatch={handleAgentDraftBatchConfirm}
+              onConfirmPlan={handleAgentPlanConfirm}
+              onUndoLastMutation={handleUndoLastMutation}
+              onCorrectLastMutation={handleCorrectLastMutation}
+              onOpenItem={(itemId) => setDetailItemId(itemId)}
+              onOpenCategory={(category) => {
+                exitChatView(true)
+                setActiveCategory(category)
+              }}
+              onOpenSettings={() => setSettingsOpen(true)}
+              orderImageApiKey={state.settings.aiApiKey}
+              orderImageModel={state.settings.aiOrderModel ?? state.settings.aiModel}
+              orderRecognitionMode={state.settings.aiOrderMode ?? "accurate"}
+              seenObservationKeys={seenObservationKeysRef.current}
+              scrollMemoryRef={chatScrollMemoryRef}
+            />
+          ) : activeCategory ? (
             <CategoryWorkArea
               category={activeCategory}
               views={itemViews.filter(({ item }) => item.category === activeCategory)}
@@ -913,37 +1037,7 @@ function App() {
           setNewItemCategory(undefined)
         })} onSave={saveItem} onDelete={editingItem ? deleteItem : undefined} />
       )}
-      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} />}
-      {(householdChatOpen || householdChatClosing) && (
-        <HouseholdChatPanel
-          state={state}
-          itemViews={itemViews}
-	          messages={householdChatMessages}
-	          onMessagesChange={setHouseholdChatMessages}
-	          onQuestionSent={setHouseholdChatLastQuestion}
-	          onConfirmDraft={handleAgentDraftConfirm}
-          onConfirmBatch={handleAgentDraftBatchConfirm}
-          onConfirmPlan={handleAgentPlanConfirm}
-          onOpenItem={(itemId) => {
-            closeChatWithSessionUpdate()
-            setDetailItemId(itemId)
-          }}
-          onOpenCategory={(category) => {
-            closeChatWithSessionUpdate()
-            setActiveCategory(category)
-          }}
-          isClosing={householdChatClosing}
-          onClose={closeChatWithSessionUpdate}
-          onOpenSettings={() => {
-            closeChatWithSessionUpdate()
-            setSettingsOpen(true)
-          }}
-          orderImageApiKey={state.settings.aiApiKey}
-          orderImageModel={state.settings.aiOrderModel ?? state.settings.aiModel}
-          orderRecognitionMode={state.settings.aiOrderMode ?? "accurate"}
-          seenObservationKeys={seenObservationKeysRef.current}
-        />
-      )}
+      {(settingsOpen || settingsClosing) && <SettingsPanel state={state} onChange={commit} isClosing={settingsClosing} onClose={() => deferredClose(setSettingsClosing, () => setSettingsOpen(false))} demoResetStatus={demoResetStatus} demoResetError={demoResetError} onResetToDemo={() => setDemoResetStatus("confirming")} onConfirmResetToDemo={handleResetToDemo} onCancelResetToDemo={() => setDemoResetStatus("idle")} />}
       {isItemCreatorOpen && (
         <ItemCreatorDialog
           category={creatingCategory || ''}
@@ -1726,7 +1820,7 @@ function AgentDraftBatchCard({ drafts, statuses, result, skippedRows, uncertainR
   )
 }
 
-function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onConfirmPlan, onOpenItem, onOpenCategory, onClose, onOpenSettings, isClosing, orderImageApiKey, orderImageModel, orderRecognitionMode, seenObservationKeys }: {
+function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQuestionSent, onConfirmDraft, onConfirmBatch, onConfirmPlan, onUndoLastMutation, onCorrectLastMutation, onOpenItem, onOpenCategory, onOpenSettings, orderImageApiKey, orderImageModel, orderRecognitionMode, seenObservationKeys, scrollMemoryRef }: {
   state: AppState
   itemViews: ItemView[]
   messages: HouseholdChatMessage[]
@@ -1735,27 +1829,35 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   onConfirmDraft: (draft: AgentDraft) => { summary: string; links: AgentMessageLink[]; observation?: string; insight?: string }
   onConfirmBatch: (drafts: AgentDraft[]) => { summary: string; links: AgentMessageLink[]; observation?: string; insight?: string }
   onConfirmPlan: (plan: AgentPlan) => { summary: string; links: AgentMessageLink[]; observation?: string; insight?: string }
+  /** 403：撤销最近一次 Agent 写入，返回回复文案 */
+  onUndoLastMutation: () => string
+  /** 403：修正最近一次 Agent 写入的字段，返回回复文案 */
+  onCorrectLastMutation: (field: "price" | "qty" | "platform" | "date", value: number | string) => string
   onOpenItem: (itemId: string) => void
   onOpenCategory: (category: string) => void
-  onClose: () => void
   onOpenSettings: () => void
-  isClosing?: boolean
   orderImageApiKey?: string
   orderImageModel?: string
   orderRecognitionMode?: OrderRecognitionMode
   /** 任务四 A：会话级观察去重状态，由 App 维护、面板关闭时重置 */
   seenObservationKeys?: Set<string>
+  /** 跨页面切换的滚动位置记忆：{ pos, count }，由 App 维护，组件挂载时恢复 */
+  scrollMemoryRef?: MutableRefObject<{ pos: number; count: number }>
 }) {
   const [draft, setDraft] = useState("")
   const [loading, setLoading] = useState(false)
   /** 响应节奏层：等待期间显示的场景化 loading 文案；为空时只显示轻微 typing 指示器 */
   const [loadingText, setLoadingText] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  /** 展开态：从右侧工作侧栏切换到更宽的对话面板，便于阅读长回复 */
-  const [expanded, setExpanded] = useState(false)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const logRef = useRef<HTMLDivElement>(null)
+  /** 首次挂载标记：用于在重新进入页面时恢复上次的滚动位置 */
+  const didMountRef = useRef(false)
   const imageInputRef = useRef<HTMLInputElement>(null)
+  // 403 修复：draftCommit 幂等保护——记录已提交的 draft 消息 index，
+  // 防止快速重复点击确认按钮或重复输入"确认"导致同一条草稿被写入两次。
+  // 使用 ref 而非 state，不依赖按钮禁用时间。
+  const committedDraftIndicesRef = useRef<Set<number>>(new Set())
   // 管家决策层单例：所有对话路径统一经过 orchestrator.decide / normalizeLlmResponse
 	  const orchestrator = useMemo(() => createHouseholdOrchestrator(), [])
 	  const starter = buildHouseholdChatStarter(itemViews)
@@ -1849,8 +1951,11 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
 	  // 已下线，全部收敛到 composeProposalMessage / composePendingReminder / composeFallbackMessage。
 
 	  function confirmAgentDraft(messageIndex: number, baseMessages = messages) {
+    // 403 修复：幂等保护——防止快速重复点击或重复 draftCommit 导致同一条草稿被写入两次。
+    if (committedDraftIndicesRef.current.has(messageIndex)) return
     const message = baseMessages[messageIndex]
     if (!message?.agentDraft) return
+    committedDraftIndicesRef.current.add(messageIndex)
     const result = onConfirmDraft(message.agentDraft)
     // 拼接 summary + observation + insight（主动判断洞察）
     const parts = [result.summary]
@@ -2191,7 +2296,16 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   }, [draft])
 
   useEffect(() => {
-    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+    // 重新进入页面时优先恢复上次滚动位置；若消息数量已变化（离开期间有新消息）则滚到底部。
+    if (!didMountRef.current) {
+      didMountRef.current = true
+      const mem = scrollMemoryRef?.current
+      if (mem && mem.count === messages.length && mem.pos > 0) {
+        logRef.current?.scrollTo({ top: mem.pos })
+        return
+      }
+    }
+    logRef.current?.scrollTo({ top: logRef.current?.scrollHeight ?? 0 })
   }, [messages, loading])
 
 	  async function sendMessage(value = draft) {
@@ -2336,9 +2450,78 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
           cancelAgentPlan(pendingPlanMessageIndex, nextMessages)
           return
         }
+        // 403：撤销最近一次 Agent 写入（直接执行，不需二次确认）
+        if (planCmd.command === "undoLastMutation") {
+          await waitWithTransient(nextMessages, timing)
+          const message = onUndoLastMutation()
+          onMessagesChange([...nextMessages, { role: "assistant", content: message, createdAt: Date.now() }])
+          return
+        }
+        // 403：修正最近一次 Agent 写入的字段（直接执行，不需二次确认）
+        if (planCmd.command === "correctLastMutation") {
+          await waitWithTransient(nextMessages, timing)
+          const message = onCorrectLastMutation(planCmd.field, planCmd.value)
+          onMessagesChange([...nextMessages, { role: "assistant", content: message, createdAt: Date.now() }])
+          return
+        }
+        // 403 修复：确认 pendingDraft / pendingCollection 并正式写入。
+        // 替代旧路径中 handlePendingDraftIntent 返回 proposal 依赖引用相等判断的脆弱写法。
+        if (planCmd.command === "draftCommit") {
+          // 优先 pendingDraft
+          if (pendingMessageIndex >= 0) {
+            confirmAgentDraft(pendingMessageIndex, nextMessages)
+            return
+          }
+          // 其次 pendingCollection：提取 collection.draft 直接 commit
+          if (pendingCollectionMessageIndex >= 0) {
+            // 403 修复：幂等保护——防止快速重复提交导致同一条采集态被写入两次
+            if (committedDraftIndicesRef.current.has(pendingCollectionMessageIndex)) {
+              await waitWithTransient(nextMessages, timing)
+              onMessagesChange([...nextMessages, { role: "assistant", content: "当前没有待确认的记录。", createdAt: Date.now() }])
+              return
+            }
+            const collectionMsg = nextMessages[pendingCollectionMessageIndex]
+            const collection = collectionMsg?.agentCollection
+            if (collection) {
+              committedDraftIndicesRef.current.add(pendingCollectionMessageIndex)
+              const draft = collection.draft
+              const result = onConfirmDraft(draft)
+              const parts = [result.summary]
+              if (result.observation) parts.push(result.observation)
+              if (result.insight) parts.push(result.insight)
+              const content = parts.join(" ")
+              // 标记 collection 为 superseded，追加结果消息
+              const base = nextMessages.map((message, index) => index === pendingCollectionMessageIndex
+                ? { ...message, collectionStatus: "superseded" as const }
+                : message)
+              onMessagesChange([...base, { role: "assistant" as const, content, links: result.links, createdAt: Date.now() }])
+              return
+            }
+          }
+          // 都没有：幂等保护，不重复写入
+          await waitWithTransient(nextMessages, timing)
+          onMessagesChange([...nextMessages, { role: "assistant", content: "当前没有待确认的记录。", createdAt: Date.now() }])
+          return
+        }
         // 其他 typed command（batch 类）走到这里说明 batch 已失效，给个兜底
         await waitWithTransient(nextMessages, timing)
         onMessagesChange([...nextMessages, { role: "assistant", content: composeFallbackMessage("no-answer"), createdAt: Date.now() }])
+        return
+      }
+      // 403 修复：管理类请求的 navigate turn —— 真实导航 + 文案回复。
+      // 旧实现只返回 answer 文案，UI 没有任何页面变化；新实现根据 target 调用 onOpenItem / onOpenCategory / onOpenSettings。
+      if (turn.kind === "navigate") {
+        const target = turn.target
+        if (target?.kind === "item" && target.itemId) {
+          onOpenItem(target.itemId)
+        } else if (target?.kind === "category" && target.category) {
+          onOpenCategory(target.category)
+        } else if (target?.kind === "settings") {
+          onOpenSettings()
+        }
+        // 即使没有 target（如多候选/未匹配），也展示文案让用户知道下一步
+        await waitWithTransient(nextMessages, timing)
+        onMessagesChange([...nextMessages, { role: "assistant", content: turn.message, createdAt: Date.now() }])
         return
       }
       // 采集态 collection turn：新采集或补充采集，渲染为普通气泡（不展示确认卡）
@@ -2472,14 +2655,17 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
     const baseWithoutTransient = nextMessages
 	    if (result.ok) {
 	      const turn = orchestrator.normalizeLlmResponse(result.content.trim(), {
-	        text, state, itemViews, pendingDraft, pendingCollection, dateContext, trace
+	        text, state, itemViews, pendingDraft, pendingCollection, dateContext, trace,
+	        allowedActions: contextPack.allowedActions
 	      })
 	      if (!turn) {
-	        // 非管家问题不再统一机械拒绝：按对话边界给自然回应。
+	        // 阶段 4B.4：parse 失败且无法抢救 answer 时，使用中性兜底文案。
+	        // 不再走 composeBoundaryAnswer(unsupported) → "这个不太属于我能直接处理的家务范围"。
+	        // composeBoundaryAnswer 只能用于 LLM 调用前已明确判定的边界场景，不能作为 parse_failed 的出口。
 	        // pendingDraft 存在时是写入意图失败，仍用 no-draft 文案。
 	        const fallback = pendingDraft
 	          ? composeFallbackMessage("no-draft")
-	          : composeBoundaryAnswer(classifyConversationBoundary(text), text)
+	          : composeParseFailedMessage()
 	        setFinalDecision(trace, { kind: "llm", turnKind: "fallback", message: fallback })
 	        commitTrace(trace)
 	        onMessagesChange([...baseWithoutTransient, { role: "assistant", content: fallback, createdAt: Date.now() }])
@@ -2614,36 +2800,19 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
   }
 
   return (
-    <div
-      className={`overlay chat-overlay ${isClosing ? "is-closing" : ""}`}
-      onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
-    >
-      <aside className={`panel chat-panel ${isClosing ? "is-closing" : ""}${expanded ? " is-expanded" : ""}`} role="dialog" aria-modal="true" aria-labelledby="household-chat-title">
-        <div className="panel-header chat-panel-header">
-          <div className="panel-header-info">
-            <h2 id="household-chat-title">403管家</h2>
-          </div>
-          <div className="chat-panel-actions">
-            <button
-              type="button"
-              className="icon-button chat-expand-btn"
-              aria-label={expanded ? "收起为侧栏" : "展开对话"}
-              aria-pressed={expanded}
-              title={expanded ? "收起为侧栏" : "展开对话"}
-              onClick={() => setExpanded((value) => !value)}
-            >
-              {expanded ? (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="9 21 3 15 9 9" /><polyline points="15 3 21 9 15 15" /></svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><polyline points="15 3 21 3 21 9" /><polyline points="9 21 3 21 3 15" /><line x1="21" y1="3" x2="14" y2="10" /><line x1="3" y1="21" x2="10" y2="14" /></svg>
-              )}
-            </button>
-            <button className="icon-button close-btn" aria-label="关闭家庭问答" onClick={onClose}><Icon name="close" size={16} /></button>
-          </div>
-        </div>
-
-        <div className="chat-panel-body">
-          <div className="chat-log" ref={logRef} aria-live="polite">
+    <section className="chat-page" aria-label="403 管家对话">
+      <div className="chat-page-body">
+        <div
+          className="chat-log"
+          ref={logRef}
+          aria-live="polite"
+          onScroll={(event) => {
+            if (scrollMemoryRef) {
+              scrollMemoryRef.current = { pos: event.currentTarget.scrollTop, count: messages.length }
+            }
+          }}
+        >
+          <div className="chat-content-shell">
             {messages.length === 0 ? (
               <div className="chat-empty">
                 <strong>你可以直接问我家里还缺什么，也可以告诉我刚买了什么、什么快用完了。</strong>
@@ -2778,7 +2947,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                       </div>
                     </>
                   ) : (
-                    <>
+                    <div className="chat-message-group chat-message-group--user">
                       <p>{message.content}</p>
                       {message.imageAttachments && message.imageAttachments.length > 0 && (
                         <div className="chat-image-attachments">
@@ -2793,7 +2962,7 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
                         </div>
                       )}
                       <div className="chat-message-time">{formatClock(messageTime(message))}</div>
-                    </>
+                    </div>
                   )}
                     </div>
                   </Fragment>
@@ -2807,7 +2976,10 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
             )}
           </div>
         </div>
+        </div>
 
+      <footer className="chat-page-footer">
+        <div className="chat-content-shell">
         <form className="chat-composer" onSubmit={submit}>
           {error && (
             <div className="chat-error" role="alert">
@@ -2863,8 +3035,9 @@ function HouseholdChatPanel({ state, itemViews, messages, onMessagesChange, onQu
             </div>
           </div>
         </form>
-      </aside>
-    </div>
+        </div>
+      </footer>
+    </section>
   )
 }
 
@@ -3896,7 +4069,17 @@ function ItemEditor({ item, initialCategory, categories, onAddCategory, onClose,
   )
 }
 
-function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppState; onChange: (state: AppState) => void; onClose: () => void; isClosing?: boolean }) {
+function SettingsPanel({ state, onChange, onClose, isClosing, demoResetStatus, demoResetError, onResetToDemo, onConfirmResetToDemo, onCancelResetToDemo }: {
+  state: AppState
+  onChange: (state: AppState) => void
+  onClose: () => void
+  isClosing?: boolean
+  demoResetStatus: "idle" | "confirming" | "loading" | "success" | "error"
+  demoResetError: string
+  onResetToDemo: () => void
+  onConfirmResetToDemo: () => void
+  onCancelResetToDemo: () => void
+}) {
   const settings = state.settings
   const [editingBudget, setEditingBudget] = useState(false)
   const [budgetDraft, setBudgetDraft] = useState(settings.monthlyBudget ? String(settings.monthlyBudget) : "")
@@ -3904,10 +4087,6 @@ function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppStat
   const [reminderHoursDraft, setReminderHoursDraft] = useState(String(settings.reminderIntervalHours))
   const [editingApiKey, setEditingApiKey] = useState(false)
   const [apiKeyDraft, setApiKeyDraft] = useState("")
-  const [editingChatModel, setEditingChatModel] = useState(false)
-  const [chatModelDraft, setChatModelDraft] = useState(settings.aiChatModel ?? settings.aiModel ?? "")
-  const [editingOrderModel, setEditingOrderModel] = useState(false)
-  const [orderModelDraft, setOrderModelDraft] = useState(settings.aiOrderModel ?? settings.aiModel ?? "")
 
   function patch(values: Partial<typeof settings>) {
     onChange({ ...state, settings: { ...settings, ...values } })
@@ -3923,26 +4102,6 @@ function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppStat
   function cancelApiKeyEdit() {
     setEditingApiKey(false)
     setApiKeyDraft("")
-  }
-
-  function saveChatModel() {
-    patch({ aiChatModel: chatModelDraft.trim() || undefined })
-    setEditingChatModel(false)
-  }
-
-  function cancelChatModelEdit() {
-    setChatModelDraft(settings.aiChatModel ?? settings.aiModel ?? "")
-    setEditingChatModel(false)
-  }
-
-  function saveOrderModel() {
-    patch({ aiOrderModel: orderModelDraft.trim() || undefined })
-    setEditingOrderModel(false)
-  }
-
-  function cancelOrderModelEdit() {
-    setOrderModelDraft(settings.aiOrderModel ?? settings.aiModel ?? "")
-    setEditingOrderModel(false)
   }
 
   function saveBudget() {
@@ -4123,91 +4282,36 @@ function SettingsPanel({ state, onChange, onClose, isClosing }: { state: AppStat
               )}
             </div>
           </div>
-          <div className="settings-row">
-            <span className="settings-row-label">问答模型</span>
-            <div className="settings-row-control settings-api-key-control">
-              {editingChatModel ? (
-                <div className="settings-secret-editor settings-model-editor">
-                  <input
-                    autoFocus
-                    aria-label="家庭问答模型 ID"
-                    type="text"
-                    value={chatModelDraft}
-                    onChange={(event) => setChatModelDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") saveChatModel()
-                      if (event.key === "Escape") {
-                        event.stopPropagation()
-                        cancelChatModelEdit()
-                      }
-                    }}
-                    placeholder="默认 qwen-plus"
-                  />
-                  <button type="button" className="settings-secret-action" onClick={saveChatModel}>确认</button>
-                  <button type="button" className="settings-secret-action muted" onClick={cancelChatModelEdit}>取消</button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="editable-value settings-editable-value settings-model-value"
-                  onClick={() => {
-                    setChatModelDraft(settings.aiChatModel ?? settings.aiModel ?? "")
-                    setEditingChatModel(true)
-                  }}
-                >
-                  <span>{settings.aiChatModel || settings.aiModel || "默认 qwen-plus"}</span>
-                  <Icon name="edit" size={13} />
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="settings-row">
-            <span className="settings-row-label">订单识别模式</span>
-            <div className="settings-row-control">
-              <div className="segment-control notification-segment" role="group" aria-label="订单识别模式">
-                <button type="button" className={(settings.aiOrderMode ?? "accurate") === "accurate" ? "active" : ""} aria-pressed={(settings.aiOrderMode ?? "accurate") === "accurate"} onClick={() => patch({ aiOrderMode: "accurate" })}>准确</button>
-                <button type="button" className={(settings.aiOrderMode ?? "accurate") === "fast" ? "active" : ""} aria-pressed={(settings.aiOrderMode ?? "accurate") === "fast"} onClick={() => patch({ aiOrderMode: "fast" })}>快速</button>
+          {(import.meta.env.DEV || import.meta.env.VITE_DEMO_MODE === "true") && (
+            <div className="settings-row settings-row-multiline demo-data-row">
+              <div className="settings-row-label">
+                <div className="settings-row-title">演示数据</div>
+                <div className="settings-row-description">将当前数据恢复为比赛预设状态</div>
+              </div>
+              <div className="settings-row-control">
+                {demoResetStatus === "confirming" ? (
+                  <div className="demo-data-confirm">
+                    <span className="demo-data-confirm-text">恢复后，当前消耗品、补货记录和对话状态将替换为比赛演示数据。当前数据会自动备份。</span>
+                    <div className="demo-data-confirm-actions">
+                      <button type="button" className="demo-data-action demo-data-cancel" onClick={onCancelResetToDemo}>取消</button>
+                      <button type="button" className="demo-data-action demo-data-confirm-btn" onClick={onConfirmResetToDemo}>恢复演示数据</button>
+                    </div>
+                  </div>
+                ) : demoResetStatus === "loading" ? (
+                  <span className="demo-data-status">正在恢复…</span>
+                ) : demoResetStatus === "success" ? (
+                  <span className="demo-data-status demo-data-success">比赛演示数据已恢复</span>
+                ) : demoResetStatus === "error" ? (
+                  <div className="demo-data-error-control">
+                    <span className="demo-data-status demo-data-error-text">{demoResetError || "恢复失败，原数据已保留。请查看日志后重试。"}</span>
+                    <button type="button" className="demo-data-action" onClick={onResetToDemo}>重试</button>
+                  </div>
+                ) : (
+                  <button type="button" className="demo-data-action" onClick={onResetToDemo}>恢复演示数据</button>
+                )}
               </div>
             </div>
-          </div>
-          <div className="settings-row">
-            <span className="settings-row-label">订单识别模型</span>
-            <div className="settings-row-control settings-api-key-control">
-              {editingOrderModel ? (
-                <div className="settings-secret-editor settings-model-editor">
-                  <input
-                    autoFocus
-                    aria-label="订单识别模型 ID"
-                    type="text"
-                    value={orderModelDraft}
-                    onChange={(event) => setOrderModelDraft(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") saveOrderModel()
-                      if (event.key === "Escape") {
-                        event.stopPropagation()
-                        cancelOrderModelEdit()
-                      }
-                    }}
-                    placeholder={(settings.aiOrderMode ?? "accurate") === "fast" ? "快速模式默认模型" : "准确模式默认模型"}
-                  />
-                  <button type="button" className="settings-secret-action" onClick={saveOrderModel}>确认</button>
-                  <button type="button" className="settings-secret-action muted" onClick={cancelOrderModelEdit}>取消</button>
-                </div>
-              ) : (
-                <button
-                  type="button"
-                  className="editable-value settings-editable-value settings-model-value"
-                  onClick={() => {
-                    setOrderModelDraft(settings.aiOrderModel ?? settings.aiModel ?? "")
-                    setEditingOrderModel(true)
-                  }}
-                >
-                  <span>{settings.aiOrderModel || settings.aiModel || ((settings.aiOrderMode ?? "accurate") === "fast" ? "快速模式默认" : "准确模式默认")}</span>
-                  <Icon name="edit" size={13} />
-                </button>
-              )}
-            </div>
-          </div>
+          )}
         </div>
       </div>
     </div>
@@ -5812,11 +5916,10 @@ function CategoryWorkArea({ category, views, onAddItem, onRename, onDelete, onEd
     <div className="category-work-area">
       {/* header */}
       <div className="work-header">
-        <div className="work-header-left">
-          <h2 className="work-title">{category}</h2>
-          <span className="work-meta">{views.length} 项</span>
+        <div className="current-heading">
+          <h2>{category} <span>{views.length} 项</span></h2>
+          <button className="primary-button green" onClick={onAddItem}>添加消耗品</button>
         </div>
-        <button className="primary-button green" onClick={onAddItem}>添加消耗品</button>
       </div>
 
       {/* item list */}
@@ -6186,7 +6289,7 @@ function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, p
   return (
     <nav className="sidebar">
       <button
-        className={`sidebar-home ${!activeCategory ? "is-active" : ""}`}
+        className={`sidebar-home ${!activeCategory && !isChatOpen ? "is-active" : ""}`}
         onClick={() => onSelectCategory(null)}
       >
         <span className="sidebar-home-icon">
@@ -6234,7 +6337,7 @@ function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, p
         const isEditing = editingCategory === category
         const isPendingDelete = pendingDelete === category
         return (
-          <div key={category} className={`sidebar-item-wrapper ${activeCategory === category ? "is-active" : ""}`}>
+          <div key={category} className={`sidebar-item-wrapper ${activeCategory === category && !isChatOpen ? "is-active" : ""}`}>
             {/* 分类项主体 - 点击切换分类 */}
             {!isEditing && !isPendingDelete && (
               <button

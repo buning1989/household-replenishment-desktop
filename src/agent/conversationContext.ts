@@ -34,6 +34,7 @@ import {
   serializeHouseholdProfile
 } from "./observations"
 import { buildManagedItemsLine, buildQueryFacts } from "../llm/householdChat"
+import { resolveItemFromText } from "./groundedQuery"
 
 // ---------- ConversationFocus ----------
 
@@ -345,6 +346,14 @@ export function buildRelevantAppFacts(
     const facts = buildQueryFacts(text, state, itemViews, dateContext)
     if (facts) {
       lines.push(facts)
+    }
+  } else if (focus.kind === "none") {
+    // 阶段 4B.7：用户显式询问某已管理物品时，强制注入该物品的完整上下文。
+    // 避免 LLM 在无证据情况下凭空生成日期/数量/金额/平台。
+    const mentionedItem = resolveItemFromText(text, state.items)
+    if (mentionedItem) {
+      lines.push("【用户询问的物品】")
+      lines.push(serializeItemForContext(mentionedItem))
     }
   }
 

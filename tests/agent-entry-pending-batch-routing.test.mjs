@@ -423,7 +423,8 @@ test("3C-15: pendingDraft + 确认仍走 draft handler（回归）", () => {
   })
 
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "draftCommit")
 })
 
 test("3C-16: pendingPlan + 确认仍走 plan handler（回归）", async () => {

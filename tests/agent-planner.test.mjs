@@ -117,39 +117,33 @@ test("已有物品时「买了两袋猫粮」→ 仅 recordRestock", () => {
 
 // ---------- 设置预算 ----------
 
-test("这个月预算设成 500 → setMonthlyBudget", () => {
+test("这个月预算设成 500 → noPlan（403 收缩，预算修改不再生成 plan）", () => {
   const result = plan("这个月预算设成 500")
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "setMonthlyBudget")
-  assert.equal(result.plan.actions[0].amount, 500)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("月预算 800 元 → setMonthlyBudget", () => {
+test("月预算 800 元 → noPlan（403 收缩，预算修改不再生成 plan）", () => {
   const result = plan("月预算 800 元")
-  assert.equal(result.plan.actions[0].type, "setMonthlyBudget")
-  assert.equal(result.plan.actions[0].amount, 800)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("预算改成 1000 → setMonthlyBudget", () => {
+test("预算改成 1000 → noPlan（403 收缩，预算修改不再生成 plan）", () => {
   const result = plan("预算改成 1000")
-  assert.equal(result.plan.actions[0].amount, 1000)
+  assert.equal(result.kind, "noPlan")
 })
 
 // ---------- 修改消耗品周期 ----------
 
-test("猫粮周期改成 30 天 → updateItem", () => {
+test("猫粮周期改成 30 天 → noPlan（403 收缩，周期修改不再生成 plan）", () => {
   const state = makeState({ items: [makeItem("i1", "猫粮", "宠物用品")] })
   const result = plan("猫粮周期改成 30 天", state)
-  assert.equal(result.kind, "plan")
-  assert.equal(result.plan.actions[0].type, "updateItem")
-  assert.equal(result.plan.actions[0].itemId, "i1")
-  assert.equal(result.plan.actions[0].cycleDays, 30)
+  assert.equal(result.kind, "noPlan")
 })
 
-test("把猫粮的周期改成 45 天 → updateItem", () => {
+test("把猫粮的周期改成 45 天 → noPlan（403 收缩，周期修改不再生成 plan）", () => {
   const state = makeState({ items: [makeItem("i1", "猫粮", "宠物用品")] })
   const result = plan("把猫粮的周期改成 45 天", state)
-  assert.equal(result.plan.actions[0].cycleDays, 45)
+  assert.equal(result.kind, "noPlan")
 })
 
 test("目标物品不存在时 updateItem → noPlan（交给 LLM）", () => {

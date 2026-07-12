@@ -1,10 +1,13 @@
 // 任务 P6: AgentPlan 第二期 orchestrator 路由测试
 // 运行方式：node --test tests/agent-plan-edit-orchestrator.test.mjs
 //
+// 403 能力收缩后：编辑类句式不再生成 planProposal，orchestrator 一律返回导航回答（answer），
+// 引导用户到对应 UI 手动操作；pendingPlan 修订同样被拦截返回 answer。
+//
 // 覆盖：
-//   - 编辑类句式生成 planProposal（renameCategory/moveItem/updateItemUnit/updateItemReminder/updatePurchaseOption/setDefaultPurchaseOption）
+//   - 编辑类句式返回导航回答（renameCategory/moveItem/updateItemUnit/updateItemReminder/updatePurchaseOption/setDefaultPurchaseOption）
 //   - 查询句式不生成 planProposal
-//   - pendingPlan 下确认/取消/修订正常
+//   - pendingPlan 下确认/取消/修订（修订被能力收缩拦截返回 answer，确认/取消仍走状态机）
 //   - 旧 Draft 流程不受影响（restock/createItem 仍走 proposal）
 
 import { test } from "node:test"
@@ -54,62 +57,62 @@ function makeOpt(id, productName) {
 
 const dateContext = buildChatDateContext(Date.UTC(2026, 6, 7))
 
-// ---------- 编辑类句式生成 planProposal ----------
+// ---------- 编辑类句式能力收缩后返回导航回答（不再生成 planProposal） ----------
 
-test("orchestrator: 「把宠物用品改成猫咪用品」生成 planProposal（renameCategory）", () => {
+test("orchestrator: 「把宠物用品改成猫咪用品」返回导航回答（renameCategory 能力已关闭）", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "把宠物用品改成猫咪用品", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "renameCategory")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
-test("orchestrator: 「把猫砂移到猫咪用品」生成 planProposal（moveItem）", () => {
+test("orchestrator: 「把猫砂移到猫咪用品」返回导航回答（moveItem 能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "把猫砂移到猫咪用品", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "moveItem")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
-test("orchestrator: 「猫砂单位改成袋」生成 planProposal（updateItemUnit）", () => {
+test("orchestrator: 「猫砂单位改成袋」返回导航回答（updateItemUnit 能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "猫砂单位改成袋", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "updateItemUnit")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
-test("orchestrator: 「猫砂提前 5 天提醒」生成 planProposal（updateItemReminder）", () => {
+test("orchestrator: 「猫砂提前 5 天提醒」返回导航回答（updateItemReminder 能力已关闭）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "猫砂提前 5 天提醒", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "updateItemReminder")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
-test("orchestrator: 「猫砂常购商品平台改成京东」生成 planProposal（updatePurchaseOption）", () => {
+test("orchestrator: 「猫砂常购商品平台改成京东」返回导航回答（updatePurchaseOption 能力已关闭）", () => {
   const item = { ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan")] }
   const state = makeState({ items: [item] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "猫砂常购商品平台改成京东", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "updatePurchaseOption")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
-test("orchestrator: 「把猫砂默认商品设成 pidan 豆腐猫砂」生成 planProposal（setDefaultPurchaseOption）", () => {
+test("orchestrator: 「把猫砂默认商品设成 pidan 豆腐猫砂」返回导航回答（setDefaultPurchaseOption 能力已关闭）", () => {
   const item = { ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan 豆腐猫砂")] }
   const state = makeState({ items: [item] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "把猫砂默认商品设成pidan豆腐猫砂", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].type, "setDefaultPurchaseOption")
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
 // ---------- 查询句式不生成 planProposal ----------
@@ -159,7 +162,7 @@ test("orchestrator: pendingPlan + 「算了」→ planCommand(planCancel)", () =
   assert.equal(decision.turn.command.command, "planCancel")
 })
 
-test("orchestrator: pendingPlan + 「价格改成 68」→ 修订生成新 planProposal", () => {
+test("orchestrator: pendingPlan + 「价格改成 68」→ 能力收缩后返回导航回答（不再修订生成 planProposal）", () => {
   const item = { ...makeItem("i1", "猫砂"), purchaseOptions: [makeOpt("o1", "pidan")] }
   const state = makeState({ items: [item] })
   const orch = createHouseholdOrchestrator()
@@ -168,9 +171,10 @@ test("orchestrator: pendingPlan + 「价格改成 68」→ 修订生成新 planP
     patch: { platform: "京东" }
   }], "test", 1000)
   const decision = orch.decide({ text: "价格改成68", state, itemViews: [], pendingPlan, dateContext })
+  // 管理类 plan 修订被能力收缩拦截：不再生成新 planProposal，返回导航回答
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions[0].patch.price, 68)
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
 test("orchestrator: pendingPlan + 查询句式不影响 pendingPlan", () => {

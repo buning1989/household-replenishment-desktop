@@ -26,6 +26,7 @@ import type { DraftCollection } from "./draftCollection"
 import type { ChatMessageLink } from "../llm/householdChat"
 import type { AppState } from "../types"
 import type { AgentPlan } from "./actions"
+import type { AllowedAction } from "./conversationContext"
 
 /** 只读查询的回答。orchestrator 不再让 quick answer 直接吐字符串给 UI。 */
 export type AgentTurnAnswer = {
@@ -162,6 +163,28 @@ export type AgentPlanCommand =
   | { command: "batchCancelIndex"; index: number }
   | { command: "batchReviseIndex"; index: number }
   | { command: "batchReviseAll" }
+  /**
+   * 403：撤销最近一次 Agent 写入（直接执行，不需二次确认）。
+   * App.tsx 读取后调用 undoLastAgentMutation(state)，用返回的 message 作为回复。
+   */
+  | { command: "undoLastMutation" }
+  /**
+   * 403：修正最近一次 Agent 写入的字段（直接执行，不需二次确认）。
+   * App.tsx 读取后调用 correctLastAgentMutation(state, field, value)。
+   */
+  | { command: "correctLastMutation"; field: "price" | "qty" | "platform" | "date"; value: number | string }
+  /**
+   * 403：确认当前 pendingDraft / pendingCollection 并正式写入。
+   * App.tsx 读取后：
+   *   - 若有 pendingDraft → 调用 confirmAgentDraft(pendingMessageIndex, nextMessages)
+   *   - 否则若有 pendingCollection → 提取 collection.draft 后调用 onConfirmDraft 并标记 collection 为 superseded
+   *   - 都没有时 → 返回「当前没有待确认的记录」（幂等保护）
+   *
+   * 设计目的：替代旧路径中 handlePendingDraftIntent 返回 { kind: "proposal", executableDraft: pendingDraft }
+   * 并依赖 App.tsx 引用相等判断（turn.executableDraft === pendingDraft）的脆弱写法。
+   * 该写法在 draft 经过 revise 后引用变化时会落入"修订"分支，形成确认死循环。
+   */
+  | { command: "draftCommit" }
 
 /** 带 typed command 的 turn：App.tsx 读取 command 后分发到对应的处理函数。 */
 export type AgentTurnPlanCommand = {
@@ -169,6 +192,33 @@ export type AgentTurnPlanCommand = {
   message: string
   command: AgentPlanCommand
 }
+
+/**
+ * 403：管理类请求的导航 turn。
+ *
+ * 管理类请求（删除常购商品 / 改周期 / 改提醒 / 设预算 / 编辑历史记录等）已关闭对话执行，
+ * 但不能只回复文字而不做任何页面变化。该 turn 携带 target，由 App.tsx 读取后调用
+ * onOpenItem / onOpenCategory / onOpenSettings 完成真实导航。
+ *
+ * target.section 是可选的 section 锚点（如常购商品区域 / 补货记录区域 / 周期提醒区域 / 预算区域）。
+ * 当前 UI 不强制支持精确 scroll anchor，但 App.tsx 可用于未来扩展或最低要求的"展开最相关区域"。
+ *
+ * 零写入约束：navigate turn 不产生 plan / executableDraft / collection / pendingDraft 变化，
+ * state 数据不变。导航产生的 UI 状态变化不算业务数据写入。
+ */
+export type AgentTurnNavigate = {
+  kind: "navigate"
+  /** 给用户看的口语化导航说明，由 responseComposer 生成 */
+  message: string
+  /** 导航目标。未匹配到具体物品时为 undefined，App.tsx 仅展示文案不触发导航。 */
+  target: NavigateTarget | undefined
+}
+
+/** 导航目标类型。 */
+export type NavigateTarget =
+  | { kind: "item"; itemId: string; section?: "purchaseOptions" | "history" | "cycle" }
+  | { kind: "category"; category: string }
+  | { kind: "settings"; section?: "budget" }
 
 /** 统一对话回合输出。UI 只渲染这个类型，不再直接渲染 AgentDraft。 */
 export type AgentTurn =
@@ -182,6 +232,7 @@ export type AgentTurn =
   | AgentTurnPlanProposal
   | AgentTurnPlanCommitted
   | AgentTurnPlanCommand
+  | AgentTurnNavigate
 
 /** orchestrator 处理用户输入时需要的上下文。 */
 export type OrchestrateInput = {
@@ -201,6 +252,13 @@ export type OrchestrateInput = {
   pendingPlan?: AgentPlan
   /** 对话日期上下文 */
   dateContext: import("../llm/householdChat").ChatDateContext
+  /**
+   * 阶段 4B.4：当前对话焦点允许 LLM 输出的动作类型（代码级硬约束）。
+   * 由 buildAgentContextPack.computeAllowedActions 计算，App.tsx 从 contextPack 传入。
+   * normalizeLlm 对 draft / clarification 做代码级校验：不在 allowedActions 内的写入动作被拒绝。
+   * 未提供时（旧测试兼容）不强制校验；App.tsx 真实路径始终提供。
+   */
+  allowedActions?: AllowedAction[]
   /**
    * 阶段 2C 复盘：dev-only 决策 trace。
    * orchestrator 在 decideSync / interpretAndRouteSync 执行过程中填充字段，

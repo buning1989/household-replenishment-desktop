@@ -16,6 +16,7 @@ import {
   getBudgetNotificationState,
   resetBudgetNotificationState
 } from "./budget-notifier.mjs"
+import { performDemoReset } from "../src/shared/demo/demo-reset-core.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
@@ -438,6 +439,24 @@ ipcMain.handle("state:sync", (_event, state) => {
   return saved
     ? { ok: true }
     : { ok: false, error: "数据已保存在当前窗口，但桌面备份文件写入失败。请重试并建议复制当前数据备份。" }
+})
+
+ipcMain.handle("state:reset-to-demo", (_event, currentState) => {
+  console.log("[demo-reset] ipc request received")
+  const file = stateFile()
+  const backupDir = path.join(app.getPath("userData"), "demo-backups")
+  const result = performDemoReset(currentState, file, backupDir)
+  if (!result.ok) {
+    console.log("[demo-reset] failed:", result.error, "rolledBack:", result.rolledBack)
+    return { ok: false, error: result.error, rolledBack: result.rolledBack }
+  }
+  console.log("[demo-reset] backup completed:", result.backupPath)
+  console.log("[demo-reset] state written and verified")
+  // 更新主进程内存中的 state
+  latestState = result.state
+  checkReminders(false)
+  checkBudgetNotification(result.state)
+  return { ok: true, state: result.state, backupPath: result.backupPath }
 })
 // ---- 订单截图识别：代理 DashScope 请求，避免 renderer 侧 CORS 限制 ----
 // 只做转发，不在主进程记录 apiKey / 图片内容。

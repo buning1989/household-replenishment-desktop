@@ -96,7 +96,7 @@ test("orchestrator: 「新建一个宠物用品分类」生成 planProposal turn
   assert.ok(decision.turn.message.includes("宠物用品"))
 })
 
-test("orchestrator: 「这个月预算设成 500」生成 planProposal turn（setMonthlyBudget）", () => {
+test("orchestrator: 403 「这个月预算设成 500」→ 导航回答（不创建 plan）", () => {
   const state = makeState()
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({
@@ -106,13 +106,11 @@ test("orchestrator: 「这个月预算设成 500」生成 planProposal turn（se
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions.length, 1)
-  assert.equal(decision.turn.plan.actions[0].type, "setMonthlyBudget")
-  assert.equal(decision.turn.plan.actions[0].amount, 500)
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 planProposal")
 })
 
-test("orchestrator: 「猫粮周期改成 30 天」生成 planProposal turn（updateItem）", () => {
+test("orchestrator: 403 「猫粮周期改成 30 天」→ 导航回答（不创建 updateItem plan）", () => {
   const state = makeState({ items: [catItem("i1", "猫粮")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({
@@ -122,10 +120,8 @@ test("orchestrator: 「猫粮周期改成 30 天」生成 planProposal turn（up
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.actions.length, 1)
-  assert.equal(decision.turn.plan.actions[0].type, "updateItem")
-  assert.equal(decision.turn.plan.actions[0].cycleDays, 30)
+  assert.equal(decision.turn.kind, "navigate")
+  assert.ok(!("plan" in decision.turn), "不应创建 planProposal")
 })
 
 test("orchestrator: 有猫砂时「帮我加一个猫砂」生成 clarification turn，不生成 draft", () => {
@@ -171,9 +167,9 @@ test("orchestrator: pending + 「确认吧」→ proposal(原 draft)，调用方
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal")
-  // executableDraft === pendingDraft，调用方据此判断执行 commit
-  assert.equal(decision.turn.executableDraft, pendingDraft)
+  assert.equal(decision.turn.kind, "planCommand")
+  // draftCommit typed command，调用方据此执行 commit
+  assert.equal(decision.turn.command.command, "draftCommit")
 })
 
 test("orchestrator: pending + 「算了别记」→ cancelled turn", () => {
@@ -364,16 +360,20 @@ test("orchestrator: normalizeLlmResponse 解析 clarification", () => {
   assert.equal(turn.options.length, 2)
 })
 
-test("orchestrator: normalizeLlmResponse 解析失败返回 null", () => {
+test("orchestrator: normalizeLlmResponse JSON-like 无 answer/message → 中性兜底 answer", () => {
   const orch = createHouseholdOrchestrator()
-  // 含 JSON 结构但解析失败的内容不放宽为纯文本 answer（避免 LLM 用半结构化内容绕过写入校验）
+  // 阶段 4B.4：含 JSON 结构但无 answer/message 字段时，不再返回 null 走 unsupported。
+  // 改为返回中性兜底 answer，不把原始 JSON 吐给用户。
   const turn = orch.normalizeLlmResponse('{ "kind": "invalid", "data": ... }', {
     text: "xxx",
     state: makeState(),
     itemViews: [],
     dateContext: buildChatDateContext(Date.UTC(2026, 6, 4))
   })
-  assert.equal(turn, null)
+  assert.ok(turn, "应返回 turn（不应 null）")
+  assert.equal(turn.kind, "answer")
+  assert.ok(!turn.message.includes("{"), "不应把原始 JSON 吐给用户")
+  assert.ok(!turn.message.includes("超出家务范围"), "不应包含旧 unsupported 文案")
 })
 
 // ---------- 6. responseComposer 禁用词校验 ----------

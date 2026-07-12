@@ -5,16 +5,19 @@
  * 本文件是纯逻辑（除 LLM 调用由调用方在外层处理），可被测试直接覆盖。
  */
 
-import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
+import { buildLocalClarification, buildLocalDraftFromText, describeAgentDraft, findItemMatch, isExplicitCreateItemSignal, extractCreateItemName, parseAgentResponse, reviseAgentDraft, type AgentClarification, type AgentDraft } from "./drafts"
 import {
   createDraftCollection,
   reviseDraftCollection,
   shouldEnterCollection,
   hasMissingQuality,
+  isCollectionConfirmSignal,
+  isCollectionStrongConfirmSignal,
+  isForceProposalSignal,
   type DraftCollection
 } from "./draftCollection"
 import { classifyAgentIntent, classifyBatchIntent, isSecondConfirmMatch, type BatchLocalIntent } from "./intent"
-import { interpretUserTurn, type TurnInterpretation } from "./turnInterpretation"
+import { interpretUserTurn, isCurrentEntryFieldRevision, isManagementRequest, type TurnInterpretation } from "./turnInterpretation"
 import { resolveConversationFocus } from "./focusResolver"
 import { askTurnInterpreterLlm, type TurnInterpreterLlmClient } from "./turnInterpreterLlm"
 import {
@@ -25,18 +28,30 @@ import {
   composeCollectionCancelledMessage,
   composeReadyToConfirmMessage,
   composePendingReminder,
+  composePendingFieldAnswer,
   composeProposalMessage,
   composeRevisedMessage,
   composeBatchIntro,
   composeBatchRevisedMessage,
   composeCancelledMessage,
-  composeBoundaryAnswer
+  composeBoundaryAnswer,
+  composeParseFailedMessage
 } from "./responseComposer"
 import { classifyConversationBoundary } from "./conversationBoundary"
+import type { AllowedAction } from "./conversationContext"
+import {
+  composeGroundedItemRecordAnswer,
+  composeItemNotFoundAnswer,
+  detectItemRecordQuery,
+  extractEvidenceFacts,
+  hasItemRecordQuerySignal,
+  resolveItemFromText,
+  validateAnswerGrounding
+} from "./groundedQuery"
 import { buildRecordSuggestions, type InferenceItemView } from "./recordInference"
 import { buildRecordInsights, composeInsightLine } from "./recordInsight"
 import { buildAgentPlan, composePlanMessage, type BuildAgentPlanResult } from "./planner"
-import type { AgentPlan } from "./actions"
+import { createAgentPlan, type AgentPlan, type CalibrateInventoryAction } from "./actions"
 import type {
   AgentOrchestrator,
   AgentPlanCommand,
@@ -49,6 +64,7 @@ import {
   setFinalDecision,
   type AgentDecisionTrace
 } from "./agentDecisionTrace"
+import { planContainsClosedActions } from "./capabilities"
 
 /** 构造一个 AgentOrchestrator 实例。无状态，可单例使用。 */
 export function createHouseholdOrchestrator(): AgentOrchestrator {
@@ -77,6 +93,224 @@ export function createHouseholdOrchestrator(): AgentOrchestrator {
     async interpretAndRoute(input, clientOverride) {
       return interpretAndRouteSync(input, clientOverride)
     }
+  }
+}
+
+/**
+ * 能力收缩：导航处理器。
+ *
+ * 对已关闭的管理类请求（删除/编辑/预算/提醒/周期管理），Agent 只负责定位对象
+ * 并导航到对应 UI，不写入 state，不创建 pendingPlan，不进入二次确认。
+ *
+ * 定位策略：
+ *   1. 从文本中匹配已管理物品（findItemMatch）
+ *   2. 匹配到唯一物品 → 告知用户可在物品详情/记录列表中手动操作
+ *   3. 匹配到多个候选 → 告知用户到对应分类下操作
+ *   4. 未匹配到物品 → 告知用户到对应设置/分类入口操作
+ *   5. 预算/提醒类请求 → 导航到设置页
+ */
+function handleNavigateIntent(text: string, state: import("../types").AppState, trace: AgentDecisionTrace | undefined, intent: string, itemNameHint?: string): OrchestrateDecision {
+  setRouteDecision(trace, "navigate", { rule: `navigate.${intent}`, interceptedByRule: true })
+  // 解析导航目标 + 生成文案
+  // itemNameHint 用于 pendingDraft 场景：用户说「周期改成 30 天」时文本里没有物品名，
+  // 但当前 pendingDraft 已隐含了物品上下文（如猫砂），用 hint 作为兜底定位。
+  const { message, target } = composeNavigateMessageAndTarget(text, state, intent, itemNameHint)
+  return {
+    kind: "sync",
+    turn: { kind: "navigate", message, target }
+  }
+}
+
+/**
+ * 403 修复：根据用户输入和意图，生成导航回答文案 + 真实导航目标。
+ *
+ * 旧实现只返回文字，UI 没有任何页面变化，等于"拒绝执行"而非"导航即答案"。
+ * 新实现同时返回 target，由 App.tsx 调用 onOpenItem / onOpenCategory / onOpenSettings 完成真实导航。
+ *
+ * target.section 是可选的 section 锚点：
+ *   - purchaseOptions：常购商品区域（删除/修改/设默认常购商品）
+ *   - history：补货记录区域（修改历史记录价格等）
+ *   - cycle：周期/提醒设置区域（改周期/改提醒）
+ *   - budget：预算区域（设预算）
+ *
+ * 当物品未匹配到时，target 为 undefined，App.tsx 仅展示文案不触发导航。
+ */
+function composeNavigateMessageAndTarget(
+  text: string,
+  state: import("../types").AppState,
+  intent: string,
+  itemNameHint?: string
+): { message: string; target: import("./orchestrator").NavigateTarget | undefined } {
+  // 预算管理 → 导航到设置页（预算区域）
+  if (intent === "manage_budget") {
+    return {
+      message: "预算设置在右上角的设置里，我帮你打开了预算区域，你到那里调整月预算。我这边不直接改预算，避免记错。",
+      target: { kind: "settings", section: "budget" }
+    }
+  }
+
+  // 删除/编辑类请求：尝试定位物品
+  const items = state.items || []
+  if (items.length === 0) {
+    return {
+      message: "目前还没有在管的消耗品。你可以先在主页添加需要管理的物品，之后再来调整记录。",
+      target: undefined
+    }
+  }
+
+  // 用 findItemMatch 定位物品
+  // 403 修复：pendingDraft 场景下用户说「周期改成 30 天」时文本里没有物品名，
+  // 先用 text 匹配；若未命中且提供了 itemNameHint（如 pendingDraft.itemName="猫砂"），
+  // 用 hint 兜底定位，确保导航 target 不丢失。
+  let match = findItemMatch(state, text)
+  if (!match.item || match.confidence === "ambiguous") {
+    if (itemNameHint) {
+      const hintMatch = findItemMatch(state, itemNameHint)
+      if (hintMatch.item && (hintMatch.confidence === "exact" || hintMatch.confidence === "substring" || hintMatch.confidence === "synonym")) {
+        match = hintMatch
+      }
+    }
+  }
+  if (match.item && (match.confidence === "exact" || match.confidence === "substring" || match.confidence === "synonym")) {
+    const item = match.item
+    if (intent === "delete_request") {
+      // 区分：删除补货记录 vs 删除常购商品 vs 删除消耗品
+      if (/补货记录|记录|那条|那条记录/.test(text)) {
+        return {
+          message: `「${item.name}」的补货记录在它的详情页里。我帮你打开了「${item.name}」的补货记录区域，你可以在记录详情中手动删除。我这边不直接删记录，避免误删。`,
+          target: { kind: "item", itemId: item.id, section: "history" }
+        }
+      }
+      // 删除常购商品
+      if (/常购商品|常购|默认商品/.test(text)) {
+        return {
+          message: `「${item.name}」的常购商品在它的详情页里。我帮你打开了「${item.name}」的常购商品区域，你可以在列表中手动删除。我这边不直接删，避免误删。`,
+          target: { kind: "item", itemId: item.id, section: "purchaseOptions" }
+        }
+      }
+      return {
+        message: `要删除「${item.name}」的话，请到它的详情页里手动操作。我帮你打开了「${item.name}」，你可以在里面删除。我这边不直接删除消耗品，避免误删。`,
+        target: { kind: "item", itemId: item.id }
+      }
+    }
+    // 编辑类（manage_item）：根据文本判断具体 section
+    // 周期/提醒类
+    if (/周期|提前.*天|提醒/.test(text)) {
+      return {
+        message: `「${item.name}」的周期和提醒设置在它的详情页里。我帮你打开了「${item.name}」的周期设置区域，你可以到那里调整。我这边不直接改，避免记错。`,
+        target: { kind: "item", itemId: item.id, section: "cycle" }
+      }
+    }
+    // 常购商品类
+    if (/常购商品|常购|默认商品/.test(text)) {
+      return {
+        message: `「${item.name}」的常购商品在它的详情页里。我帮你打开了「${item.name}」的常购商品区域，你可以到那里修改。我这边不直接改，避免记错。`,
+        target: { kind: "item", itemId: item.id, section: "purchaseOptions" }
+      }
+    }
+    // 历史记录类
+    if (/历史|记录|上个月|上次|价格/.test(text)) {
+      return {
+        message: `「${item.name}」的补货记录在它的详情页里。我帮你打开了「${item.name}」的补货记录区域，你可以到那里修改。我这边不直接改，避免记错。`,
+        target: { kind: "item", itemId: item.id, section: "history" }
+      }
+    }
+    // 兜底：打开详情页
+    return {
+      message: `「${item.name}」的设置在它的详情页里。我帮你打开了「${item.name}」，你可以到那里调整周期、单位、提醒等。我这边不直接改，避免记错。`,
+      target: { kind: "item", itemId: item.id }
+    }
+  }
+
+  // 匹配到多个候选
+  if (match.candidates.length > 1) {
+    return {
+      message: `你说的可能是 ${match.candidates.slice(0, 4).map((c) => `「${c}」`).join("、")} 中的一个。请到对应物品的详情页里手动操作，我这边不直接改，避免记错。`,
+      target: undefined
+    }
+  }
+
+  // 未匹配到物品
+  return {
+    message: "没找到对应的消耗品。你可以到主页或对应分类下找到要管理的物品，在详情页里手动操作。我这边不直接改，避免记错。",
+    target: undefined
+  }
+}
+
+/**
+ * 403：库存状态报告处理器。
+ *
+ * 从 TurnInterpretation 提取 itemName/remainingDays/statusLabel，
+ * 构造 CalibrateInventoryAction 并生成 planProposal。
+ * 用户确认后由 commitAgentPlan → applyAgentAction → calibrateRemainingDays 写入。
+ *
+ * 不创建补货记录，不新建消耗品，只更新库存状态锚点。
+ */
+function handleInventoryStatusReport(
+  interpretation: TurnInterpretation,
+  state: import("../types").AppState,
+  text: string,
+  trace: AgentDecisionTrace | undefined
+): OrchestrateDecision {
+  const itemName = interpretation.fields.itemName
+  const remainingDays = interpretation.fields.remainingDays
+  const statusLabel = interpretation.fields.unit ?? (
+    remainingDays === 0 ? "已用完"
+      : (interpretation.fields.inventoryStatus === "low" ? "快没了"
+        : interpretation.fields.inventoryStatus === "half" ? "还能用一阵"
+          : interpretation.fields.inventoryStatus === "plenty" ? "还有很多"
+            : "库存状态更新")
+  )
+
+  if (!itemName || remainingDays === undefined) {
+    setRouteDecision(trace, "inventoryStatus", { rule: "missing_fields", routeToLlm: true })
+    return {
+      kind: "sync",
+      turn: {
+        kind: "answer",
+        message: "没听清楚是哪个物品或还剩多少。你可以说「猫砂快没了」或「纸巾还剩两包」。"
+      }
+    }
+  }
+
+  // 查找物品 id
+  const match = findItemMatch(state, itemName)
+  if (!match.item || match.confidence === "ambiguous") {
+    if (match.candidates.length > 1) {
+      setRouteDecision(trace, "inventoryStatus", { rule: "ambiguous_match", interceptedByRule: true })
+      return {
+        kind: "sync",
+        turn: {
+          kind: "clarification",
+          message: `你说的可能是 ${match.candidates.slice(0, 4).map((c) => `「${c}」`).join("、")} 中的一个。告诉我具体是哪个？`,
+          options: match.candidates.slice(0, 4).map((c) => ({ label: c, draft: undefined }))
+        }
+      }
+    }
+    setRouteDecision(trace, "inventoryStatus", { rule: "no_match", interceptedByRule: true })
+    return {
+      kind: "sync",
+      turn: {
+        kind: "answer",
+        message: `没在管「${itemName}」这个消耗品。你可以先在主页添加它，之后再来报告库存状态。`
+      }
+    }
+  }
+
+  const item = match.item
+  const action: CalibrateInventoryAction = {
+    type: "calibrateInventory",
+    itemId: item.id,
+    itemName: item.name,
+    remainingDays,
+    statusLabel
+  }
+  const plan = createAgentPlan([action], text)
+  const message = composePlanMessage(plan, state)
+  setRouteDecision(trace, "inventoryStatus", { rule: "planProposal", interceptedByRule: true })
+  return {
+    kind: "sync",
+    turn: { kind: "planProposal", message, plan }
   }
 }
 
@@ -167,6 +401,70 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
     // 落到下面继续 writeDraft / boundary / LLM 流程。
   }
 
+  // 3.5. 能力收缩：无 pending 时拦截管理类意图（删除/编辑/预算/提醒/周期管理）。
+  //     这些请求不再进入写入流程，只定位对象并导航到对应 UI。
+  //     必须在 writeDraft 之前拦截，避免被 classifyAgentIntent 误判为 writeDraft
+  //     后走到 buildAgentPlan（已关闭管理类）→ noPlan → buildLocalDraftFromText → null → LLM。
+  {
+    const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
+    if (trace) {
+      trace.localInterpretation = interpretation
+      trace.firstFocusDecision = { focus: "route_to_navigate", reason: `管理类意图「${interpretation.intent}」无 pending 时拦截` }
+    }
+    if (
+      interpretation.intent === "delete_request" ||
+      interpretation.intent === "manage_item" ||
+      interpretation.intent === "manage_budget"
+    ) {
+      return handleNavigateIntent(text, state, trace, interpretation.intent)
+    }
+
+    // 3.6. 403：库存状态报告、最近写入纠错/撤销。
+    //   - report_inventory_status → 构造 CalibrateInventoryAction 的 planProposal
+    //   - undo_last_mutation → planCommand(undoLastMutation)，App.tsx 直接执行
+    //   - correct_last_mutation → planCommand(correctLastMutation, field, value)，App.tsx 直接执行
+    //   这些操作不进入 writeDraft 流程，不创建 collection/proposal/plan 管理类入口。
+    if (interpretation.intent === "report_inventory_status") {
+      setRouteDecision(trace, "inventoryStatus", { rule: "report_inventory_status", interceptedByRule: true })
+      return handleInventoryStatusReport(interpretation, state, text, trace)
+    }
+    if (interpretation.intent === "undo_last_mutation") {
+      setRouteDecision(trace, "undoLastMutation", { rule: "undo_last_mutation", interceptedByRule: true })
+      return {
+        kind: "sync",
+        turn: { kind: "planCommand", message: "撤销刚才那条。", command: { command: "undoLastMutation" } }
+      }
+    }
+    if (interpretation.intent === "correct_last_mutation") {
+      const field = interpretation.fields.correctionField
+      const value = interpretation.fields.correctionValue
+      if (field && value !== undefined) {
+        setRouteDecision(trace, "correctLastMutation", { rule: `correct_last_mutation.${field}`, interceptedByRule: true })
+        return {
+          kind: "sync",
+          turn: {
+            kind: "planCommand",
+            message: `修正刚才那条的${field === "price" ? "金额" : field === "qty" ? "数量" : field === "platform" ? "平台" : "日期"}。`,
+            command: { command: "correctLastMutation", field, value }
+          }
+        }
+      }
+    }
+  }
+
+  // 3.7. 403：管理请求统一兜底守卫。
+  //   即使 interpretUserTurn 未将意图分类为 delete_request/manage_item/manage_budget，
+  //   只要文本命中 isManagementRequest，立即返回导航回答，不进入 writeDraft 流程。
+  //   此守卫防止「删除猫砂的 pidan 豆腐猫砂常购商品」等句式被 buildLocalDraftFromText
+  //   误解析为 addPurchaseOption（虽然 drafts.ts 已加守卫，这里再拦一层，纵深防御）。
+  //   有 pending 时不拦——允许当前草稿字段修订（如「金额改成 78」）。
+  if (!pendingDraft && !pendingCollection && !pendingBatch && !pendingPlan && isManagementRequest(text)) {
+    if (trace) {
+      setRouteDecision(trace, "navigate", { rule: "management_request_guard", interceptedByRule: true })
+    }
+    return handleNavigateIntent(text, state, trace, "manage_item")
+  }
+
   // 4. writeDraft 意图：
   //    4a. 先检查重复创建/歧义（clarification）
   //    4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改周期）
@@ -181,6 +479,45 @@ function decideSync(input: OrchestrateInput): OrchestrateDecision {
   //   走到这里说明本轮不是针对 pendingPlan 的这些意图。
   //   如果传 pendingPlan，"帮我加一袋猫砂" 会因"袋"在 REVISE_KEYWORDS 中被误判为 reviseDraft，
   //   导致新写入请求走 needLlm 而非 writeDraft。
+  //
+  // 4.5. 阶段 4B.7：data-grounded item record query。
+  //     用户询问已管理物品的补货历史 / 最近记录 / 价格 / 平台 / 数量时，
+  //     直接从 state.items[].history 读取真实数据回答，不走 answerLlm，避免幻觉。
+  //     此检查在混合信号守卫之前，因为「狗粮买了几袋」含「买了」+「几袋」会被
+  //     混合信号守卫直接送 LLM，但本地有真实数据可直接回答。
+  //     检测条件保守：必须含查询信号 + 已管理物品名 + 不含强写入信号。
+  {
+    const recordQuery = detectItemRecordQuery(text, state)
+    if (recordQuery) {
+      setRouteDecision(trace, "groundedQuery", { rule: "grounded_item_record_query", interceptedByRule: true })
+      return {
+        kind: "sync",
+        turn: { kind: "answer", message: composeGroundedItemRecordAnswer(recordQuery) }
+      }
+    }
+    // 未找到物品但有查询信号：不编造，引导用户确认
+    if (hasItemRecordQuerySignal(text)) {
+      const mentionedItem = resolveItemFromText(text, state.items)
+      if (!mentionedItem && state.items.length > 0) {
+        setRouteDecision(trace, "groundedQuery", { rule: "item_not_found", interceptedByRule: true })
+        return {
+          kind: "sync",
+          turn: { kind: "answer", message: composeItemNotFoundAnswer(text, state) }
+        }
+      }
+    }
+  }
+
+  // 阶段 4B.6：混合信号守卫——无 pending 时也检查购买动词 + 疑问/指代词。
+  //   如「我花了多少钱买的这 5 袋猫砂」含「买的」会被 classifyAgentIntent 判为 writeDraft，
+  //   但「多少钱」是疑问信号，本地无权高置信新建 collection，应交 LLM 查询历史或澄清。
+  if (!pendingDraft && !pendingCollection && !pendingBatch && (!pendingPlan || (pendingPlan.status !== "pending" && pendingPlan.status !== "awaitingSecondConfirm"))) {
+    const preInterpretation = interpretUserTurn({ text, state, itemViews: itemViews ?? [], dateContext })
+    if (preInterpretation.signals.hasQuestionSignal && preInterpretation.signals.hasPurchaseVerb) {
+      setRouteDecision(trace, "needLlm", { rule: "mixed_signal_guard.no_pending", routeToLlm: true, reason: preInterpretation.reason })
+      return handleBoundaryOrLlmFallback(text, trace)
+    }
+  }
   const intent = classifyAgentIntent(text, Boolean(pendingDraft))
   if (intent === "writeDraft") {
     const writeDraftDecision = handleWriteDraftIntent(input)
@@ -207,40 +544,30 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
     setRouteDecision(trace, "writeDraft", { rule: "clarification", interceptedByRule: true })
     return { kind: "sync", turn: clarifyToTurn(clarification) }
   }
-  // 4b. 用 planner 检查 AgentPlan-only 句式（建分类、设预算、改消耗品周期 + 第二期编辑类）
-  //     只对 AgentDraft 无法处理的新能力生成 planProposal，避免破坏旧 confirm/cancel/revise 流程
+  // 4b. 用 planner 检查 AgentPlan-only 句式（建分类）
+  //     能力收缩后，planner 只对录入域 action 生成 plan（createCategory/createItem/
+  //     addPurchaseOption/recordRestock）。其中只有 createCategory 是 plan-only
+  //     （其他三种可由旧 AgentDraft 流程处理）。
   const planResult = buildAgentPlan({ text, state, dateContext, pendingPlan: undefined })
   if (planResult.kind === "plan") {
     const plan = planResult.plan
-    // 判断是否是 AgentPlan-only 能力：
-    //   第一期：createCategory / setMonthlyBudget / updateItem
-    //   第二期：renameCategory / moveItem / updateItemUnit / updateItemReminder /
-    //           updatePurchaseOption / setDefaultPurchaseOption
-    //   第三期：deletePurchaseOption / deleteRestockRecord / deleteItem / deleteCategory
-    const isPlanOnly = plan.actions.some(
-      (a) => a.type === "createCategory"
-        || a.type === "setMonthlyBudget"
-        || a.type === "updateItem"
-        || a.type === "renameCategory"
-        || a.type === "moveItem"
-        || a.type === "updateItemUnit"
-        || a.type === "updateItemReminder"
-        || a.type === "updatePurchaseOption"
-        || a.type === "setDefaultPurchaseOption"
-        || a.type === "deletePurchaseOption"
-        || a.type === "deleteRestockRecord"
-        || a.type === "deleteItem"
-        || a.type === "deleteCategory"
-    )
-    if (isPlanOnly) {
-      setRouteDecision(trace, "writeDraft", { rule: "planner.planOnly", interceptedByRule: true })
-      return {
-        kind: "sync",
-        turn: { kind: "planProposal", message: composePlanMessage(plan, state), plan }
+    // 安全兜底：若 plan 意外包含已关闭的管理类 action（不应发生），不创建 planProposal
+    if (planContainsClosedActions(plan.actions.map((a) => a.type))) {
+      setRouteDecision(trace, "writeDraft", { rule: "planner.closed_action_blocked", interceptedByRule: true })
+      // 不返回 planProposal，落到下方 draft 流程或 LLM
+    } else {
+      // 能力收缩后唯一 plan-only：createCategory（其他 action 回退到旧 AgentDraft 流程）
+      const isPlanOnly = plan.actions.some((a) => a.type === "createCategory")
+      if (isPlanOnly) {
+        setRouteDecision(trace, "writeDraft", { rule: "planner.planOnly", interceptedByRule: true })
+        return {
+          kind: "sync",
+          turn: { kind: "planProposal", message: composePlanMessage(plan, state), plan }
+        }
       }
+      // 非 plan-only（如「买了两袋猫砂」）：回退到旧 AgentDraft 流程，保持 confirm 链路不变
+      setRouteDecision(trace, "writeDraft", { rule: "planner.nonPlanOnly_fallback_to_drafts" })
     }
-    // 非 plan-only（如「买了两袋猫砂」）：回退到旧 AgentDraft 流程，保持 confirm 链路不变
-    setRouteDecision(trace, "writeDraft", { rule: "planner.nonPlanOnly_fallback_to_drafts" })
   }
   if (planResult.kind === "clarification") {
     // planner 的 clarification 是本地兜底，目前不会产出可点选选项
@@ -259,6 +586,26 @@ function handleWriteDraftIntent(input: OrchestrateInput): OrchestrateDecision | 
     }
     setRouteDecision(trace, "writeDraft", { rule: "drafts.proposal", interceptedByRule: true })
     return { kind: "sync", turn: draftToProposal(localDraft, state, itemViews) }
+  }
+  // 403 修复：显式 createItem 语义 + 已存在 → 返回 navigate turn（打开已有物品详情）
+  // buildLocalDraftFromText 在此场景返回 null，旧逻辑会落到 LLM 兜底，
+  // 但这里应直接拦截，回复「已存在」并打开详情页。
+  if (isExplicitCreateItemSignal(text)) {
+    const itemName = extractCreateItemName(text)
+    if (itemName) {
+      const match = findItemMatch(state, itemName)
+      if (match.item && (match.confidence === "exact" || match.confidence === "synonym")) {
+        setRouteDecision(trace, "writeDraft", { rule: "createItem.alreadyExists", interceptedByRule: true })
+        return {
+          kind: "sync",
+          turn: {
+            kind: "navigate",
+            message: `「${match.item.name}」已经在清单里了，不需要重复创建。我帮你打开它。`,
+            target: { kind: "item", itemId: match.item.id, section: undefined }
+          }
+        }
+      }
+    }
   }
   // 4d. 本地解析失败 → 返回 null，由调用方走 boundary / LLM 兜底
   return null
@@ -391,9 +738,39 @@ function handlePendingPlanFocusDecision(input: OrchestrateInput): OrchestrateDec
   const { text, state, itemViews, dateContext, pendingPlan, trace } = input
   if (!pendingPlan) return null
 
+  // 403：当前草稿字段修订（如「价格改成 68」「改成 3 袋」「平台改成京东」）。
+  //   当 pendingPlan 活跃且文本命中 isCurrentEntryFieldRevision 时，尝试修订 plan：
+  //   - 修订后若 plan 只含有效写入 action（recordRestock/createItem 等）→ 返回 planProposal
+  //   - 修订后若 plan 含已关闭的管理类 action（updatePurchaseOption 等）→ 返回导航回答
+  //   - tryRevisePendingPlan 未匹配 → 交正常 focus 流程
+  if (isCurrentEntryFieldRevision(text)) {
+    const reviseResult = buildAgentPlan({ text, state, dateContext, pendingPlan })
+    if (reviseResult.kind === "plan") {
+      setRouteDecision(trace, "pendingPlan", { rule: "field_revision.revised", interceptedByRule: true })
+      return {
+        kind: "sync",
+        turn: {
+          kind: "planProposal",
+          message: `${composeRevisedMessage()}\n${composePlanMessage(reviseResult.plan, state)}`,
+          plan: reviseResult.plan
+        }
+      }
+    }
+    // reviseResult.kind === "noPlan"：
+    //   - 若 pendingPlan 含已关闭的管理类 action（如 updatePurchaseOption），
+    //     tryRevisePendingPlan 会生成修订 plan 但被 planContainsClosedActions 拦截 → 导航
+    //   - 若 tryRevisePendingPlan 未匹配字段 → null → 交正常 focus 流程
+    if (planContainsClosedActions(pendingPlan.actions.map((a) => a.type))) {
+      setRouteDecision(trace, "pendingPlan", { rule: "field_revision.closed_action_navigate", interceptedByRule: true })
+      return handleNavigateIntent(text, state, trace, "manage_item")
+    }
+    // 否则交正常 focus 流程
+  }
+
   const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
   const focus = resolveConversationFocus({
     interpretation,
+    text,
     pendingPlan,
     pendingCollection: input.pendingCollection,
     pendingDraft: input.pendingDraft,
@@ -466,6 +843,11 @@ function handlePendingPlanFocusDecision(input: OrchestrateInput): OrchestrateDec
       return null
     }
 
+    case "route_to_navigate": {
+      // 能力收缩：管理类请求只导航，不执行。不影响当前 pendingPlan。
+      return handleNavigateIntent(text, state, trace, interpretation.intent)
+    }
+
     default:
       // continue_pending_collection / continue_pending_batch / continue_pending_draft / route_to_write_draft
       // 这些分支在 pendingPlan 场景下不应出现（focusResolver 已分流），兜底交回 decideSync。
@@ -495,6 +877,7 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
   }
   const focus = resolveConversationFocus({
     interpretation,
+    text,
     pendingCollection,
     pendingPlan,
     pendingDraft,
@@ -531,6 +914,16 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       // 本地解析失败：交 LLM 兜底
       setRouteDecision(trace, "needLlm", { rule: "start_new_collection.local_parse_failed", routeToLlm: true, reason: `start_new_collection but local parser failed: ${focus.reason}` })
       return { kind: "needLlm", reason: `start_new_collection but local parser failed: ${focus.reason}` }
+    }
+
+    case "query_current_pending": {
+      // 阶段 4B.6：直接从 pendingCollection 回答字段，不新建 collection，不交 LLM
+      const targetField = focus.focus === "query_current_pending"
+        ? (focus as { targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary" }).targetField
+        : undefined
+      const message = composePendingFieldAnswer(undefined, pendingCollection, targetField)
+      setRouteDecision(trace, "pendingCollection", { rule: `focus.query_current_pending(${targetField ?? "summary"})`, interceptedByRule: true })
+      return { kind: "sync", turn: { kind: "answer", message } }
     }
 
     case "route_to_query": {
@@ -600,12 +993,30 @@ function handleCollectionFocusDecision(input: OrchestrateInput): OrchestrateDeci
       return { kind: "needTurnInterpreterLlm", reason: focus.reason }
     }
 
+    case "route_to_navigate": {
+      // 能力收缩：管理类请求只导航，不执行。不影响当前 pendingCollection。
+      return handleNavigateIntent(text, state, trace, interpretation.intent)
+    }
+
     default:
       // continue_pending_plan / continue_pending_batch / continue_pending_draft / route_to_write_draft
       // 这些分支在 pendingCollection 场景下不应出现（focusResolver 已分流），
       // 兜底交回 decideSync 后续流程处理。
       return null
   }
+}
+
+/**
+ * 阶段 4B.6：明确修订信号——显式修订词 + 字段名 + 金额字。
+ * 用于在 interpretation.intent === "unknown" 时判断是否允许 legacy reviseDraft 接管。
+ * 不含「今天/昨天/袋/包/京东」等松散关键词，避免「我今天有点累」被误判为修订。
+ */
+const EXPLICIT_REVISE_PATTERN =
+  /改成|换成|修正|更正|价格错了|数量错了|平台错了|商品名叫|买的是|分类改成|分类改为|归到|放到|周期|补货周期|平台|商家|数量|价格|金额|评价|日期|单位|花了|块|元|不是.*是/
+
+/** 把一句话压成只含中文/字母数字的紧凑串，便于关键词匹配。 */
+function compactForRevise(value: string): string {
+  return value.trim().replace(/[\s，。！？、,.!?]/g, "")
 }
 
 /**
@@ -631,6 +1042,7 @@ function handlePendingDraftFocusDecision(input: OrchestrateInput): OrchestrateDe
   const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
   const focus = resolveConversationFocus({
     interpretation,
+    text,
     pendingPlan: input.pendingPlan,
     pendingCollection: input.pendingCollection,
     pendingDraft,
@@ -677,6 +1089,16 @@ function handlePendingDraftFocusDecision(input: OrchestrateInput): OrchestrateDe
       return null
     }
 
+    case "query_current_pending": {
+      // 阶段 4B.6：直接从 pendingDraft 回答字段，不新建 collection，不交 LLM
+      const targetField = focus.focus === "query_current_pending"
+        ? (focus as { targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary" }).targetField
+        : undefined
+      const message = composePendingFieldAnswer(pendingDraft, undefined, targetField)
+      setRouteDecision(trace, "pendingDraft", { rule: `focus.query_current_pending(${targetField ?? "summary"})`, interceptedByRule: true })
+      return { kind: "sync", turn: { kind: "answer", message } }
+    }
+
     case "route_to_query":
     case "route_to_smalltalk":
     case "route_to_llm": {
@@ -692,7 +1114,20 @@ function handlePendingDraftFocusDecision(input: OrchestrateInput): OrchestrateDe
       // 能识别为 reviseDraft。仍交原 draft handler 处理，保留旧修订能力。
       // 注意：含「买了」的新补货记录已由 start_new_collection 分支处理，
       // 不会走到这里，因此不会重新引入「袋」误判问题。
-      if (legacyIntent === "reviseDraft") {
+      //
+      // 阶段 4B.6：pending 活跃期白名单准入——以下情况不允许 legacy reviseDraft 接管：
+      //   1. interpretation.intent 为 smalltalk / query_inventory（明确非修订）
+      //   2. hasQuestionSignal=true（混合信号，需 LLM 结合 pending 判断）
+      //   3. interpretation.intent 为 unknown 且无明确修订信号（如「我今天有点累」
+      //      被 classifyAgentIntent 因「今天」误判为 reviseDraft，但无改成/换成/价格等
+      //      明确修订词，不应被 legacy 覆盖）
+      const hasExplicitReviseSignal = EXPLICIT_REVISE_PATTERN.test(compactForRevise(text))
+      const shouldBlockReviseDraft =
+        interpretation.intent === "smalltalk" ||
+        interpretation.intent === "query_inventory" ||
+        interpretation.signals.hasQuestionSignal === true ||
+        (interpretation.intent === "unknown" && !hasExplicitReviseSignal)
+      if (legacyIntent === "reviseDraft" && !shouldBlockReviseDraft) {
         setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}→reviseDraft`, interceptedByRule: true })
         const draftTurn = handlePendingDraftIntent(text, pendingDraft, state, trace)
         if (draftTurn) return { kind: "sync", turn: draftTurn }
@@ -708,9 +1143,37 @@ function handlePendingDraftFocusDecision(input: OrchestrateInput): OrchestrateDe
           }
         }
       }
+      // 阶段 4B.6 补口：pendingDraft route_to_llm 无条件升级 needTurnInterpreterLlm。
+      // 原因：route_to_llm 已代表本地无法可靠承接。draft 态下不应再落回 answer LLM，
+      // 因为 answer LLM 没有「修订当前 draft 字段」的结构化出口（会答「超出家务范围」）。
+      // 与 pendingCollection 对齐（pendingCollection 的 route_to_llm 也是无条件升级）。
+      if (focus.focus === "route_to_llm") {
+        setRouteDecision(trace, "needTurnInterpreterLlm", { rule: "focus.route_to_llm.unconditional", routeToLlm: true, reason: focus.reason })
+        return { kind: "needTurnInterpreterLlm", reason: focus.reason }
+      }
+      // route_to_query 且含混合信号（hasQuestionSignal）时，也交 LLM Turn Interpreter。
+      // 如「猫砂那条你记了多少钱」被判为 query_inventory → route_to_query，
+      // 但含「多少钱」指代信号，应交 LLM 结合 pendingDraft 回答。
+      if (focus.focus === "route_to_query" && interpretation.signals.hasQuestionSignal) {
+        setRouteDecision(trace, "needTurnInterpreterLlm", { rule: "focus.route_to_query.mixed_signal", routeToLlm: true, reason: focus.reason })
+        return { kind: "needTurnInterpreterLlm", reason: focus.reason }
+      }
       // 查询 / 闲聊 / 低置信：不执行 draft，落回 decideSync 后续流程
-      setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}`, routeToLlm: focus.focus === "route_to_llm" })
+      // 注意：route_to_llm 已在上方无条件升级为 needTurnInterpreterLlm，不会走到这里。
+      setRouteDecision(trace, "pendingDraft", { rule: `focus.${focus.focus}` })
       return null
+    }
+
+    case "route_to_navigate": {
+      // 能力收缩：管理类请求只导航，不执行。不影响当前 pendingDraft。
+      // 403 修复：pendingDraft 场景下用户说「周期改成 30 天」时文本里没有物品名，
+      // 传 pendingDraft 的 itemName 作为 hint，让 composeNavigateMessageAndTarget 能定位到物品。
+      const draftItemName = pendingDraft.kind === "restock" ? pendingDraft.itemName
+        : pendingDraft.kind === "createItemWithRestock" ? pendingDraft.item.itemName
+        : pendingDraft.kind === "createItem" ? pendingDraft.itemName
+        : pendingDraft.kind === "addPurchaseOption" ? pendingDraft.itemName
+        : undefined
+      return handleNavigateIntent(text, state, trace, interpretation.intent, draftItemName)
     }
 
     default:
@@ -732,8 +1195,20 @@ function handlePendingDraftIntent(
 ): AgentTurn | null {
   const intent = classifyAgentIntent(text, true)
   if (intent === "confirmDraft") {
-    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.confirmDraft", interceptedByRule: true })
-    return { kind: "proposal", message: composeProposalMessage(pendingDraft), executableDraft: pendingDraft, status: "pending" }
+    // 403 修复：返回 typed draftCommit command，由 App.tsx 调用 confirmAgentDraft。
+    // 旧实现返回 { kind: "proposal", executableDraft: pendingDraft } 并依赖 App.tsx
+    // 的 turn.executableDraft === pendingDraft 引用相等判断；该写法在 draft 经过 revise
+    // 后引用变化时会落入"修订"分支，形成确认死循环。
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.confirmDraft→draftCommit", interceptedByRule: true })
+    return { kind: "planCommand", message: "", command: { command: "draftCommit" } }
+  }
+  // 403 修复：force_proposal 信号（就这么记/先保存/直接记下/不用问等）在 pendingDraft
+  // 上下文中视为确认。focusResolver 已将 force_proposal 路由到 continue_pending_draft，
+  // 但旧 handlePendingDraftIntent 只检查 classifyAgentIntent，不认识"直接记下"等
+  // force-proposal 短语（它们不在 CONFIRM_EXPLICIT_PHRASES 里），导致返回 null 落到 LLM。
+  if (isForceProposalSignal(text)) {
+    setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.forceProposal→draftCommit", interceptedByRule: true })
+    return { kind: "planCommand", message: "", command: { command: "draftCommit" } }
   }
   if (intent === "cancelDraft") {
     setRouteDecision(trace, "pendingDraft", { rule: "draftHandler.cancelDraft", interceptedByRule: true })
@@ -782,6 +1257,7 @@ function handlePendingBatchFocusDecision(input: OrchestrateInput): OrchestrateDe
   const interpretation = interpretUserTurn({ text, state, itemViews, dateContext })
   const focus = resolveConversationFocus({
     interpretation,
+    text,
     pendingPlan: input.pendingPlan,
     pendingCollection: input.pendingCollection,
     pendingDraft: input.pendingDraft,
@@ -856,6 +1332,11 @@ function handlePendingBatchFocusDecision(input: OrchestrateInput): OrchestrateDe
       return null
     }
 
+    case "route_to_navigate": {
+      // 能力收缩：管理类请求只导航，不执行。不影响当前 pendingBatch。
+      return handleNavigateIntent(text, state, trace, interpretation.intent)
+    }
+
     default:
       // continue_pending_collection / continue_pending_batch / continue_pending_plan / continue_pending_draft / route_to_write_draft
       // 这些分支在 pendingBatch 场景下不应出现（focusResolver 已分流），兜底交回 decideSync。
@@ -867,10 +1348,16 @@ function handlePendingBatchFocusDecision(input: OrchestrateInput): OrchestrateDe
  * 阶段 2C：pendingCollection 下本地低置信（route_to_llm）时，调用 LLM Turn Interpreter
  * 重新做结构化理解，再用 resolveConversationFocus 二次路由。
  *
+ * 阶段 4B.6：扩展支持 pendingDraft（无 pendingCollection 时也能进入）。
+ * pendingDraft + 混合信号（如「我花了多少钱买的这 5 袋猫砂」）从 handlePendingDraftFocusDecision
+ * 路由到 needTurnInterpreterLlm，由本函数调用 LLM 结合 pendingDraft 上下文重新理解。
+ *
  * 决策契约：
- *   - LLM 解释成功且高/中置信 → 复用 handlePendingCollectionIntent（用合成输入）走 collection 流程
+ *   - LLM 解释成功且高/中置信 → 复用 handlePendingCollectionIntent（用合成输入）走 collection 流程；
+ *     或 pendingDraft 场景走 continue_pending_draft / query_current_pending
  *   - LLM 解释失败 / 低置信 / unknown → 返回 clarification，询问是否补当前记录，
  *     禁止回复「超出家务范围」
+ *   - LLM 判定为 query_current_pending → 直接从 pending 回答字段（不交 answer LLM）
  *   - LLM 判定为 query / smalltalk → 返回 needLlm，交常规 answer LLM 兜底
  *
  * clientOverride 供单测注入 mock；真实运行时内部构造 desktop bridge client。
@@ -896,14 +1383,15 @@ async function interpretAndRouteSync(
     }
   }
 
-  if (!pendingCollection) {
-    // 无 pendingCollection 不应进入此路径；兜底交常规 LLM
+  // 阶段 4B.6：允许 pendingDraft-only 进入（不再要求 pendingCollection 必须存在）
+  if (!pendingCollection && !pendingDraft) {
+    // 无 pending 上下文不应进入此路径；兜底交常规 LLM
     if (trace) {
-      trace.llmInterpreter!.skipReason = "no_pendingCollection"
+      trace.llmInterpreter!.skipReason = "no_pending_context"
     }
-    setRouteDecision(trace, "needLlm", { rule: "interpretAndRoute.no_pendingCollection", routeToLlm: true, reason: "interpretAndRoute without pendingCollection" })
+    setRouteDecision(trace, "needLlm", { rule: "interpretAndRoute.no_pending_context", routeToLlm: true, reason: "interpretAndRoute without pendingCollection or pendingDraft" })
     setFinalDecision(trace, { kind: "needLlm" })
-    return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection" }
+    return { kind: "needLlm", reason: "interpretAndRoute without pendingCollection or pendingDraft" }
   }
 
   const llmInterpretation = await askTurnInterpreterLlm({
@@ -911,6 +1399,7 @@ async function interpretAndRouteSync(
     pendingCollection,
     pendingDraft,
     pendingPlan,
+    pendingBatch,
     state,
     itemViews,
     dateContext,
@@ -920,7 +1409,7 @@ async function interpretAndRouteSync(
 
   // LLM 失败 / 低置信 / unknown → clarification（不回复「超出家务范围」）
   if (!llmInterpretation) {
-    const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+    const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
     setRouteDecision(trace, "turnInterpreter", { rule: "llm_failed_or_low_confidence→clarification", interceptedByRule: true })
     setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
     return { kind: "sync", turn: clarificationTurn }
@@ -928,6 +1417,7 @@ async function interpretAndRouteSync(
 
   const focus = resolveConversationFocus({
     interpretation: llmInterpretation,
+    text,
     pendingCollection,
     pendingPlan,
     pendingDraft,
@@ -940,6 +1430,12 @@ async function interpretAndRouteSync(
   switch (focus.focus) {
     case "continue_pending_collection":
     case "correct_pending_collection": {
+      if (!pendingCollection) {
+        // 不应发生（focusResolver 只在有 pendingCollection 时返回此 focus），兜底 clarification
+        const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
+        setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
+        return { kind: "sync", turn: clarificationTurn }
+      }
       // 用 LLM 解释出的 fields 合成等价用户输入，复用旧 collection 处理逻辑抽取/写入字段
       const synthText = synthesizeInputFromInterpretation(llmInterpretation, pendingCollection)
       if (trace) {
@@ -952,14 +1448,49 @@ async function interpretAndRouteSync(
         return { kind: "sync", turn: collectionTurn }
       }
       // 合成输入仍抽不出字段 → clarification
-      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
       setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.synth_no_extract→clarification", interceptedByRule: true })
       setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
     }
 
+    case "continue_pending_draft": {
+      // 阶段 4B.6：pendingDraft 场景，LLM 判定为修订当前草稿字段（如「我花了120买的这5袋猫砂」）
+      if (!pendingDraft) {
+        const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
+        setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
+        return { kind: "sync", turn: clarificationTurn }
+      }
+      // 用 LLM 解释出的 fields 合成等价输入，复用旧 draft handler 的 revise 逻辑
+      const synthText = synthesizeInputForDraft(llmInterpretation)
+      if (trace) {
+        trace.synthesizedInput = synthText
+      }
+      const draftTurn = handlePendingDraftIntent(synthText, pendingDraft, state, trace)
+      if (draftTurn) {
+        setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.continue_pending_draft", interceptedByRule: true })
+        setFinalDecision(trace, { kind: "sync", turnKind: draftTurn.kind, message: draftTurn.message })
+        return { kind: "sync", turn: draftTurn }
+      }
+      // revise 失败：回退到 pending reminder
+      const reminderTurn: AgentTurn = { kind: "answer", message: composePendingReminder(pendingDraft) }
+      setFinalDecision(trace, { kind: "sync", turnKind: "answer", message: reminderTurn.message })
+      return { kind: "sync", turn: reminderTurn }
+    }
+
+    case "query_current_pending": {
+      // 阶段 4B.6：LLM 判定为查询当前待确认草稿字段 → 直接从 pending 回答
+      const targetField = focus.focus === "query_current_pending"
+        ? (focus as { targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary" }).targetField
+        : undefined
+      const message = composePendingFieldAnswer(pendingDraft, pendingCollection, targetField)
+      setRouteDecision(trace, "turnInterpreter", { rule: `secondFocus.query_current_pending(${targetField ?? "summary"})`, interceptedByRule: true })
+      setFinalDecision(trace, { kind: "sync", turnKind: "answer", message })
+      return { kind: "sync", turn: { kind: "answer", message } }
+    }
+
     case "start_new_collection": {
-      // LLM 判定为新物品补货记录（itemName 与当前 collection 不同）：走 writeDraft 流程
+      // LLM 判定为新物品补货记录（itemName 与当前 pending 不同）：走 writeDraft 流程
       setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.start_new_collection" })
       const writeDraftDecision = handleWriteDraftIntent(input)
       if (writeDraftDecision) {
@@ -968,13 +1499,13 @@ async function interpretAndRouteSync(
         }
         return writeDraftDecision
       }
-      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
       setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
     }
 
     case "route_to_query":
-      // LLM 判定为查询：不打断 collection，交常规 answer LLM 回答查询
+      // LLM 判定为查询：不打断 pending，交常规 answer LLM 回答查询
       setRouteDecision(trace, "needLlm", { rule: "secondFocus.route_to_query", routeToLlm: true, reason: "llm interpreted as query, defer to answer llm" })
       setFinalDecision(trace, { kind: "needLlm" })
       return { kind: "needLlm", reason: "llm interpreted as query, defer to answer llm" }
@@ -992,13 +1523,100 @@ async function interpretAndRouteSync(
       return { kind: "needLlm", reason: "llm interpreted as smalltalk" }
     }
 
+    case "route_to_navigate": {
+      // 能力收缩：管理类请求只导航，不执行。
+      const decision = handleNavigateIntent(text, state, trace, llmInterpretation.intent)
+      if (decision.kind === "sync") {
+        setFinalDecision(trace, { kind: "sync", turnKind: decision.turn.kind, message: decision.turn.message })
+      }
+      return decision
+    }
+
+    case "report_inventory_status": {
+      // 403：LLM 在 pending 上下文中检测到库存状态报告 → 生成 planProposal
+      const decision = handleInventoryStatusReport(llmInterpretation, state, text, trace)
+      if (decision.kind === "sync") {
+        setFinalDecision(trace, { kind: "sync", turnKind: decision.turn.kind, message: "message" in decision.turn ? decision.turn.message : undefined })
+      }
+      return decision
+    }
+
+    case "undo_last_mutation": {
+      // 403：LLM 在 pending 上下文中检测到撤销请求 → planCommand
+      setRouteDecision(trace, "undoLastMutation", { rule: "secondFocus.undo_last_mutation", interceptedByRule: true })
+      const turn: AgentTurn = {
+        kind: "planCommand",
+        message: "撤销刚才那条。",
+        command: { command: "undoLastMutation" }
+      }
+      setFinalDecision(trace, { kind: "sync", turnKind: "planCommand", message: turn.message })
+      return { kind: "sync", turn }
+    }
+
+    case "correct_last_mutation": {
+      // 403：LLM 在 pending 上下文中检测到纠错请求 → planCommand
+      const field = llmInterpretation.fields.correctionField
+      const value = llmInterpretation.fields.correctionValue
+      if (field && value !== undefined) {
+        setRouteDecision(trace, "correctLastMutation", { rule: `secondFocus.correct_last_mutation.${field}`, interceptedByRule: true })
+        const turn: AgentTurn = {
+          kind: "planCommand",
+          message: `修正刚才那条的${field === "price" ? "金额" : field === "qty" ? "数量" : field === "platform" ? "平台" : "日期"}。`,
+          command: { command: "correctLastMutation", field, value }
+        }
+        setFinalDecision(trace, { kind: "sync", turnKind: "planCommand", message: turn.message })
+        return { kind: "sync", turn }
+      }
+      // 字段不完整 → clarification
+      const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
+      setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
+      return { kind: "sync", turn: clarificationTurn }
+    }
+
     default:
       // route_to_llm / 其他：clarification 兜底
-      const clarificationTurn = composeCollectionClarificationTurn(pendingCollection)
+      const clarificationTurn = composePendingClarificationTurn(pendingCollection, pendingDraft)
       setRouteDecision(trace, "turnInterpreter", { rule: "secondFocus.default→clarification", interceptedByRule: true })
       setFinalDecision(trace, { kind: "sync", turnKind: clarificationTurn.kind, message: clarificationTurn.message })
       return { kind: "sync", turn: clarificationTurn }
   }
+}
+
+/**
+ * 阶段 4B.6：构造 pending clarification turn。
+ * 有 pendingCollection 时复用旧 collection clarification；只有 pendingDraft 时用 draft 口吻。
+ */
+function composePendingClarificationTurn(
+  pendingCollection: DraftCollection | undefined,
+  pendingDraft: AgentDraft | undefined
+): AgentTurn {
+  if (pendingCollection) {
+    return composeCollectionClarificationTurn(pendingCollection)
+  }
+  if (pendingDraft) {
+    const name = pendingDraft.kind === "restock" ? pendingDraft.itemName
+      : pendingDraft.kind === "createItemWithRestock" ? pendingDraft.item.itemName
+      : pendingDraft.kind === "createItem" ? pendingDraft.itemName
+      : undefined
+    const message = `你是想改刚才那条${name ? `「${name}」` : "记录"}的字段吗？比如「改成 120 元」「换成京东」。如果不打算记了，可以说「算了」。`
+    return { kind: "clarification", message, options: [] }
+  }
+  return { kind: "clarification", message: "你想让我做什么？可以直接说要记录、查询、修改还是取消。", options: [] }
+}
+
+/**
+ * 阶段 4B.6：把 LLM 解释出的 fields 合成等价用户输入，供 handlePendingDraftIntent 复用旧 revise 逻辑。
+ * 例如 { price: 120 } → "120元"；{ platform: "京东" } → "京东"。
+ */
+function synthesizeInputForDraft(interpretation: TurnInterpretation): string {
+  const f = interpretation.fields
+  const parts: string[] = []
+  if (f.platform) parts.push(f.platform)
+  if (f.price !== undefined) parts.push(`${f.price}元`)
+  if (f.review) parts.push(f.review)
+  if (f.quantity !== undefined) parts.push(`${f.quantity}${f.unit ?? ""}`)
+  if (f.date !== undefined) parts.push(String(f.date))
+  return parts.length > 0 ? parts.join("，") : ""
 }
 
 /**
@@ -1339,6 +1957,22 @@ function handlePendingCollectionIntent(
   dateContext: import("../llm/householdChat").ChatDateContext
 ): AgentTurn | null {
   const prevMissing = collection.qualityMissingSlots
+
+  // 403 修复：采集态确认信号直接走 draftCommit，不再先转 proposal 再让用户确认一次。
+  // 旧实现：missingQualityFields + 强确认 → draftToProposal(...)，用户看到"你确认后我再写入"，
+  // 还需要再输入"确认"才会真正写入——形成"确认死循环"。
+  // 新实现：required 字段齐全时，无论 quality 字段（price/platform）是否缺失，强确认/轻量确认
+  // 都直接返回 draftCommit 命令；App.tsx 读取后调用 onConfirmDraft 写入。
+  // required 字段仍缺（missingRequiredFields）时不允许确认，继续追问 required 字段。
+  if (collection.completeness !== "missingRequiredFields") {
+    if (isCollectionStrongConfirmSignal(text)) {
+      return { kind: "planCommand", message: "", command: { command: "draftCommit" } }
+    }
+    if (collection.completeness === "readyToConfirm" && isCollectionConfirmSignal(text)) {
+      return { kind: "planCommand", message: "", command: { command: "draftCommit" } }
+    }
+  }
+
   const result = reviseDraftCollection(collection, text, state, dateContext.now)
 
   if (result.status === "cancelled") {
@@ -1346,10 +1980,8 @@ function handlePendingCollectionIntent(
   }
 
   if (result.status === "forceProposal") {
-    // 用户要求直接保存：用最新草稿转 proposal，质量字段仍缺则带「未补全」标记
-    const draft = result.draft
-    const qualityMissing = hasMissingQuality(collection) ? collection.qualityMissingSlots : []
-    return draftToProposal(draft, state, itemViews, { fromCollection: true, qualityMissing, dateContext })
+    // 用户明确要求直接保存（就这样/先保存/直接记下）：直接走 draftCommit，不转 proposal
+    return { kind: "planCommand", message: "", command: { command: "draftCommit" } }
   }
 
   if (result.status === "supplemented") {
@@ -1427,64 +2059,194 @@ function handleBatchIntent(text: string, pendingBatch: AgentDraft[], _state: imp
  *
  * 阶段 2C+：同时填充 trace.parseResult 与 trace.validationResult，
  * 便于外部 reviewer 判断问题出在 parse 还是 normalize。
+ *
+ * 阶段 4B.4 重写：
+ *   1. parse 失败时优先抢救 answer/message 字段（从残缺 JSON、非标准 JSON、自然语言中提取）
+ *   2. 不再因含 { } 一票否决
+ *   3. 不再因含写入动词词表否决纯文本（纯文本不会直接写入，没有安全收益）
+ *   4. allowedActions 成为代码级硬约束：draft / clarification 不在 allowedActions 内时拒绝写入
+ *   5. 旧「超出家务范围」等错误兜底文案被替换成中性管家式回答
+ *   6. 不返回 null 给 App.tsx 走 composeBoundaryAnswer(unsupported)
  */
+
 /**
- * 阶段 4B.3：尝试把 LLM 返回的纯文本当作 answer 回复。
- *
- * 触发条件：
- *   - parseAgentResponse 返回 null（非 JSON 结构或 JSON 不合法）
- *   - 内容是合理长度的自然语言（4-300 字符）
- *   - 不包含明显违规写入指令（创建/删除/确认/取消/草稿/计划 等系统语义）
- *   - 不包含「超出家务范围」这类禁用文案
- *
- * 严格限制：只放宽纯文本 answer，不放宽 draft/collection/plan 写入校验。
- * LLM 即使返回自然语言，也不能绕过结构化写入流程。
+ * 阶段 4B.4：旧错误兜底文案黑名单。
+ * 如果 LLM 返回的内容包含这些文案，不原样展示，替换成中性管家式回答。
  */
-const FREE_TEXT_ANSWER_FORBIDDEN = [
-  // 写入指令（LLM 不能用自然语言绕过结构化写入）
-  "创建草稿", "新建草稿", "删除草稿", "确认草稿", "取消草稿",
-  "创建计划", "新建计划", "删除计划", "确认计划", "取消计划",
-  "创建物品", "新建物品", "删除物品",
-  "创建分类", "新建分类", "删除分类",
-  // 禁用文案
-  "超出家务范围", "不太属于我能直接处理"
+const FORBIDDEN_ANSWER_PHRASES = [
+  "超出家务范围",
+  "不太属于我能直接处理的家务范围",
+  "不太属于我能直接处理"
 ]
 
-const FREE_TEXT_ANSWER_FORBIDDEN_MIN_LENGTH = 4
-const FREE_TEXT_ANSWER_FORBIDDEN_MAX_LENGTH = 300
+/** answer 抢救的最大长度（避免把超长 LLM 输出当 answer 吐给用户） */
+const SALVAGE_ANSWER_MAX_LENGTH = 2000
 
-function tryFreeTextAnswer(content: string): string | null {
+/**
+ * 从残缺 JSON / 非标准 JSON 中提取 answer / message 字段值。
+ *
+ * 覆盖场景：
+ *   {"kind":"queryAnswer","answer":"目前没有待确认的记录了"}
+ *   {"kind":"answer","message":"目前没有待确认的记录了",}
+ *   {"answer":"目前没有待确认的记录了"
+ *   前后带说明文字的 JSON 片段
+ */
+function extractAnswerFromJsonLike(content: string): string | null {
   const trimmed = content.trim()
+  // 尝试匹配 "answer":"..." 或 "answer": "..."
+  // 使用非贪婪匹配，支持转义字符
+  const answerMatch = trimmed.match(/"answer"\s*:\s*"((?:[^"\\]|\\.)*)"/s)
+  if (answerMatch?.[1] !== undefined) {
+    return unescapeJsonString(answerMatch[1])
+  }
+  // 尝试匹配 "message":"..."
+  const messageMatch = trimmed.match(/"message"\s*:\s*"((?:[^"\\]|\\.)*)"/s)
+  if (messageMatch?.[1] !== undefined) {
+    return unescapeJsonString(messageMatch[1])
+  }
+  return null
+}
+
+/** 把 JSON 字符串中的转义序列还原成实际字符 */
+function unescapeJsonString(raw: string): string {
+  try {
+    // 用 JSON.parse 还原转义序列（把 raw 当作字符串内容包在引号里解析）
+    return JSON.parse(`"${raw}"`)
+  } catch {
+    // 解析失败时直接返回原始匹配（已去掉外层引号）
+    return raw
+  }
+}
+
+/**
+ * 判断内容是否看起来像 JSON（用于区分"纯文本 answer"和"JSON 但没有 answer/message 字段"）。
+ * 如果内容看起来像 JSON 但没有 answer/message，不应把原始 JSON 吐给用户。
+ */
+function looksLikeJson(text: string): boolean {
+  const trimmed = text.trim()
+  if (trimmed.startsWith("{") && trimmed.includes("}")) return true
+  if (/"kind"\s*:/.test(trimmed)) return true
+  return false
+}
+
+/**
+ * 对抢救出来的 answer 文本做污染过滤。
+ * - 空文本或超长文本返回 null
+ * - 包含旧错误兜底文案时替换成中性管家式回答
+ * - 其他情况原样返回
+ */
+function sanitizeAnswerText(answer: string): string | null {
+  const trimmed = answer.trim()
   if (!trimmed) return null
-  // 长度限制
-  if (trimmed.length < FREE_TEXT_ANSWER_FORBIDDEN_MIN_LENGTH) return null
-  if (trimmed.length > FREE_TEXT_ANSWER_FORBIDDEN_MAX_LENGTH) return null
-  // 包含 JSON 结构（{ ... }）的不当作纯文本 answer
-  if (trimmed.includes("{") && trimmed.includes("}")) return null
-  // 检查禁用词
-  const lower = trimmed.toLowerCase()
-  for (const forbidden of FREE_TEXT_ANSWER_FORBIDDEN) {
-    if (lower.includes(forbidden.toLowerCase())) return null
+  if (trimmed.length > SALVAGE_ANSWER_MAX_LENGTH) return null
+  for (const phrase of FORBIDDEN_ANSWER_PHRASES) {
+    if (trimmed.includes(phrase)) {
+      return composeParseFailedMessage()
+    }
   }
   return trimmed
 }
 
+/**
+ * 阶段 4B.4：从 LLM 返回内容中抢救 answer。
+ *
+ * 优先级：
+ *   1. 从 JSON-like 内容中提取 answer/message 字段
+ *   2. 如果内容看起来像 JSON 但没有 answer/message → 中性兜底（不把原始 JSON 吐给用户）
+ *   3. 纯文本（含偶然出现的大括号如「我看到 {抽纸} 这条记录」）→ 作为 answer
+ *   4. 包含旧错误兜底文案 → 替换成中性管家式回答
+ */
+function salvageAnswerFromContent(content: string): string | null {
+  const trimmed = content.trim()
+  if (!trimmed) return null
+
+  // 1. 尝试从 JSON-like 内容中提取 answer/message
+  const jsonAnswer = extractAnswerFromJsonLike(trimmed)
+  if (jsonAnswer) {
+    return sanitizeAnswerText(jsonAnswer)
+  }
+
+  // 2. 内容看起来像 JSON 但没有 answer/message 字段 → 中性兜底
+  if (looksLikeJson(trimmed)) {
+    return composeParseFailedMessage()
+  }
+
+  // 3. 纯文本（含偶然大括号）→ 作为 answer
+  return sanitizeAnswerText(trimmed)
+}
+
+/**
+ * 阶段 4B.4：检查 action 是否被 allowedActions 允许。
+ * allowedActions 未提供时（旧测试兼容）允许所有动作。
+ */
+function isActionAllowed(action: AllowedAction, allowedActions?: AllowedAction[]): boolean {
+  if (!allowedActions || allowedActions.length === 0) return true
+  return allowedActions.includes(action)
+}
+
+/**
+ * 阶段 4B.5：把 LLM 返回的 draft 字段 patch 到当前 collection 的 draft 上。
+ * 采用「只补缺失字段」语义：当前 collection 已有的字段不被 LLM draft 覆盖。
+ * 这防止 LLM 幻觉（如 qty=1）覆盖用户已确认的字段（如 qty=5）。
+ * - qty: 当前已有有效值时保留，否则取 LLM 值
+ * - unit: 当前已有非空值时保留，否则取 LLM 值
+ * - price: 当前已有值时保留，否则取 LLM 值
+ * - platform: 当前已有非空值时保留，否则取 LLM 值
+ * - review: 当前已有非空值时保留，否则取 LLM 值
+ * - restockDate: 当前已有值时保留，否则取 LLM 值
+ */
+function mergeDraftFields(current: AgentDraft, llmDraft: AgentDraft): AgentDraft {
+  if (current.kind === "restock" && llmDraft.kind === "restock") {
+    return {
+      ...current,
+      qty: (current.qty !== undefined && current.qty > 0) ? current.qty : llmDraft.qty,
+      unit: current.unit || llmDraft.unit,
+      price: current.price !== undefined ? current.price : llmDraft.price,
+      platform: current.platform || llmDraft.platform,
+      review: current.review || llmDraft.review,
+      restockDate: current.restockDate !== undefined ? current.restockDate : llmDraft.restockDate,
+      purchaseProductName: current.purchaseProductName || llmDraft.purchaseProductName,
+      purchaseMeasureAmount: current.purchaseMeasureAmount !== undefined ? current.purchaseMeasureAmount : llmDraft.purchaseMeasureAmount,
+      purchaseMeasureUnit: current.purchaseMeasureUnit || llmDraft.purchaseMeasureUnit,
+    }
+  }
+  if (current.kind === "createItemWithRestock" && llmDraft.kind === "createItemWithRestock") {
+    return {
+      ...current,
+      restock: {
+        ...current.restock,
+        qty: (current.restock.qty !== undefined && current.restock.qty > 0) ? current.restock.qty : llmDraft.restock.qty,
+        unit: current.restock.unit || llmDraft.restock.unit,
+        price: current.restock.price !== undefined ? current.restock.price : llmDraft.restock.price,
+        platform: current.restock.platform || llmDraft.restock.platform,
+        review: current.restock.review || llmDraft.restock.review,
+        restockDate: current.restock.restockDate !== undefined ? current.restock.restockDate : llmDraft.restock.restockDate,
+        purchaseProductName: current.restock.purchaseProductName || llmDraft.restock.purchaseProductName,
+        purchaseMeasureAmount: current.restock.purchaseMeasureAmount !== undefined ? current.restock.purchaseMeasureAmount : llmDraft.restock.purchaseMeasureAmount,
+        purchaseMeasureUnit: current.restock.purchaseMeasureUnit || llmDraft.restock.purchaseMeasureUnit,
+      }
+    }
+  }
+  // kind 不一致：返回当前 draft，不用 LLM draft 覆盖
+  return current
+}
+
 function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | null {
   const trace = input.trace
+  const allowedActions = input.allowedActions
   const parsed = parseAgentResponse(content, input.state)
+
   if (!parsed) {
-    // 阶段 4B.3：纯文本 answer fallback 防线。
-    // 当 LLM 返回的是合理自然语言回答（非 JSON 结构）时，不要打成 normalize_returned_null
-    // 再 fallback 成「这个不太属于我能直接处理的家务范围」。
-    // 严格限制：只放宽纯文本 answer，不放宽 draft/collection/plan 写入校验。
-    const freeTextAnswer = tryFreeTextAnswer(content)
-    if (freeTextAnswer) {
+    // 阶段 4B.4：parse 失败时优先抢救 answer
+    const salvagedAnswer = salvageAnswerFromContent(content)
+    if (salvagedAnswer) {
       if (trace) {
-        trace.parseResult = { ok: false, error: "parse_failed_but_free_text_answer" }
+        trace.parseResult = { ok: false, error: "parse_failed_but_answer_salvaged" }
         trace.validationResult = { passed: true, turnKind: "answer" }
       }
-      return { kind: "answer", message: freeTextAnswer }
+      return { kind: "answer", message: salvagedAnswer }
     }
+    // 真正无法抢救 → 返回 null，App.tsx 使用 composeParseFailedMessage 中性兜底
     if (trace) {
       trace.parseResult = { ok: false, error: "parse_failed" }
       trace.validationResult = { passed: false, rejectReason: "normalize_returned_null" }
@@ -1493,6 +2255,28 @@ function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | nul
   }
 
   if (parsed.kind === "queryAnswer") {
+    // 阶段 4B.7：data-grounded 校验。
+    // 如果用户输入涉及已管理物品的补货历史，LLM 答案中出现的事实字段
+    // （日期/数量/金额/平台）必须能在 evidenceFacts 里找到。
+    // 不一致时拒绝 LLM 答案，改用本地 grounded answer。
+    const recordQuery = detectItemRecordQuery(input.text, input.state)
+    if (recordQuery) {
+      const evidence = extractEvidenceFacts(recordQuery.item)
+      const grounding = validateAnswerGrounding(parsed.answer, evidence)
+      if (!grounding.grounded) {
+        if (trace) {
+          trace.parseResult = { ok: true, kind: "queryAnswer" }
+          trace.validationResult = { passed: false, rejectReason: "answer_not_grounded" }
+          trace.finalDecision = {
+            kind: "sync",
+            turnKind: "grounded_query_answer",
+            message: composeGroundedItemRecordAnswer(recordQuery)
+          }
+        }
+        return { kind: "answer", message: composeGroundedItemRecordAnswer(recordQuery) }
+      }
+    }
+    // queryAnswer 是只读回答，不触发写入，始终允许
     if (trace) {
       trace.parseResult = { ok: true, kind: "queryAnswer" }
       trace.validationResult = { passed: true, turnKind: "answer" }
@@ -1500,6 +2284,19 @@ function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | nul
     return { kind: "answer", message: parsed.answer }
   }
   if (parsed.kind === "clarification") {
+    // 阶段 4B.4：clarification 需要通过 allowedActions 校验
+    if (!isActionAllowed("clarification", allowedActions)) {
+      if (trace) {
+        trace.parseResult = { ok: true, kind: "clarification" }
+        trace.validationResult = { passed: false, rejectReason: "action_not_allowed" }
+      }
+      // 降级为 answer：如果有 question 就用 question，否则返回中性兜底
+      const answerText = sanitizeAnswerText(parsed.clarification.question)
+      if (answerText) {
+        return { kind: "answer", message: answerText }
+      }
+      return { kind: "answer", message: composeParseFailedMessage() }
+    }
     if (trace) {
       trace.parseResult = { ok: true, kind: "clarification" }
       trace.validationResult = { passed: true, turnKind: "clarification" }
@@ -1513,6 +2310,66 @@ function normalizeLlm(content: string, input: OrchestrateInput): AgentTurn | nul
     }
   }
   if (parsed.kind === "draft") {
+    // 阶段 4B.4：draft 必须通过 allowedActions 代码级硬约束
+    if (!isActionAllowed("draft", allowedActions)) {
+      if (trace) {
+        trace.parseResult = { ok: true, kind: "draft" }
+        trace.validationResult = { passed: false, rejectReason: "action_not_allowed" }
+      }
+      // 不进入 collection/proposal/plan/batch，不修改 pending 状态，不写入数据
+      // 如果有 message，降级为 answer
+      if (parsed.message) {
+        const answerText = sanitizeAnswerText(parsed.message)
+        if (answerText) {
+          return { kind: "answer", message: answerText }
+        }
+      }
+      return { kind: "answer", message: composeParseFailedMessage() }
+    }
+
+    // 阶段 4B.5：pendingCollection 存在时，LLM draft 不能直接覆盖当前 collection。
+    // - 如果 LLM draft 的 itemName 与当前 collection 相同 → 合并字段（patch），不创建新 collection
+    // - 如果 LLM draft 的 itemName 不同，但用户输入没有明确提到新物品名 → 拒绝写入，转 clarification
+    // - 只有用户明确说了新物品名时，才允许创建新 collection（由上层 focusResolver 处理）
+    if (input.pendingCollection) {
+      const currentItemName = input.pendingCollection.draft.kind === "restock"
+        ? input.pendingCollection.draft.itemName
+        : input.pendingCollection.draft.kind === "createItemWithRestock"
+          ? input.pendingCollection.draft.item.itemName
+          : undefined
+      const draftItemName = parsed.draft.kind === "restock"
+        ? parsed.draft.itemName
+        : parsed.draft.kind === "createItemWithRestock"
+          ? parsed.draft.item.itemName
+          : undefined
+
+      if (currentItemName && draftItemName && draftItemName.trim() === currentItemName.trim()) {
+        // ItemName 匹配：把 LLM draft 的字段 patch 到当前 collection，不创建新 collection
+        const mergedDraft = mergeDraftFields(input.pendingCollection.draft, parsed.draft)
+        if (trace) {
+          trace.parseResult = { ok: true, kind: "draft" }
+          trace.validationResult = { passed: true, turnKind: "collection_merge" }
+        }
+        // 用合并后的 draft 重新走 collection/proposal 判断
+        if (shouldEnterCollection(mergedDraft, input.text)) {
+          return draftToCollection(mergedDraft, input.state, input.itemViews, input.dateContext)
+        }
+        return draftToProposal(mergedDraft, input.state, input.itemViews)
+      }
+
+      // ItemName 不同：用户没有明确提到新物品名时，拒绝 LLM draft 覆盖
+      // 转为 clarification，让用户确认是否要切换物品
+      if (trace) {
+        trace.parseResult = { ok: true, kind: "draft" }
+        trace.validationResult = { passed: false, rejectReason: "llm_draft_item_mismatch" }
+      }
+      return {
+        kind: "clarification",
+        message: `你刚才在记「${currentItemName ?? ""}」，现在说「${draftItemName ?? ""}」是同一件吗？如果是新物品，再说一遍「今天买了几袋什么」就行。`,
+        options: [],
+      }
+    }
+
     // 关键：不直接采用 LLM 的 message，由 composer 重新生成
     // 这样保证 LLM 即使文案漂移，最终用户看到的仍是统一管家口吻
     // 补货类草稿字段未齐时同样进采集态，避免 LLM 绕过 collection 直接甩确认卡

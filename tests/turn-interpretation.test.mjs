@@ -255,9 +255,9 @@ test("15. 「把月预算设成 800」 → manage_budget", () => {
   assert.equal(result.intent, "manage_budget")
 })
 
-// ---------- 16. 物品管理 ----------
+// ---------- 16. 物品创建 ----------
 
-test("16. 「帮我添加洗衣凝珠」 → manage_item", () => {
+test("16. 「帮我添加洗衣凝珠」 → create_item", () => {
   const result = interpret("帮我添加洗衣凝珠")
-  assert.equal(result.intent, "manage_item")
+  assert.equal(result.intent, "create_item")
 })

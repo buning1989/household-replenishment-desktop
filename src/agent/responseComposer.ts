@@ -129,13 +129,19 @@ export function composeProposalMessage(draft: AgentDraft): string {
     return `我先把「${draft.itemName}」加进来，按 ${draft.cycleDays} 天一轮帮你盯着。你要是没问题，我就先这么记下。`
   }
   if (draft.kind === "restock") {
-    return `「${draft.itemName}」这次补货我先记一笔。你要是没问题，我就这么保存。`
+    // 403 修复：proposal 文案中带上已解析的关键字段（数量/金额），让用户一眼看到解析结果。
+    const parts: string[] = []
+    if (draft.qty && draft.qty > 0) parts.push(`${draft.qty}${draft.unit || ""}`)
+    if (draft.price !== undefined && draft.price !== null) parts.push(`¥${draft.price}`)
+    const detail = parts.length > 0 ? `（${parts.join("，")}）` : ""
+    return `「${draft.itemName}」这次补货我先记一笔${detail}。你要是没问题，我就这么保存。`
   }
   if (draft.kind === "createItemWithRestock") {
     const qty = draft.restock.qty
     const unit = draft.restock.unit || draft.item.unit || "件"
     const qtyText = qty ? `${qty}${unit}` : "这一笔"
-    return `我先把「${draft.item.itemName}」加进来，这次 ${qtyText} 也一起算作起始记录。你要是没问题，我就先这么记下。`
+    const pricePart = draft.restock.price !== undefined && draft.restock.price !== null ? `，¥${draft.restock.price}` : ""
+    return `我先把「${draft.item.itemName}」加进来，这次 ${qtyText}${pricePart} 也一起算作起始记录。你要是没问题，我就先这么记下。`
   }
   // addPurchaseOption
   return `我先把「${draft.productName}」放到「${draft.itemName}」下面，之后你补货就能直接沿用。没问题我就保存。`
@@ -373,15 +379,11 @@ export function composeCollectionMessage(
     if (diff) lines.push(diff)
   }
 
-  // 4. 一个核心问题：平台缺问平台，否则问金额
-  if (!platform || !platform.trim()) {
-    if (price === undefined || price === null) {
-      lines.push("你这次在哪个平台买的？如果金额不是这个数，直接说一个数我改准。")
-    } else {
-      lines.push("你这次在哪个平台买的？")
-    }
-  } else if (price === undefined || price === null) {
-    lines.push("实际金额是多少？")
+  // 4. 仅在金额缺失时提示补充金额；平台为可选字段，绝不追问
+  // 403 修复：平台从 qualityMissing 移除后，采集态仅在 price 缺失时触发。
+  // 平台缺失时不追问「在哪个平台买的」，用户可之后补充。
+  if (price === undefined || price === null) {
+    lines.push("实际金额是多少？不记得的话说「就这样」我先空着。")
   }
 
   return lines.filter(Boolean).join(" ")
@@ -535,6 +537,193 @@ export function composePendingReminder(draft: AgentDraft): string {
 }
 
 /**
+ * 阶段 4B.6：pending 字段查询本地应答器。
+ *
+ * 直接从 pendingDraft / pendingCollection 读取字段回答，不查已提交 state。
+ * pending 本身尚未正式写入，所以不能回答「没有记录」。
+ *
+ * targetField 决定回答哪个字段：
+ *   - price：回答金额；缺失则说明还没记金额
+ *   - platform：回答平台；缺失则说明还没记平台
+ *   - qty：回答数量单位
+ *   - status：回答当前是待确认，还没正式写入
+ *   - date：回答日期
+ *   - summary：回答当前完整摘要
+ */
+export function composePendingFieldAnswer(
+  pendingDraft?: AgentDraft,
+  pendingCollection?: DraftCollection,
+  targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary"
+): string {
+  // 优先用 pendingCollection（采集态更结构化），其次 pendingDraft
+  const fields = pendingCollection
+    ? extractCollectionFields(pendingCollection)
+    : pendingDraft
+      ? extractDraftFieldsForAnswer(pendingDraft)
+      : null
+
+  if (!fields) {
+    return "现在没有待确认的记录，你想记一笔什么？"
+  }
+
+  const itemName = fields.itemName ?? "这条记录"
+  const confirmHint = '你说"确认"或"好的"我就保存。'
+
+  switch (targetField) {
+    case "price": {
+      if (fields.price !== undefined && fields.price !== null) {
+        const parts = [`这条${itemName}我现在记的是 ¥${fields.price}`]
+        if (fields.qty) parts.push(`${fields.qty}${fields.unit ?? ""}`)
+        if (fields.platform) parts.push(`${fields.platform}`)
+        parts.push("还没正式写入，你确认后我再保存。")
+        return parts.join("，")
+      }
+      // 价格缺失
+      const parts = [`这条${itemName}的金额还没记上`]
+      if (fields.qty) parts.push(`目前记的是 ${fields.qty}${fields.unit ?? ""}`)
+      if (fields.platform) parts.push(`平台 ${fields.platform}`)
+      parts.push(`你记得金额的话直接说个数。${confirmHint}`)
+      return parts.join("，")
+    }
+    case "platform": {
+      if (fields.platform) {
+        const parts = [`这条${itemName}我现在记的平台是 ${fields.platform}`]
+        if (fields.price !== undefined) parts.push(`金额 ¥${fields.price}`)
+        if (fields.qty) parts.push(`${fields.qty}${fields.unit ?? ""}`)
+        parts.push(`没问题的话说"确认"或"好的"就能保存。`)
+        return parts.join("，")
+      }
+      const parts = [`这条${itemName}的平台还没记上`]
+      if (fields.qty) parts.push(`目前记的是 ${fields.qty}${fields.unit ?? ""}`)
+      parts.push(`你这次在哪个平台买的？`)
+      return parts.join("，")
+    }
+    case "qty": {
+      if (fields.qty !== undefined && fields.qty !== null) {
+        const parts = [`这条${itemName}现在记的是 ${fields.qty}${fields.unit ?? ""}`]
+        if (fields.price !== undefined) parts.push(`¥${fields.price}`)
+        if (fields.platform) parts.push(`${fields.platform}`)
+        parts.push("还没正式写入。")
+        return parts.join("，")
+      }
+      return `这条${itemName}的数量还没记全。`
+    }
+    case "date": {
+      const dateLabel = fields.restockDate
+        ? formatPendingDate(fields.restockDate)
+        : "今天"
+      const parts = [`这条${itemName}的日期按${dateLabel}。`]
+      parts.push("还没正式写入。")
+      return parts.join("")
+    }
+    case "status": {
+      const parts = [`这条${itemName}还在待确认，没有正式写入。`]
+      const detail: string[] = []
+      if (fields.qty) detail.push(`${fields.qty}${fields.unit ?? ""}`)
+      if (fields.price !== undefined) detail.push(`¥${fields.price}`)
+      if (fields.platform) detail.push(`${fields.platform}`)
+      if (detail.length > 0) parts.push(`当前是：${detail.join("，")}。`)
+      parts.push(`你说"确认"我再保存。`)
+      return parts.join("")
+    }
+    case "summary":
+    default: {
+      const parts = [`这条${itemName}，`]
+      const detail: string[] = []
+      if (fields.qty) detail.push(`${fields.qty}${fields.unit ?? ""}`)
+      if (fields.price !== undefined) detail.push(`¥${fields.price}`)
+      if (fields.platform) detail.push(`${fields.platform}`)
+      if (detail.length > 0) parts.push(detail.join("，"))
+      parts.push("还在待确认，没正式写入。")
+      parts.push(`你说"确认"或"好的"我就保存。`)
+      return parts.join("")
+    }
+  }
+}
+
+/** 从 pendingCollection 抽取字段供应答器使用。 */
+function extractCollectionFields(collection: DraftCollection): {
+  itemName?: string
+  qty?: number
+  unit?: string
+  price?: number
+  platform?: string
+  review?: string
+  restockDate?: number
+} | null {
+  const draft = collection.draft
+  if (draft.kind === "restock") {
+    return {
+      itemName: draft.itemName,
+      qty: draft.qty,
+      unit: draft.unit,
+      price: draft.price,
+      platform: draft.platform,
+      review: draft.review,
+      restockDate: draft.restockDate
+    }
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return {
+      itemName: draft.item.itemName,
+      qty: draft.restock.qty,
+      unit: draft.restock.unit,
+      price: draft.restock.price,
+      platform: draft.restock.platform,
+      review: draft.restock.review,
+      restockDate: draft.restock.restockDate
+    }
+  }
+  return null
+}
+
+/** 从 pendingDraft 抽取字段供应答器使用。 */
+function extractDraftFieldsForAnswer(draft: AgentDraft): {
+  itemName?: string
+  qty?: number
+  unit?: string
+  price?: number
+  platform?: string
+  review?: string
+  restockDate?: number
+} | null {
+  if (draft.kind === "restock") {
+    return {
+      itemName: draft.itemName,
+      qty: draft.qty,
+      unit: draft.unit,
+      price: draft.price,
+      platform: draft.platform,
+      review: draft.review,
+      restockDate: draft.restockDate
+    }
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return {
+      itemName: draft.item.itemName,
+      qty: draft.restock.qty,
+      unit: draft.restock.unit,
+      price: draft.restock.price,
+      platform: draft.restock.platform,
+      review: draft.restock.review,
+      restockDate: draft.restock.restockDate
+    }
+  }
+  if (draft.kind === "createItem") {
+    return { itemName: draft.itemName }
+  }
+  return null
+}
+
+/** 把 restockDate 格式化成口语日期标签。 */
+function formatPendingDate(restockDate: number): string {
+  const todayStart = startOfDay(Date.now())
+  if (restockDate === todayStart) return "今天"
+  if (restockDate === todayStart - 24 * 60 * 60 * 1000) return "昨天"
+  return formatDate(restockDate)
+}
+
+/**
  * 生成修订后的提示文案。
  * 不说「已更新草稿」，说「我按你说的改了一下」。
  */
@@ -564,6 +753,17 @@ export function composeBatchRevisedMessage(scope: "single" | "all"): string {
 export function composeFallbackMessage(scenario: "no-draft" | "no-answer"): string {
   if (scenario === "no-draft") return "我没能整理成可确认草稿，你换一句描述试试。"
   return "我没能整理出可靠回答，你换一句问法试试。"
+}
+
+/**
+ * 阶段 4B.4：LLM 解析失败时的中性兜底文案。
+ *
+ * 当 normalizeLlm 返回 null（parse 失败且无法抢救 answer）时使用。
+ * 不再走 composeBoundaryAnswer(unsupported) → "这个不太属于我能直接处理的家务范围"。
+ * composeBoundaryAnswer 只能用于 LLM 调用前已明确判定的边界场景，不能作为 parse_failed 的出口。
+ */
+export function composeParseFailedMessage(): string {
+  return "我没太看懂你想让我处理什么。你可以换个说法，或者直接说要记录、查询、修改还是取消。"
 }
 
 /**

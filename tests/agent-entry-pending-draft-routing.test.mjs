@@ -137,7 +137,7 @@ test("3B-1: pendingDraft + 新补货记录（不同物品）→ 新建 collectio
   assert.notEqual(fields.itemName, "猫砂")
 })
 
-test("3B-2: pendingDraft + 确认 → 仍走 draft handler（proposal）", () => {
+test("3B-2: pendingDraft + 确认 → 仍走 draft handler（planCommand/draftCommit）", () => {
   const orch = createHouseholdOrchestrator()
   const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
   const pendingDraft = makePendingDraft()
@@ -150,8 +150,8 @@ test("3B-2: pendingDraft + 确认 → 仍走 draft handler（proposal）", () =>
   })
 
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal")
-  assert.equal(decision.turn.executableDraft, pendingDraft, "应返回原 pendingDraft 作为 executableDraft")
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "draftCommit", "应返回 draftCommit typed command")
 })
 
 test("3B-3: pendingDraft + 取消 → 仍走 draft handler（cancelled）", () => {
@@ -170,7 +170,7 @@ test("3B-3: pendingDraft + 取消 → 仍走 draft handler（cancelled）", () =
   assert.equal(decision.turn.kind, "cancelled")
 })
 
-test("3B-4: pendingDraft + force_proposal（「确认吧」）→ 仍走 draft handler（proposal）", () => {
+test("3B-4: pendingDraft + force_proposal（「确认吧」）→ 仍走 draft handler（planCommand/draftCommit）", () => {
   const orch = createHouseholdOrchestrator()
   const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
   const pendingDraft = makePendingDraft()
@@ -183,9 +183,9 @@ test("3B-4: pendingDraft + force_proposal（「确认吧」）→ 仍走 draft h
   })
 
   assert.equal(decision.kind, "sync")
-  // force_proposal 在 pendingDraft 上下文中视为确认 → proposal（不是 collection）
-  assert.equal(decision.turn.kind, "proposal")
-  assert.equal(decision.turn.executableDraft, pendingDraft)
+  // force_proposal 在 pendingDraft 上下文中视为确认 → planCommand/draftCommit（不是 collection）
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "draftCommit")
 })
 
 test("3B-5: pendingDraft + pendingStatus（「保存了吗」）→ 仍走 draft handler（answer）", () => {
@@ -398,7 +398,7 @@ test("3B-15: 不影响 pendingPlan 行为 — pendingPlan + 确认仍走 plan ha
 
 // ---------- 12. 阶段 4B：「按这个来」确认语义补齐 ----------
 
-test("3B-16: pendingDraft + 「按这个来」→ 仍走 draft handler（proposal）", () => {
+test("3B-16: pendingDraft + 「按这个来」→ 仍走 draft handler（planCommand/draftCommit）", () => {
   const orch = createHouseholdOrchestrator()
   const state = makeState({ items: [makeItem("i1", "猫砂", "宠物用品")] })
   const pendingDraft = makePendingDraft()
@@ -411,8 +411,8 @@ test("3B-16: pendingDraft + 「按这个来」→ 仍走 draft handler（proposa
   })
 
   // 阶段 4B：「按这个来」已纳入 FORCE_PROPOSAL_PATTERNS + CONFIRM_EXPLICIT_PHRASES，
-  // 在 pendingDraft 上下文中视为确认当前 draft → proposal
+  // 在 pendingDraft 上下文中视为确认当前 draft → planCommand/draftCommit
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "proposal")
-  assert.equal(decision.turn.executableDraft, pendingDraft)
+  assert.equal(decision.turn.kind, "planCommand")
+  assert.equal(decision.turn.command.command, "draftCommit")
 })

@@ -38,6 +38,7 @@ export type AskTurnInterpreterLlmInput = {
   pendingCollection?: DraftCollection
   pendingDraft?: AgentDraft
   pendingPlan?: AgentPlan
+  pendingBatch?: AgentDraft[]
   state: AppState
   itemViews: HouseholdChatItemView[]
   dateContext: ChatDateContext
@@ -55,6 +56,7 @@ export type LlmTurnIntent =
   | "confirm_current_task"
   | "cancel_current_task"
   | "query_inventory"
+  | "query_current_pending"
   | "smalltalk"
   | "unknown"
 
@@ -69,6 +71,8 @@ export type LlmTurnInterpretation = {
     price?: number
     platform?: string
     review?: string
+    /** 阶段 4B.6：query_current_pending 时，用户想查的字段 */
+    targetField?: "price" | "platform" | "qty" | "status" | "date" | "summary"
   }
   confidence: "high" | "medium" | "low"
   reason: string
@@ -81,6 +85,7 @@ const VALID_LLM_INTENTS: ReadonlySet<LlmTurnIntent> = new Set([
   "confirm_current_task",
   "cancel_current_task",
   "query_inventory",
+  "query_current_pending",
   "smalltalk",
   "unknown"
 ])
@@ -357,7 +362,7 @@ function buildRepairPrompt(
   lines.push("")
   lines.push("【合法 JSON schema】")
   lines.push('{')
-  lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_inventory | smalltalk | unknown",')
+  lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_current_pending | query_inventory | smalltalk | unknown",')
   lines.push('  "fields": {')
   lines.push('    "itemName": "可选",')
   lines.push('    "quantity": "可选，数字",')
@@ -365,7 +370,8 @@ function buildRepairPrompt(
   lines.push('    "date": "可选",')
   lines.push('    "price": "可选，数字",')
   lines.push('    "platform": "可选，归一后的标准平台名",')
-  lines.push('    "review": "可选"')
+  lines.push('    "review": "可选",')
+  lines.push('    "targetField": "可选，query_current_pending 时填：price | platform | qty | status | date | summary"')
   lines.push('  },')
   lines.push('  "confidence": "high | medium | low",')
   lines.push('  "reason": "一句话说明"')
@@ -429,12 +435,24 @@ function buildSystemPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push("结合当前正在采集的补货记录，判断用户这一轮输入属于以下哪一类：")
   lines.push("- supplement_current_collection：补当前草稿字段（平台/价格/评价/数量/日期等）")
   lines.push("- correct_current_collection：修正当前草稿（如「不是 X，是 Y」改物品名）")
-  lines.push("- new_restock_record：开启一条全新的补货记录（物品名与当前不同）")
+  lines.push("- new_restock_record：开启一条全新的补货记录（物品名与当前不同，且含「又买了/另外买了」等新增信号）")
   lines.push("- confirm_current_task：确认保存当前记录")
   lines.push("- cancel_current_task：取消当前记录")
-  lines.push("- query_inventory：查询库存/还能用多久")
+  lines.push("- query_current_pending：问当前待确认草稿的字段（如「花了多少钱」「哪个平台」「几袋」「记了没」）")
+  lines.push("- query_inventory：查询库存/还能用多久（与当前草稿无关的库存查询）")
   lines.push("- smalltalk：闲聊/寒暄/身份问题")
   lines.push("- unknown：确实无法判断")
+  lines.push("")
+
+  lines.push("【query_current_pending 判定规则】")
+  lines.push("当存在待确认草稿时，以下输入应判为 query_current_pending（不是 new_restock_record）：")
+  lines.push("- 「我花了多少钱买的这 5 袋猫砂」→ targetField=price")
+  lines.push("- 「这 5 袋猫砂哪个平台买的」→ targetField=platform")
+  lines.push("- 「你记的是几袋猫砂」→ targetField=qty")
+  lines.push("- 「猫砂那条还没记上吗」→ targetField=status")
+  lines.push("- 「刚才那条猫砂多少钱来着」→ targetField=price")
+  lines.push("关键：含疑问词（多少钱/哪个/几袋/来着/记了没）+ 指代当前草稿物品 → query_current_pending")
+  lines.push("只有明确说「又买了/另外买了/今天买了 X」且物品不同时才判 new_restock_record。")
   lines.push("")
 
   lines.push("【平台别名归一化规则】")
@@ -454,7 +472,7 @@ function buildSystemPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push("【输出 JSON schema】")
   lines.push("第一个字符必须是 `{`，最后一个字符必须是 `}`。schema：")
   lines.push('{')
-  lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_inventory | smalltalk | unknown",')
+  lines.push('  "intent": "supplement_current_collection | correct_current_collection | new_restock_record | confirm_current_task | cancel_current_task | query_current_pending | query_inventory | smalltalk | unknown",')
   lines.push('  "fields": {')
   lines.push('    "itemName": "可选，物品名",')
   lines.push('    "quantity": "可选，数字",')
@@ -462,7 +480,8 @@ function buildSystemPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push('    "date": "可选，日期",')
   lines.push('    "price": "可选，数字",')
   lines.push('    "platform": "可选，归一后的标准平台名",')
-  lines.push('    "review": "可选，评价原文"')
+  lines.push('    "review": "可选，评价原文",')
+  lines.push('    "targetField": "可选，query_current_pending 时填：price | platform | qty | status | date | summary"')
   lines.push('  },')
   lines.push('  "confidence": "high | medium | low",')
   lines.push('  "reason": "一句话说明判断依据"')
@@ -475,30 +494,56 @@ function buildSystemPrompt(input: AskTurnInterpreterLlmInput): string {
 
 /** user 段：当前上下文 + 用户输入。 */
 function buildUserPrompt(input: AskTurnInterpreterLlmInput): string {
-  const { text, pendingCollection, state, itemViews, dateContext } = input
+  const { text, pendingCollection, pendingDraft, pendingPlan, pendingBatch, state, itemViews, dateContext } = input
   const lines: string[] = []
 
   lines.push("【当前时间】")
   lines.push(`今天是 ${dateContext.todayLabel}，当前时间 ${dateContext.timestampLabel}，时区 ${dateContext.timezone}。`)
   lines.push("")
 
-  lines.push("【当前正在采集的补货记录】")
-  if (pendingCollection) {
-    const f = describeCollectionDraft(pendingCollection)
-    lines.push(`物品名：${f.itemName ?? "（未定）"}`)
-    if (f.qty !== undefined) lines.push(`数量：${f.qty}${f.unit ?? ""}`)
-    if (f.platform) lines.push(`平台：${f.platform}`)
-    if (f.price !== undefined) lines.push(`价格：${f.price}`)
-    if (f.review) lines.push(`评价：${f.review}`)
-    const missing = [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
-    lines.push(`当前缺失字段：${missing.length > 0 ? missing.join("、") : "（无）"}`)
+  // 阶段 4B.6：统一展示所有 active pending 上下文
+  const hasAnyPending = pendingCollection || pendingDraft || (pendingBatch && pendingBatch.length > 0) ||
+    (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm"))
+
+  if (hasAnyPending) {
+    lines.push("【当前待确认的记录（尚未正式写入）】")
+
+    if (pendingDraft) {
+      const f = describeDraftFields(pendingDraft)
+      lines.push(`- 待确认草稿：${f.itemName ?? "（未定）"}`)
+      if (f.qty !== undefined) lines.push(`  数量：${f.qty}${f.unit ?? ""}`)
+      if (f.platform) lines.push(`  平台：${f.platform}`)
+      if (f.price !== undefined) lines.push(`  价格：¥${f.price}`)
+      if (f.restockDate !== undefined) lines.push(`  日期：${formatTimestamp(f.restockDate, dateContext)}`)
+      lines.push(`  状态：待确认，尚未正式保存`)
+    }
+
+    if (pendingCollection) {
+      const f = describeCollectionDraft(pendingCollection)
+      lines.push(`- 采集中的记录：${f.itemName ?? "（未定）"}`)
+      if (f.qty !== undefined) lines.push(`  数量：${f.qty}${f.unit ?? ""}`)
+      if (f.platform) lines.push(`  平台：${f.platform}`)
+      if (f.price !== undefined) lines.push(`  价格：¥${f.price}`)
+      if (f.review) lines.push(`  评价：${f.review}`)
+      const missing = [...pendingCollection.requiredMissingSlots, ...pendingCollection.qualityMissingSlots]
+      lines.push(`  当前缺失字段：${missing.length > 0 ? missing.join("、") : "（无）"}`)
+    }
+
+    if (pendingBatch && pendingBatch.length > 0) {
+      lines.push(`- 批量待确认：${pendingBatch.length} 条草稿`)
+    }
+
+    if (pendingPlan && (pendingPlan.status === "pending" || pendingPlan.status === "awaitingSecondConfirm")) {
+      lines.push(`- 待确认计划：${pendingPlan.actions.length} 个动作（${pendingPlan.sourceText.slice(0, 30)}）`)
+    }
   } else {
-    lines.push("（无正在采集的记录）")
+    lines.push("【当前待确认的记录】")
+    lines.push("（无正在采集或待确认的记录）")
   }
   lines.push("")
 
   lines.push("【该物品的历史补货平台（用于指代消解）】")
-  const historyPlatforms = collectHistoryPlatforms(pendingCollection, state, itemViews)
+  const historyPlatforms = collectHistoryPlatforms(pendingCollection ?? (pendingDraft ? toDraftCollection(pendingDraft) : undefined), state, itemViews)
   if (historyPlatforms.length > 0) {
     lines.push(historyPlatforms.join("、"))
   } else {
@@ -512,6 +557,21 @@ function buildUserPrompt(input: AskTurnInterpreterLlmInput): string {
   lines.push("只输出 JSON 对象，第一个字符是 `{`，最后一个字符是 `}`。")
 
   return lines.join("\n")
+}
+
+/** 阶段 4B.6：把 pendingDraft 包装成 DraftCollection 供 collectHistoryPlatforms 复用。 */
+function toDraftCollection(draft: AgentDraft): DraftCollection | undefined {
+  const itemName = draft.kind === "restock" ? draft.itemName : draft.kind === "createItemWithRestock" ? draft.item.itemName : undefined
+  if (!itemName) return undefined
+  // 只需 draft 字段供 collectHistoryPlatforms 提取 itemName
+  return { kind: "draftCollection", draft, requiredMissingSlots: [], qualityMissingSlots: [], inferredSuggestions: [], turns: 0, completeness: "readyToConfirm", updatedAt: 0 }
+}
+
+/** 阶段 4B.6：把时间戳格式化为可读日期。 */
+function formatTimestamp(ts: number, dateContext: ChatDateContext): string {
+  if (dateContext.now && Math.abs(ts - dateContext.now) < 24 * 60 * 60 * 1000) return "今天"
+  const d = new Date(ts)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
 }
 
 /** 从 collection draft 中取出可读字段。 */
@@ -642,6 +702,13 @@ function validateLlmTurnInterpretation(obj: unknown): LlmTurnInterpretation | nu
   else if (typeof f.price === "string" && /^\d+(\.\d+)?$/.test(f.price.trim())) fields.price = Number(f.price)
   if (typeof f.platform === "string" && f.platform.trim()) fields.platform = f.platform.trim()
   if (typeof f.review === "string" && f.review.trim()) fields.review = f.review.trim()
+  // 阶段 4B.6：targetField（query_current_pending 时用户想查的字段）
+  if (typeof f.targetField === "string") {
+    const validTargets = ["price", "platform", "qty", "status", "date", "summary"]
+    if (validTargets.includes(f.targetField)) {
+      fields.targetField = f.targetField as LlmTurnInterpretation["fields"]["targetField"]
+    }
+  }
 
   // 放宽：confidence 缺失时默认 "medium"，不再返回 null
   const confidenceRaw = o.confidence
@@ -682,6 +749,43 @@ function normalizeLlmInterpretation(parsed: LlmTurnInterpretation): TurnInterpre
     confidence: parsed.confidence,
     reason: parsed.reason || `LLM 解释为 ${intent}`
   }
+}
+
+/**
+ * 阶段 4B.6：从 pendingDraft 中提取可读字段摘要，供 buildUserPrompt 使用。
+ */
+function describeDraftFields(draft: AgentDraft): {
+  itemName?: string
+  qty?: number
+  unit?: string
+  platform?: string
+  price?: number
+  review?: string
+  restockDate?: number
+} {
+  if (draft.kind === "restock") {
+    return {
+      itemName: draft.itemName,
+      qty: draft.qty,
+      unit: draft.unit,
+      platform: draft.platform,
+      price: draft.price,
+      review: draft.review,
+      restockDate: draft.restockDate
+    }
+  }
+  if (draft.kind === "createItemWithRestock") {
+    return {
+      itemName: draft.item.itemName,
+      qty: draft.restock.qty,
+      unit: draft.restock.unit,
+      platform: draft.restock.platform,
+      price: draft.restock.price,
+      review: draft.restock.review,
+      restockDate: draft.restock.restockDate
+    }
+  }
+  return {}
 }
 
 /**

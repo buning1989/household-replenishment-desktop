@@ -40,6 +40,7 @@ declare global {
     desktop?: {
       syncState: (state: AppState) => Promise<{ ok: boolean; error?: string }>
       loadState: () => Promise<AppState | null>
+      resetToDemoState: (currentState: AppState) => Promise<{ ok: true; state: AppState; backupPath: string } | { ok: false; error: string; rolledBack?: boolean }>
       ocrExtract: (payload: OcrExtractPayload) => Promise<OcrExtractResult>
       chatComplete: (payload: ChatCompletePayload) => Promise<ChatCompleteResult>
       openExternal: (url: string) => Promise<void>

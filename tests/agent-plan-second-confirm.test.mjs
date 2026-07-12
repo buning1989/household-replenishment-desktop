@@ -1,8 +1,12 @@
 // AgentPlan 第三期：二次确认状态机测试
 // 运行方式：node --test tests/agent-plan-second-confirm.test.mjs
 //
+// 403 能力收缩后：删除类句式不再生成 planProposal，orchestrator 返回导航回答（answer），
+// 因此正常会话不会创建待确认的删除 plan。下面的状态机测试通过手动注入 pendingPlan
+// 验证 confirm/cancel/second-confirm 逻辑仍正确（回归保护），以及删除请求直接返回 answer。
+//
 // 覆盖：
-//   - 删除类句式生成 high risk planProposal
+//   - 删除类句式能力收缩后返回导航回答（不再生成 high risk planProposal）
 //   - high risk plan 下普通「确认」不执行，返回 planAwaitingSecondConfirm command
 //   - high risk plan 下「确认删除」才执行，返回 planSecondConfirm command
 //   - 「取消」取消，返回 planCancel command
@@ -77,16 +81,16 @@ test("isSecondConfirmMatch: 空字符串返回 false", () => {
   assert.equal(isSecondConfirmMatch("   "), false)
 })
 
-// ---------- 删除类句式生成 high risk planProposal ----------
+// ---------- 删除类句式能力收缩后返回导航回答（不再生成 planProposal） ----------
 
-test("orchestrator: 「删除猫砂」生成 high risk planProposal", () => {
+test("orchestrator: 「删除猫砂」能力收缩后返回导航回答（不再生成 planProposal）", () => {
   const state = makeState({ items: [makeItem("i1", "猫砂")] })
   const orch = createHouseholdOrchestrator()
   const decision = orch.decide({ text: "删除猫砂", state, itemViews: [], dateContext })
   assert.equal(decision.kind, "sync")
-  assert.equal(decision.turn.kind, "planProposal")
-  assert.equal(decision.turn.plan.risk, "high")
-  assert.equal(decision.turn.plan.requiresSecondConfirm, true)
+  assert.equal(decision.turn.kind, "navigate")
+  // 不应创建 plan，因此不会进入二次确认流程
+  assert.ok(!("plan" in decision.turn), "不应创建 plan")
 })
 
 // ---------- high risk plan 下普通「确认」不执行 ----------

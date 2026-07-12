@@ -263,23 +263,23 @@ test("10. 无 pending + 「猫砂还能用多久」→ route_to_query", () => {
   assert.equal(d.focus, "route_to_query")
 })
 
-// ---------- 补充：删除请求 / 预算 / 物品管理 → route_to_write_draft ----------
+// ---------- 补充：删除请求 / 预算 / 物品管理 → route_to_navigate（403 收缩）----------
 
-test("11. 无 pending + 「删除卫生间下的消耗品」→ route_to_write_draft", () => {
+test("11. 无 pending + 「删除卫生间下的消耗品」→ route_to_navigate（403 收缩，删除走导航）", () => {
   const state = makeState({ items: [] })
   const interp = interpret("删除卫生间下的消耗品", state)
   assert.equal(interp.intent, "delete_request")
 
   const d = resolve({ interpretation: interp })
-  assert.equal(d.focus, "route_to_write_draft")
+  assert.equal(d.focus, "route_to_navigate")
 })
 
-test("12. 无 pending + 「把月预算设成 800」→ route_to_write_draft", () => {
+test("12. 无 pending + 「把月预算设成 800」→ route_to_navigate（403 收缩，预算走导航）", () => {
   const interp = interpret("把月预算设成 800")
   assert.equal(interp.intent, "manage_budget")
 
   const d = resolve({ interpretation: interp })
-  assert.equal(d.focus, "route_to_write_draft")
+  assert.equal(d.focus, "route_to_navigate")
 })
 
 // ---------- 补充：闲聊 / 兜底 ----------

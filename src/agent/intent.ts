@@ -39,7 +39,10 @@ type IntentRule = {
 const CONFIRM_EXPLICIT_PHRASES = [
   "确认吧", "确认创建", "确认记录", "确认补货", "确认补货单", "确认这条", "确认",
   "可以了", "就按这个", "没问题", "保存", "记上", "执行", "执行吧",
-  "可以创建", "可以记录", "就这样", "按这个来"
+  "可以创建", "可以记录", "就这样", "按这个来",
+  // 403 修复：补齐用户要求的确认表达，避免"确定"/"提交"/"就这么记"在
+  // pendingDraft/pendingCollection 下被误判为 query 导致确认死循环。
+  "确定", "提交", "就这么记"
 ]
 const CONFIRM_CASUAL_PHRASES = ["可以", "对的", "好的", "好吧", "ok", "OK"]
 const CONFIRM_CASUAL_MAX_LENGTH = 6

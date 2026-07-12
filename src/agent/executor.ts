@@ -1,5 +1,5 @@
-import { createItem, restockItem, updateItemFromDraft, updateRestockRecord } from "../domain"
-import type { AppState, PurchaseOption, ReplenishmentItem } from "../types"
+import { calibrateRemainingDays, createItem, restockItem, updateItemFromDraft, updateRestockRecord } from "../domain"
+import type { AppState, LastAgentMutation, PurchaseOption, ReplenishmentItem } from "../types"
 import { fuzzyMatchItem, type ExtractedOrder, type ExtractedOrderLine } from "../llm/orderImport"
 import { CONSUMABLE_TEMPLATES } from "../model/consumableTemplates"
 import { createItemDraftFromName, findItemMatch, type AgentDraft, type CreateItemDraft, type OrderRow, type RestockDraftDetails } from "./drafts"
@@ -296,6 +296,84 @@ export function applyAgentDraft(
     : `已创建并记录：消耗品「${restocked.name}」。`
 }
 
+/**
+ * 403：比较 commit 前后的 state，找出受影响的物品，构造 lastAgentMutation。
+ * 仅记录受影响物品的 before/after 快照，不保存全量 state。
+ */
+function buildLastAgentMutation(
+  prevState: AppState,
+  nextState: AppState,
+  draft: AgentDraft | undefined,
+  now: number
+): LastAgentMutation | undefined {
+  // 找出新增的物品（createItem / createItemWithRestock）
+  const prevIds = new Set(prevState.items.map((it) => it.id))
+  const newItem = nextState.items.find((it) => !prevIds.has(it.id))
+  if (newItem) {
+    // draft 可能为 undefined（commitAgentPlan 场景），此时根据是否有 history 推断类型
+    const mutationType = draft
+      ? (draft.kind === "createItemWithRestock" ? "createItemWithRestock" : "createItem")
+      : (newItem.history.length > 0 ? "createItemWithRestock" : "createItem")
+    const latestRecord = newItem.history.length > 0 ? newItem.history[newItem.history.length - 1] : undefined
+    return {
+      mutationType,
+      createdAt: now,
+      itemId: newItem.id,
+      recordId: latestRecord?.id,
+      itemName: newItem.name,
+      beforeSnapshot: undefined,
+      afterSnapshot: newItem,
+      consumed: false
+    }
+  }
+
+  // 找出被修改的物品（restock / addPurchaseOption）
+  for (const nextItem of nextState.items) {
+    const prevItem = prevState.items.find((it) => it.id === nextItem.id)
+    if (!prevItem) continue
+    // history 长度增加 → 新增补货记录
+    if (nextItem.history.length > prevItem.history.length) {
+      const latestRecord = nextItem.history[nextItem.history.length - 1]
+      return {
+        mutationType: "createRestockRecord",
+        createdAt: now,
+        itemId: nextItem.id,
+        recordId: latestRecord?.id,
+        itemName: nextItem.name,
+        beforeSnapshot: prevItem,
+        afterSnapshot: nextItem,
+        consumed: false
+      }
+    }
+    // purchaseOptions 长度增加 → 新增常购商品
+    if (nextItem.purchaseOptions.length > prevItem.purchaseOptions.length) {
+      return {
+        mutationType: "addPurchaseOption",
+        createdAt: now,
+        itemId: nextItem.id,
+        itemName: nextItem.name,
+        beforeSnapshot: prevItem,
+        afterSnapshot: nextItem,
+        consumed: false
+      }
+    }
+  }
+
+  // 新增分类（createCategory）
+  const prevCats = new Set(prevState.categories)
+  const newCat = nextState.categories.find((c) => !prevCats.has(c))
+  if (newCat) {
+    return {
+      mutationType: "createCategory",
+      createdAt: now,
+      createdCategoryName: newCat,
+      consumed: false
+    }
+  }
+
+  return undefined
+}
+
 export function commitAgentDraft(
   state: AppState,
   draft: AgentDraft,
@@ -314,8 +392,12 @@ export function commitAgentDraft(
   // 主动判断洞察：commit 后基于新 state 生成价格/预算/周期/常购等判断
   const insight = runPostCommitInsight(draft, nextState, now, dateContext)
 
+  // 403：记录最近一次 Agent 写入，供有限纠错和撤销使用
+  const lastMutation = buildLastAgentMutation(state, nextState, draft, now)
+  const stateWithMutation = lastMutation ? { ...nextState, lastAgentMutation: lastMutation } : nextState
+
   return {
-    state: nextState,
+    state: stateWithMutation,
     summary,
     links,
     observation,
@@ -366,8 +448,16 @@ export function commitAgentDraftBatch(
     }
   }
 
+  // 403：记录最近一次 Agent 写入（批量场景用最后一条 draft 计算）
+  const lastDraftForMutation = drafts[drafts.length - 1]
+  const lastMutation = lastDraftForMutation ? buildLastAgentMutation(state, nextState, lastDraftForMutation, now) : undefined
+  if (lastMutation) {
+    lastMutation.mutationType = "batchCommit"
+  }
+  const stateWithMutation = lastMutation ? { ...nextState, lastAgentMutation: lastMutation } : nextState
+
   return {
-    state: nextState,
+    state: stateWithMutation,
     summary: summaries.join("\n"),
     links,
     observation,
@@ -1089,6 +1179,23 @@ export function applyAgentAction(
       return { summary: `已删除分类：「${action.categoryName}」。`, ok: true }
     }
 
+    case "calibrateInventory": {
+      const target = findWorkItem(work, action.itemId, action.itemName)
+      if (!target) {
+        return { summary: `没有校准。找不到消耗品「${action.itemName}」。`, ok: true }
+      }
+      const calibrated = calibrateRemainingDays(target, action.remainingDays, now)
+      work.items = work.items.map((item) => item.id === target.id ? calibrated : item)
+      linkItem(links, calibrated)
+      const daysText = action.remainingDays === 0
+        ? "已用完"
+        : `预计还能用 ${action.remainingDays} 天`
+      return {
+        summary: `已更新「${calibrated.name}」的库存状态：${daysText}。提醒预测会按这个时间重新计算。`,
+        ok: true
+      }
+    }
+
     default: {
       // 类型已约束，走到这里说明是未实现的 action
       return { summary: `未实现：${(action as { type: string }).type} 动作本期不支持。`, ok: false }
@@ -1182,11 +1289,226 @@ export function commitAgentPlan(
     }
   }
 
+  // 403：记录最近一次 Agent 写入（plan 场景）
+  // buildLastAgentMutation 通过对比 prevState 与 nextState 差异推断写入类型，
+  // 不依赖 tempDraft 的字段完整性，覆盖 recordRestock / createItem / addPurchaseOption / createCategory。
+  const lastMutation = buildLastAgentMutation(state, nextState, undefined, now)
+  const stateWithMutation = lastMutation ? { ...nextState, lastAgentMutation: lastMutation } : nextState
+
   return {
-    state: nextState,
+    state: stateWithMutation,
     summary: summaries.join("\n"),
     links,
     observation,
     insight
+  }
+}
+
+/**
+ * 403：撤销最近一次 Agent 写入。
+ * 恢复到写入前状态。重复执行撤销不产生二次删除。
+ * 不进入通用删除 Action，不要求删除二次确认。
+ */
+export function undoLastAgentMutation(
+  state: AppState,
+  now: number = Date.now()
+): { state: AppState; message: string } {
+  const mutation = state.lastAgentMutation
+  if (!mutation) {
+    return {
+      state,
+      message: "没有可以撤销的最近记录。你可以到记录列表里手动查找要修改的内容。"
+    }
+  }
+  if (mutation.consumed) {
+    return {
+      state,
+      message: "刚才那条已经撤销过了，不用重复操作。"
+    }
+  }
+
+  // 恢复 beforeSnapshot
+  if (mutation.mutationType === "createRestockRecord" && mutation.beforeSnapshot && mutation.itemId) {
+    // 恢复物品到写入前状态
+    const items = state.items.map((it) => it.id === mutation.itemId ? mutation.beforeSnapshot! : it)
+    return {
+      state: { ...state, items, lastAgentMutation: { ...mutation, consumed: true }, updatedAt: now },
+      message: `已撤销刚才记的「${mutation.itemName}」那条补货。`
+    }
+  }
+
+  if ((mutation.mutationType === "createItem" || mutation.mutationType === "createItemWithRestock") && mutation.itemId) {
+    // 删除新创建的物品
+    const items = state.items.filter((it) => it.id !== mutation.itemId)
+    return {
+      state: { ...state, items, lastAgentMutation: { ...mutation, consumed: true }, updatedAt: now },
+      message: `已撤销刚才创建的「${mutation.itemName}」。`
+    }
+  }
+
+  if (mutation.mutationType === "addPurchaseOption" && mutation.beforeSnapshot && mutation.itemId) {
+    const items = state.items.map((it) => it.id === mutation.itemId ? mutation.beforeSnapshot! : it)
+    return {
+      state: { ...state, items, lastAgentMutation: { ...mutation, consumed: true }, updatedAt: now },
+      message: `已撤销刚才添加的常购商品。`
+    }
+  }
+
+  if (mutation.mutationType === "createCategory" && mutation.createdCategoryName) {
+    const categories = state.categories.filter((c) => c !== mutation.createdCategoryName)
+    return {
+      state: { ...state, categories, lastAgentMutation: { ...mutation, consumed: true }, updatedAt: now },
+      message: `已撤销刚才创建的分类「${mutation.createdCategoryName}」。`
+    }
+  }
+
+  // batchCommit 场景：恢复到 beforeSnapshot
+  if (mutation.beforeSnapshot && mutation.itemId) {
+    const items = state.items.map((it) => it.id === mutation.itemId ? mutation.beforeSnapshot! : it)
+    return {
+      state: { ...state, items, lastAgentMutation: { ...mutation, consumed: true }, updatedAt: now },
+      message: `已撤销刚才的写入。`
+    }
+  }
+
+  return {
+    state,
+    message: "这条记录无法撤销，你可以到记录列表里手动修改。"
+  }
+}
+
+/**
+ * 403：修正最近一次 Agent 写入的字段。
+ * 只修改最近一条记录，不新增第二条。
+ * 支持修正：price / qty / platform / date。
+ */
+export function correctLastAgentMutation(
+  state: AppState,
+  field: "price" | "qty" | "platform" | "date",
+  value: number | string,
+  now: number = Date.now()
+): { state: AppState; message: string } {
+  const mutation = state.lastAgentMutation
+  if (!mutation) {
+    return {
+      state,
+      message: "没有可以修改的最近记录。你可以到记录列表里手动查找要修改的内容。"
+    }
+  }
+  if (mutation.consumed) {
+    return {
+      state,
+      message: "刚才那条已经撤销了，不能再修改。你可以到记录列表里手动操作。"
+    }
+  }
+
+  // 仅支持补货记录的纠错
+  if (mutation.mutationType !== "createRestockRecord" && mutation.mutationType !== "createItemWithRestock" && mutation.mutationType !== "batchCommit") {
+    return {
+      state,
+      message: "这条记录不支持字段修正。你可以到物品详情里手动修改。"
+    }
+  }
+
+  if (!mutation.itemId || !mutation.recordId) {
+    return {
+      state,
+      message: "没有找到可以修改的记录。你可以到记录列表里手动操作。"
+    }
+  }
+
+  const targetItem = state.items.find((it) => it.id === mutation.itemId)
+  if (!targetItem) {
+    return {
+      state,
+      message: "没有找到对应的消耗品。你可以到记录列表里手动修改。"
+    }
+  }
+
+  // 查找当前记录以获取原始值
+  const currentRecord = targetItem.history.find((evt) => evt.id === mutation.recordId)
+  if (!currentRecord) {
+    return {
+      state,
+      message: "没有找到对应的补货记录。你可以到记录列表里手动修改。"
+    }
+  }
+
+  if (field === "platform") {
+    if (typeof value !== "string" || !value.trim()) {
+      return { state, message: "平台名称不对，请再说一次。" }
+    }
+    // updateRestockRecord 的 patch 不含 platform，需要直接在 item 上修改
+    const updatedHistory = targetItem.history.map((evt) =>
+      evt.id === mutation.recordId ? { ...evt, platform: value.trim() } : evt
+    )
+    const updatedItem = { ...targetItem, history: updatedHistory, updatedAt: now }
+    const items = state.items.map((it) => it.id === targetItem.id ? updatedItem : it)
+    return {
+      state: { ...state, items, updatedAt: now },
+      message: `已把刚才那条的平台改成「${value.trim()}」。`
+    }
+  }
+
+  // price / qty / date 走 updateRestockRecord（需要 Pick<at|qty|price>）
+  if (field === "price") {
+    const price = typeof value === "number" ? value : Number(value)
+    if (!Number.isFinite(price) || price < 0) {
+      return { state, message: "金额格式不对，请再说一次。" }
+    }
+    const updatedItem = updateRestockRecord(targetItem, mutation.recordId, {
+      at: currentRecord.at,
+      qty: currentRecord.qty ?? 1,
+      price
+    }, now)
+    const items = state.items.map((it) => it.id === targetItem.id ? updatedItem : it)
+    return {
+      state: { ...state, items, updatedAt: now },
+      message: `已把刚才那条的金额改成¥${price}。`
+    }
+  }
+
+  if (field === "qty") {
+    const qty = typeof value === "number" ? value : Number(value)
+    if (!Number.isFinite(qty) || qty < 1) {
+      return { state, message: "数量格式不对，请再说一次。" }
+    }
+    const updatedItem = updateRestockRecord(targetItem, mutation.recordId, {
+      at: currentRecord.at,
+      qty,
+      price: currentRecord.price ?? 0
+    }, now)
+    const items = state.items.map((it) => it.id === targetItem.id ? updatedItem : it)
+    return {
+      state: { ...state, items, updatedAt: now },
+      message: `已把刚才那条的数量改成${qty}。`
+    }
+  }
+
+  // field === "date"
+  const todayStart = new Date(now)
+  todayStart.setHours(0, 0, 0, 0)
+  const todayMs = todayStart.getTime()
+  let at: number | undefined
+  if (value === "今天") at = todayMs
+  else if (value === "昨天") at = todayMs - 86400000
+  else if (value === "前天") at = todayMs - 86400000 * 2
+  else if (value === "大前天" || value === "三天前") at = todayMs - 86400000 * 3
+  else {
+    const num = Number(value)
+    if (Number.isFinite(num) && num > 0) at = num
+  }
+  if (at === undefined) {
+    return { state, message: "日期格式不对，请再说一次。" }
+  }
+  const updatedItem = updateRestockRecord(targetItem, mutation.recordId, {
+    at,
+    qty: currentRecord.qty ?? 1,
+    price: currentRecord.price ?? 0
+  }, now)
+  const items = state.items.map((it) => it.id === targetItem.id ? updatedItem : it)
+  return {
+    state: { ...state, items, updatedAt: now },
+    message: `已把刚才那条的日期改成${value}。`
   }
 }
