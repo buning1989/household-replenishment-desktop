@@ -71,7 +71,7 @@ export function isManagementRequest(text: string): boolean {
   //   排除：含购买动词、含数量/价格信号、X 是字段名的当前草稿字段修订
   if (/把.{2,10}改成.{2,10}/.test(normalized) && !/买|花了|花费|补货/.test(normalized)) {
     const isFieldNameRevision = /把(?:数量|金额|价格|平台|日期|单位|商品名|名称).*(?:改成|改为)/.test(normalized)
-    const hasQtySignal = /\d+\s*(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)/.test(normalized)
+    const hasQtySignal = /\d+\s*(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)/.test(normalized)
     const hasPriceSignal = /\d+(?:\.\d+)?(?:\s*元|块钱|块)/.test(normalized)
     if (!isFieldNameRevision && !hasQtySignal && !hasPriceSignal) return true
   }

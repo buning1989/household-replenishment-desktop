@@ -104,7 +104,7 @@ export type AgentResponse =
   | { kind: "clarification"; clarification: AgentClarification }
   | { kind: "queryAnswer"; answer: string }
 
-const UNIT_PATTERN = "包|瓶|袋|盒|支|卷|件|kg|斤|L|升"
+const UNIT_PATTERN = "包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml"
 const CHINESE_DIGITS: Record<string, number> = {
   一: 1,
   二: 2,
@@ -146,11 +146,23 @@ export function parseQty(text: string): { qty?: number; unit?: string } {
 }
 
 export function parsePrice(text: string): number | undefined {
+  // 403：中文小数格式「39块9」「128块5」「39块9毛5」必须最先匹配
+  // 否则 withSuffix 会先匹配到「39块」丢失小数部分
+  const blockDecimal = text.match(/(\d+)\s*块\s*(\d)(?:毛\s*(\d))?/)
+  if (blockDecimal) {
+    const yuan = Number(blockDecimal[1])
+    const tenths = Number(blockDecimal[2])
+    const hundredths = blockDecimal[3] ? Number(blockDecimal[3]) : 0
+    const value = hundredths > 0
+      ? yuan + tenths / 10 + hundredths / 100
+      : yuan + tenths / 10
+    return Math.round(value * 100) / 100
+  }
   // 优先匹配「前缀 + 数字 + 后缀单位」（如 花了100块钱、128元）
-  const withSuffix = text.match(/(?:花了|花|价格|金额|共|一共|￥|¥)?\s*(\d+(?:\.\d+)?)\s*(?:块钱|块|元)/)
+  const withSuffix = text.match(/(?:花了|花|价格|金额|共|一共|总共|￥|¥)?\s*(\d+(?:\.\d+)?)\s*(?:块钱|块|元)/)
   if (withSuffix) return Number(withSuffix[1])
   // 兜底匹配「前缀 + 数字」（如 花了128，帮我记一下）
-  const withPrefix = text.match(/(?:花了|花|价格|金额|共|一共|￥|¥)\s*(\d+(?:\.\d+)?)/)
+  const withPrefix = text.match(/(?:花了|花|价格|金额|共|一共|总共|￥|¥)\s*(\d+(?:\.\d+)?)/)
   if (withPrefix) return Number(withPrefix[1])
   // 403：匹配「前缀 + 改成/改为 + 数字」（如 金额改成78、价格改成128）
   const withRevise = text.match(/(?:金额|价格)\s*(?:改成|改为|是|不是)\s*(\d+(?:\.\d+)?)/)
@@ -346,8 +358,8 @@ export function extractCreateItemName(text: string): string | undefined {
   return undefined
 }
 
-/** 纯数量+单位模式（如「5袋」「两包」），不是有效物品名。 */
-const QTY_UNIT_ONLY_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)$/
+/** 纯数量+单位模式（如「5袋」「两包」「两提」），不是有效物品名。 */
+const QTY_UNIT_ONLY_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)$/
 
 function extractPurchasedName(text: string): string | undefined {
   const compact = cleanText(text)
@@ -698,7 +710,7 @@ export function parseItemNameRevision(text: string): { from: string; to: string 
   const m = compacted.match(/(?:这个)?不是([^\s，。,!.！？?是]+)[，。,!.！？?\s]*是([^\s，。,!.！？?]+)/)
   if (m && m[1] && m[2] && m[1] !== "不") {
     // 阶段 4B.5：纯数量/单位修正（如「不是1袋，是5袋」）不是物品名修订
-    const QTY_UNIT_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)$/
+    const QTY_UNIT_RE = /^(?:[一二两三四五六七八九十\d]+)(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)$/
     if (QTY_UNIT_RE.test(m[1]) && QTY_UNIT_RE.test(m[2])) return undefined
     return { from: m[1], to: m[2] }
   }
@@ -756,8 +768,8 @@ export function buildLocalDraftFromText(text: string, state: AppState): AgentDra
 
   // 「加一袋猫砂」「加一瓶洗发水」这种「加+量词」也算补货信号，走 restock/createItemWithRestock
   // 但要排除「加一个」「加个」这种建档信号（无量词）
-  const hasQtyWithAdd = /(?:加|补|买|购入).{0,4}(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)/.test(compact)
-  const hasPurchaseSignal = hasQtyWithAdd || /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|金额|价格|京东|淘宝|天猫|拼多多/.test(compact)
+  const hasQtyWithAdd = /(?:加|补|买|购入).{0,4}(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)/.test(compact)
+  const hasPurchaseSignal = hasQtyWithAdd || /买了|下单|购入|入手|囤了|续上|补了|补货了|收货了|快递到了|花了|块钱|元|金额|价格|京东|淘宝|天猫|拼多多|\d+块/.test(compact)
   if (hasPurchaseSignal) {
     const itemName = extractPurchasedName(compact)
     if (!itemName) return null

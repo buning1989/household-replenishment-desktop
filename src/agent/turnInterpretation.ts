@@ -177,7 +177,7 @@ export function isCurrentEntryFieldRevision(text: string): boolean {
     // 排除管理类「改成」
     if (isManagementRequest(text)) return false
     // 检查是否含录入字段信号
-    const hasQtySignal = /\d+\s*(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)/.test(normalized)
+    const hasQtySignal = /\d+\s*(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)/.test(normalized)
     const hasPriceSignal = /\d+(?:\.\d+)?(?:\s*元|块钱|块)/.test(normalized)
     const hasPlatformSignal = /京东|淘宝|天猫|拼多多|抖音|1688|盒马|山姆|美团|超市|线下|苏宁|当当|蜜芽|网易|拼多多/.test(normalized)
     const hasDateSignal = /今天|昨天|前天|大前天|三天前/.test(normalized)
@@ -690,7 +690,7 @@ function detectShortField(
 
   // 数量+单位短句（如「两袋」「3 包」）
   const qty = parseQty(normalized)
-  if (qty.qty !== undefined && qty.unit && /^(?:[一二两三四五六七八九十]+|\d+)\s*(?:包|瓶|袋|盒|支|卷|件|kg|斤|L|升)$/.test(normalized)) {
+  if (qty.qty !== undefined && qty.unit && /^(?:[一二两三四五六七八九十]+|\d+)\s*(?:包|瓶|袋|盒|支|卷|件|提|桶|罐|箱|套|kg|斤|L|升|ml)$/.test(normalized)) {
     return { fields: { quantity: qty.qty, unit: qty.unit }, reason: `短句命中数量「${qty.qty}${qty.unit}」` }
   }
 
