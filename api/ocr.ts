@@ -12,6 +12,10 @@
 
 /// <reference types="node" />
 
+// 声明为 Edge Function：代码使用 Web Request/Response API，
+// 必须显式声明 edge runtime，否则 Vercel 默认按 Node.js Function 调用会失败。
+export const config = { runtime: "edge" }
+
 const OCR_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 const OCR_TIMEOUT_MS = 60 * 1000
 const MAX_IMAGE_SIZE = 8 * 1024 * 1024 // 8MB

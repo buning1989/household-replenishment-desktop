@@ -12,6 +12,10 @@
 
 /// <reference types="node" />
 
+// 声明为 Edge Function：代码使用 Web Request/Response API，
+// 必须显式声明 edge runtime，否则 Vercel 默认按 Node.js Function 调用会失败。
+export const config = { runtime: "edge" }
+
 const CHAT_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 const CHAT_TIMEOUT_MS = 45 * 1000
 const MAX_MESSAGES = 20
