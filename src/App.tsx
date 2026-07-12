@@ -374,6 +374,11 @@ function App() {
     return () => window.clearInterval(timer)
   }, [])
 
+  // Web 端设置浏览器标签标题；Electron 窗口标题由主进程 BrowserWindow 管理，不受影响
+  useEffect(() => {
+    if (isWebRuntime) document.title = "403 家庭管家"
+  }, [])
+
   useEffect(() => window.desktop?.onNotificationAction((payload) => {
     if (payload.action === "open" && payload.itemIds.length === 1) {
       setDetailItemId(payload.itemIds[0])
@@ -6310,6 +6315,11 @@ function Sidebar({ dueCount, categorySummaries, allItems, now, activeCategory, p
 
   return (
     <nav className="sidebar">
+      {isWebRuntime && (
+        <div className="sidebar-brand">
+          <span className="sidebar-brand-title">403 家庭管家</span>
+        </div>
+      )}
       <button
         className={`sidebar-home ${!activeCategory && !isChatOpen ? "is-active" : ""}`}
         onClick={() => onSelectCategory(null)}

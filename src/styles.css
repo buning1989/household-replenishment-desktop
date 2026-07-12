@@ -155,6 +155,20 @@ h1 { margin: 0; font-size: 19px; letter-spacing: -.02em; }
   gap: 2px;
 }
 
+/* Web 端产品身份区：仅 Web 运行时渲染，位于侧边栏最顶部 */
+.sidebar-brand {
+  padding: 20px 10px 8px;
+  flex-shrink: 0;
+}
+.sidebar-brand-title {
+  display: block;
+  font-size: 18px;
+  line-height: 1.4;
+  font-weight: 600;
+  color: #20251f;
+  letter-spacing: -0.01em;
+}
+
 .sidebar-home {
   display: flex;
   align-items: center;
