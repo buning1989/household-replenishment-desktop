@@ -385,6 +385,129 @@ check(
   sparseItems.length ? `稀疏商品: ${sparseItems.map((i) => i.name).join(", ")}` : "无"
 )
 
+// ---- 21. 每个消耗品至少有 1 个常购商品 ----
+const itemsWithoutOptions = items.filter((item) => !Array.isArray(item.purchaseOptions) || item.purchaseOptions.length === 0)
+check(
+  `所有消耗品至少有 1 个常购商品（缺: ${itemsWithoutOptions.map((i) => i.name).join(", ") || "无"}）`,
+  itemsWithoutOptions.length === 0,
+  itemsWithoutOptions.length ? `缺常购商品: ${itemsWithoutOptions.map((i) => i.name).join(", ")}` : ""
+)
+
+// ---- 22. 每个常购商品字段完整 ----
+const invalidOptions = []
+for (const item of items) {
+  for (const opt of (item.purchaseOptions || [])) {
+    if (!opt.id || !opt.productName || !opt.unit) {
+      invalidOptions.push({ item: item.name, id: opt.id, productName: opt.productName, unit: opt.unit })
+    }
+  }
+}
+check(
+  `所有常购商品字段完整（id/productName/unit 非空）`,
+  invalidOptions.length === 0,
+  invalidOptions.length ? `不完整: ${invalidOptions.map((o) => `${o.item}/${o.id}`).join(", ")}` : ""
+)
+
+// ---- 23. 常购商品 ID 全局唯一 ----
+const allOptionIds = []
+for (const item of items) {
+  for (const opt of (item.purchaseOptions || [])) {
+    allOptionIds.push({ id: opt.id, item: item.name })
+  }
+}
+const duplicateOptionIds = allOptionIds.filter((entry, index, arr) =>
+  arr.findIndex((e) => e.id === entry.id) !== index
+)
+check(
+  `常购商品 ID 全局唯一`,
+  duplicateOptionIds.length === 0,
+  duplicateOptionIds.length ? `重复 ID: ${[...new Set(duplicateOptionIds.map((o) => o.id))].join(", ")}` : ""
+)
+
+// ---- 24. 每个消耗品恰好有一个 isDefault=true 的常购商品 ----
+const itemsWithWrongDefault = items.filter((item) => {
+  const defaults = (item.purchaseOptions || []).filter((opt) => opt.isDefault === true)
+  return defaults.length !== 1
+})
+check(
+  `每个消耗品恰好有 1 个 isDefault=true 的常购商品`,
+  itemsWithWrongDefault.length === 0,
+  itemsWithWrongDefault.length ? `异常: ${itemsWithWrongDefault.map((i) => {
+    const defaults = (i.purchaseOptions || []).filter((o) => o.isDefault).length
+    return `${i.name}(${defaults}个默认)`
+  }).join(", ")}` : ""
+)
+
+// ---- 25. 默认常购商品单位与消耗品单位一致 ----
+const unitMismatches = []
+for (const item of items) {
+  const defaultOpt = (item.purchaseOptions || []).find((opt) => opt.isDefault)
+  if (defaultOpt && defaultOpt.unit !== item.unit) {
+    unitMismatches.push({ item: item.name, itemUnit: item.unit, optUnit: defaultOpt.unit })
+  }
+}
+check(
+  `默认常购商品单位与消耗品单位一致`,
+  unitMismatches.length === 0,
+  unitMismatches.length ? `不一致: ${unitMismatches.map((m) => `${m.name}(${m.itemUnit}≠${m.optUnit})`).join(", ")}` : ""
+)
+
+// ---- 26. 每条历史记录的 purchaseOptionId 都能在当前物品中找到 ----
+const orphanHistoryRecords = []
+for (const item of items) {
+  const optionIds = new Set((item.purchaseOptions || []).map((opt) => opt.id))
+  for (const event of (item.history || [])) {
+    if (!event.purchaseOptionId || !optionIds.has(event.purchaseOptionId)) {
+      orphanHistoryRecords.push({ item: item.name, eventId: event.id, optionId: event.purchaseOptionId })
+    }
+  }
+}
+check(
+  `每条历史记录的 purchaseOptionId 都能在当前物品中找到`,
+  orphanHistoryRecords.length === 0,
+  orphanHistoryRecords.length ? `孤立记录: ${orphanHistoryRecords.map((r) => `${r.item}/${r.optionId}`).join(", ")}` : ""
+)
+
+// ---- 27. 每条历史记录的 purchaseProductName 与引用商品一致 ----
+const nameMismatches = []
+for (const item of items) {
+  const optionMap = new Map((item.purchaseOptions || []).map((opt) => [opt.id, opt.productName]))
+  for (const event of (item.history || [])) {
+    if (event.purchaseOptionId && event.purchaseProductName) {
+      const expectedName = optionMap.get(event.purchaseOptionId)
+      if (expectedName && expectedName !== event.purchaseProductName) {
+        nameMismatches.push({ item: item.name, eventId: event.id, expected: expectedName, actual: event.purchaseProductName })
+      }
+    }
+  }
+}
+check(
+  `每条历史记录的 purchaseProductName 与引用商品一致`,
+  nameMismatches.length === 0,
+  nameMismatches.length ? `不一致: ${nameMismatches.map((m) => `${m.item}/${m.eventId}`).join(", ")}` : ""
+)
+
+// ---- 28. 卷纸常购商品明确校验 ----
+const toiletPaper = items.find((item) => item.name === "卷纸")
+if (toiletPaper) {
+  check(
+    `卷纸至少有 1 个常购商品`,
+    (toiletPaper.purchaseOptions || []).length >= 1,
+    `实际 ${toiletPaper.purchaseOptions?.length || 0} 个`
+  )
+  const defaultOpt = (toiletPaper.purchaseOptions || []).find((opt) => opt.isDefault)
+  check(
+    `卷纸默认常购商品名称包含"卷纸"`,
+    !!defaultOpt && defaultOpt.productName.includes("卷纸"),
+    `实际: ${defaultOpt?.productName || "无"}`
+  )
+  check(
+    `卷纸两条历史记录均关联到常购商品`,
+    (toiletPaper.history || []).every((event) => event.purchaseOptionId === defaultOpt?.id),
+    `不匹配记录: ${(toiletPaper.history || []).filter((e) => e.purchaseOptionId !== defaultOpt?.id).map((e) => e.id).join(", ") || "无"}`
+  )
+}
+
 // ---- 汇总 ----
 
 console.log("")

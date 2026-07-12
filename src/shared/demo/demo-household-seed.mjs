@@ -57,6 +57,7 @@ const demoCategories = [
  * @param {string} [opts.purchaseUnit]
  * @param {string} [opts.purchaseOptionId]
  * @param {string} [opts.purchaseProductName]
+ * @param {"spec"|"weight"} [opts.purchasePricingMode]
  * @param {1|2|3} [opts.rating]
  * @param {string} [opts.review]
  */
@@ -72,9 +73,29 @@ function restockEvent(opts) {
   if (opts.purchaseUnit !== undefined) event.purchaseUnit = opts.purchaseUnit
   if (opts.purchaseOptionId !== undefined) event.purchaseOptionId = opts.purchaseOptionId
   if (opts.purchaseProductName !== undefined) event.purchaseProductName = opts.purchaseProductName
+  if (opts.purchasePricingMode !== undefined) event.purchasePricingMode = opts.purchasePricingMode
   if (opts.rating !== undefined) event.rating = opts.rating
   if (opts.review !== undefined) event.review = opts.review
   return event
+}
+
+/**
+ * 构造一个常购商品（PurchaseOption）。
+ * Demo 数据统一使用 spec 计价模式，商品身份固定。
+ * @param {object} opts
+ * @param {string} opts.id
+ * @param {string} opts.productName
+ * @param {string} opts.unit
+ * @param {boolean} [opts.isDefault]
+ */
+function purchaseOption(opts) {
+  return {
+    id: opts.id,
+    productName: opts.productName,
+    unit: opts.unit,
+    pricingMode: "spec",
+    isDefault: opts.isDefault === undefined ? true : opts.isDefault
+  }
 }
 
 // ---- 消耗品构造工具 ----
@@ -142,12 +163,11 @@ const demoItems = [
     confidence: "high",
     defaultQty: 2,
     purchaseOptions: [
-      {
+      purchaseOption({
         id: "demo-po-catlitter",
-        productName: "pidan 豆腐猫砂",
-        unit: "袋",
-        isDefault: true
-      }
+        productName: "pidan 豆腐猫砂 2.4kg",
+        unit: "袋"
+      })
     ],
     history: [
       restockEvent({
@@ -158,7 +178,8 @@ const demoItems = [
         platform: "淘宝",
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-catlitter",
-        purchaseProductName: "pidan 豆腐猫砂"
+        purchaseProductName: "pidan 豆腐猫砂 2.4kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-cat-litter-h2",
@@ -169,7 +190,8 @@ const demoItems = [
         platform: "淘宝",
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-catlitter",
-        purchaseProductName: "pidan 豆腐猫砂"
+        purchaseProductName: "pidan 豆腐猫砂 2.4kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-cat-litter-h3",
@@ -179,7 +201,8 @@ const demoItems = [
         price: 68,
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-catlitter",
-        purchaseProductName: "pidan 豆腐猫砂"
+        purchaseProductName: "pidan 豆腐猫砂 2.4kg",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -198,12 +221,11 @@ const demoItems = [
     confidence: "high",
     defaultQty: 1,
     purchaseOptions: [
-      {
+      purchaseOption({
         id: "demo-po-detergent",
-        productName: "蓝月亮洗衣液",
-        unit: "瓶",
-        isDefault: true
-      }
+        productName: "蓝月亮深层洁净洗衣液 3kg",
+        unit: "瓶"
+      })
     ],
     history: [
       restockEvent({
@@ -214,7 +236,8 @@ const demoItems = [
         platform: "京东",
         purchaseUnit: "瓶",
         purchaseOptionId: "demo-po-detergent",
-        purchaseProductName: "蓝月亮洗衣液"
+        purchaseProductName: "蓝月亮深层洁净洗衣液 3kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-laundry-detergent-h2",
@@ -225,7 +248,8 @@ const demoItems = [
         platform: "京东",
         purchaseUnit: "瓶",
         purchaseOptionId: "demo-po-detergent",
-        purchaseProductName: "蓝月亮洗衣液"
+        purchaseProductName: "蓝月亮深层洁净洗衣液 3kg",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -244,6 +268,13 @@ const demoItems = [
     confidence: "medium",
     inventoryStatus: "justRestocked",
     defaultQty: 3,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-pet-wipes",
+        productName: "小佩宠物湿巾 80 抽",
+        unit: "包"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-pet-wipes-h1",
@@ -252,6 +283,9 @@ const demoItems = [
         price: 45,
         platform: "拼多多",
         purchaseUnit: "包",
+        purchaseOptionId: "demo-po-pet-wipes",
+        purchaseProductName: "小佩宠物湿巾 80 抽",
+        purchasePricingMode: "spec",
         rating: 2,
         review: "一般"
       }),
@@ -263,6 +297,9 @@ const demoItems = [
         price: 42,
         platform: "拼多多",
         purchaseUnit: "包",
+        purchaseOptionId: "demo-po-pet-wipes",
+        purchaseProductName: "小佩宠物湿巾 80 抽",
+        purchasePricingMode: "spec",
         rating: 3,
         review: "质量不错"
       })
@@ -284,6 +321,13 @@ const demoItems = [
     createdAt: day(2026, 4, 25),
     confidence: "high",
     defaultQty: 2,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-tissues",
+        productName: "维达超韧抽纸 3 层 100 抽 × 12 包",
+        unit: "提"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-tissues-h1",
@@ -291,7 +335,10 @@ const demoItems = [
         qty: 2,
         price: 35,
         platform: "淘宝",
-        purchaseUnit: "提"
+        purchaseUnit: "提",
+        purchaseOptionId: "demo-po-tissues",
+        purchaseProductName: "维达超韧抽纸 3 层 100 抽 × 12 包",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-tissues-h2",
@@ -300,7 +347,10 @@ const demoItems = [
         qty: 2,
         price: 33,
         platform: "淘宝",
-        purchaseUnit: "提"
+        purchaseUnit: "提",
+        purchaseOptionId: "demo-po-tissues",
+        purchaseProductName: "维达超韧抽纸 3 层 100 抽 × 12 包",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-tissues-h3",
@@ -308,7 +358,10 @@ const demoItems = [
         intervalDays: 25,
         qty: 2,
         price: 35,
-        purchaseUnit: "提"
+        purchaseUnit: "提",
+        purchaseOptionId: "demo-po-tissues",
+        purchaseProductName: "维达超韧抽纸 3 层 100 抽 × 12 包",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -326,6 +379,13 @@ const demoItems = [
     createdAt: day(2026, 5, 10),
     confidence: "medium",
     defaultQty: 2,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-garbage-bags",
+        productName: "妙洁加厚垃圾袋 30 只",
+        unit: "卷"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-garbage-bags-h1",
@@ -333,7 +393,10 @@ const demoItems = [
         qty: 2,
         price: 18,
         platform: "线下",
-        purchaseUnit: "卷"
+        purchaseUnit: "卷",
+        purchaseOptionId: "demo-po-garbage-bags",
+        purchaseProductName: "妙洁加厚垃圾袋 30 只",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-garbage-bags-h2",
@@ -341,7 +404,10 @@ const demoItems = [
         intervalDays: 34,
         qty: 2,
         price: 16,
-        purchaseUnit: "卷"
+        purchaseUnit: "卷",
+        purchaseOptionId: "demo-po-garbage-bags",
+        purchaseProductName: "妙洁加厚垃圾袋 30 只",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -361,12 +427,11 @@ const demoItems = [
     inventoryStatus: "justRestocked",
     defaultQty: 1,
     purchaseOptions: [
-      {
+      purchaseOption({
         id: "demo-po-cat-food",
-        productName: "皇家猫粮",
-        unit: "袋",
-        isDefault: true
-      }
+        productName: "皇家室内成猫粮 2kg",
+        unit: "袋"
+      })
     ],
     history: [
       restockEvent({
@@ -377,7 +442,8 @@ const demoItems = [
         platform: "京东",
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-cat-food",
-        purchaseProductName: "皇家猫粮"
+        purchaseProductName: "皇家室内成猫粮 2kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-cat-food-h2",
@@ -388,7 +454,8 @@ const demoItems = [
         platform: "京东",
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-cat-food",
-        purchaseProductName: "皇家猫粮"
+        purchaseProductName: "皇家室内成猫粮 2kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-cat-food-h3",
@@ -399,7 +466,8 @@ const demoItems = [
         platform: "京东",
         purchaseUnit: "袋",
         purchaseOptionId: "demo-po-cat-food",
-        purchaseProductName: "皇家猫粮",
+        purchaseProductName: "皇家室内成猫粮 2kg",
+        purchasePricingMode: "spec",
         rating: 3,
         review: "猫咪爱吃"
       })
@@ -418,6 +486,13 @@ const demoItems = [
     createdAt: day(2026, 4, 22),
     confidence: "medium",
     defaultQty: 2,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-toilet-paper",
+        productName: "维达蓝色经典卷纸 4 层 10 卷",
+        unit: "提"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-toilet-paper-h1",
@@ -425,7 +500,10 @@ const demoItems = [
         qty: 2,
         price: 45,
         platform: "淘宝",
-        purchaseUnit: "提"
+        purchaseUnit: "提",
+        purchaseOptionId: "demo-po-toilet-paper",
+        purchaseProductName: "维达蓝色经典卷纸 4 层 10 卷",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-toilet-paper-h2",
@@ -434,7 +512,10 @@ const demoItems = [
         qty: 2,
         price: 42,
         platform: "淘宝",
-        purchaseUnit: "提"
+        purchaseUnit: "提",
+        purchaseOptionId: "demo-po-toilet-paper",
+        purchaseProductName: "维达蓝色经典卷纸 4 层 10 卷",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -451,6 +532,13 @@ const demoItems = [
     createdAt: day(2026, 4, 28),
     confidence: "medium",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-kitchen-paper",
+        productName: "心相印厨房纸 2 卷",
+        unit: "包"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-kitchen-paper-h1",
@@ -458,7 +546,10 @@ const demoItems = [
         qty: 1,
         price: 22,
         platform: "京东",
-        purchaseUnit: "包"
+        purchaseUnit: "包",
+        purchaseOptionId: "demo-po-kitchen-paper",
+        purchaseProductName: "心相印厨房纸 2 卷",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-kitchen-paper-h2",
@@ -467,7 +558,10 @@ const demoItems = [
         qty: 1,
         price: 25,
         platform: "京东",
-        purchaseUnit: "包"
+        purchaseUnit: "包",
+        purchaseOptionId: "demo-po-kitchen-paper",
+        purchaseProductName: "心相印厨房纸 2 卷",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -484,6 +578,13 @@ const demoItems = [
     createdAt: day(2026, 4, 16),
     confidence: "medium",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-dish-soap",
+        productName: "立白洗洁精 1.1kg",
+        unit: "瓶"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-dish-soap-h1",
@@ -491,7 +592,10 @@ const demoItems = [
         qty: 1,
         price: 15,
         platform: "线下",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-dish-soap",
+        purchaseProductName: "立白洗洁精 1.1kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-dish-soap-h2",
@@ -499,7 +603,10 @@ const demoItems = [
         intervalDays: 40,
         qty: 1,
         price: 15,
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-dish-soap",
+        purchaseProductName: "立白洗洁精 1.1kg",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -516,6 +623,13 @@ const demoItems = [
     createdAt: day(2026, 6, 15),
     confidence: "low",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-hand-soap",
+        productName: "威露士泡沫洗手液 300ml",
+        unit: "瓶"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-hand-soap-h1",
@@ -523,7 +637,10 @@ const demoItems = [
         qty: 1,
         price: 12,
         platform: "线下",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-hand-soap",
+        purchaseProductName: "威露士泡沫洗手液 300ml",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -540,6 +657,13 @@ const demoItems = [
     createdAt: day(2026, 4, 14),
     confidence: "medium",
     defaultQty: 2,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-toothpaste",
+        productName: "云南白药牙膏 120g",
+        unit: "支"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-toothpaste-h1",
@@ -547,7 +671,10 @@ const demoItems = [
         qty: 2,
         price: 28,
         platform: "淘宝",
-        purchaseUnit: "支"
+        purchaseUnit: "支",
+        purchaseOptionId: "demo-po-toothpaste",
+        purchaseProductName: "云南白药牙膏 120g",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-toothpaste-h2",
@@ -556,7 +683,10 @@ const demoItems = [
         qty: 2,
         price: 30,
         platform: "淘宝",
-        purchaseUnit: "支"
+        purchaseUnit: "支",
+        purchaseOptionId: "demo-po-toothpaste",
+        purchaseProductName: "云南白药牙膏 120g",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -573,6 +703,13 @@ const demoItems = [
     createdAt: day(2026, 4, 12),
     confidence: "medium",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-shampoo",
+        productName: "海飞丝去屑洗发水 750ml",
+        unit: "瓶"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-shampoo-h1",
@@ -580,7 +717,10 @@ const demoItems = [
         qty: 1,
         price: 35,
         platform: "京东",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-shampoo",
+        purchaseProductName: "海飞丝去屑洗发水 750ml",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-shampoo-h2",
@@ -589,7 +729,10 @@ const demoItems = [
         qty: 1,
         price: 38,
         platform: "京东",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-shampoo",
+        purchaseProductName: "海飞丝去屑洗发水 750ml",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -606,6 +749,13 @@ const demoItems = [
     createdAt: day(2026, 4, 10),
     confidence: "medium",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-body-wash",
+        productName: "舒肤佳沐浴露 720ml",
+        unit: "瓶"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-body-wash-h1",
@@ -613,7 +763,10 @@ const demoItems = [
         qty: 1,
         price: 25,
         platform: "淘宝",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-body-wash",
+        purchaseProductName: "舒肤佳沐浴露 720ml",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-body-wash-h2",
@@ -622,7 +775,10 @@ const demoItems = [
         qty: 1,
         price: 28,
         platform: "淘宝",
-        purchaseUnit: "瓶"
+        purchaseUnit: "瓶",
+        purchaseOptionId: "demo-po-body-wash",
+        purchaseProductName: "舒肤佳沐浴露 720ml",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -639,6 +795,13 @@ const demoItems = [
     createdAt: day(2026, 5, 20),
     confidence: "medium",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-rice",
+        productName: "十月稻田五常大米 5kg",
+        unit: "袋"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-rice-h1",
@@ -646,7 +809,10 @@ const demoItems = [
         qty: 1,
         price: 55,
         platform: "线下",
-        purchaseUnit: "袋"
+        purchaseUnit: "袋",
+        purchaseOptionId: "demo-po-rice",
+        purchaseProductName: "十月稻田五常大米 5kg",
+        purchasePricingMode: "spec"
       }),
       restockEvent({
         id: "demo-rice-h2",
@@ -655,7 +821,10 @@ const demoItems = [
         qty: 1,
         price: 58,
         platform: "线下",
-        purchaseUnit: "袋"
+        purchaseUnit: "袋",
+        purchaseOptionId: "demo-po-rice",
+        purchaseProductName: "十月稻田五常大米 5kg",
+        purchasePricingMode: "spec"
       })
     ]
   }),
@@ -672,13 +841,23 @@ const demoItems = [
     createdAt: day(2026, 6, 2),
     confidence: "low",
     defaultQty: 1,
+    purchaseOptions: [
+      purchaseOption({
+        id: "demo-po-storage-bags",
+        productName: "妙洁中号保鲜袋 100 只",
+        unit: "盒"
+      })
+    ],
     history: [
       restockEvent({
         id: "demo-storage-bags-h1",
         at: day(2026, 6, 2),
         qty: 1,
         price: 8,
-        purchaseUnit: "盒"
+        purchaseUnit: "盒",
+        purchaseOptionId: "demo-po-storage-bags",
+        purchaseProductName: "妙洁中号保鲜袋 100 只",
+        purchasePricingMode: "spec"
       })
     ]
   })

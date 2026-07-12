@@ -17,14 +17,14 @@ import type {
   RestockEvent
 } from "./types"
 import { isDesktopRuntime } from "./runtime/runtimeBridge"
-import { ensureCompetitionDemoState } from "./demo/competitionDemoState"
+import { ensureCompetitionDemoState, COMPETITION_WEB_STORAGE_KEY } from "./demo/competitionDemoState"
 
 // 运行时隔离：桌面端和 Web 端使用独立 localStorage Key
 // 桌面端：原有 Key，保持不变
-// Web 端：独立 Key，禁止覆盖桌面端数据
+// Web 端：统一引用 COMPETITION_WEB_STORAGE_KEY 常量，禁止重复硬编码
 const STORAGE_KEY = isDesktopRuntime
   ? "household_replenishment_desktop_v1"
-  : "household_replenishment_competition_web_v1"
+  : COMPETITION_WEB_STORAGE_KEY
 
 export type PersistenceIssue = {
   kind: "read" | "write" | "sync"

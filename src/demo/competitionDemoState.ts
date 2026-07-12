@@ -19,6 +19,18 @@ import { isDesktopRuntime } from "../runtime/runtimeBridge"
 import { createDemoState as createDemoStateRaw } from "../shared/demo/demo-household-seed.mjs"
 
 /**
+ * 比赛 Web 端 localStorage Key。
+ *
+ * 升级到 v2 以强制刷新已有浏览器中的旧 Demo State：
+ * 旧 v1 数据缺少常购商品，已部署新 Seed 后仍会显示空卡片。
+ * v2 key 让首次访问的新部署自动加载包含商品数据的新 Demo State。
+ *
+ * 桌面端 Key（household_replenishment_desktop_v1）保持不变，不得修改。
+ * 所有比赛 Web storage key 引用必须统一使用此常量，不得重复硬编码。
+ */
+export const COMPETITION_WEB_STORAGE_KEY = "household_replenishment_competition_web_v2"
+
+/**
  * 创建比赛 Demo State。
  * 复用 demo-household-seed.mjs 的 createDemoState()，
  * 确保桌面端 seed 脚本和 Web 端使用同一份数据源。
@@ -62,14 +74,13 @@ export function resetCompetitionDemoState(): AppState {
 export function ensureCompetitionDemoState(): AppState | null {
   if (isDesktopRuntime) return null
 
-  const WEB_STORAGE_KEY = "household_replenishment_competition_web_v1"
   try {
-    const existing = localStorage.getItem(WEB_STORAGE_KEY)
+    const existing = localStorage.getItem(COMPETITION_WEB_STORAGE_KEY)
     if (existing) return null // 已有数据，不覆盖
 
     // 首次访问：注入比赛 Demo State
     const demoState = createCompetitionDemoState()
-    localStorage.setItem(WEB_STORAGE_KEY, JSON.stringify(demoState))
+    localStorage.setItem(COMPETITION_WEB_STORAGE_KEY, JSON.stringify(demoState))
     return demoState
   } catch {
     // localStorage 不可用（隐私模式等），返回 null 让 loadState 走兜底
@@ -86,10 +97,9 @@ export function clearCompetitionTempState(): void {
 
   try {
     // 清理损坏数据备份键
-    const WEB_STORAGE_KEY = "household_replenishment_competition_web_v1"
     for (let i = localStorage.length - 1; i >= 0; i--) {
       const key = localStorage.key(i)
-      if (key && key.startsWith(`${WEB_STORAGE_KEY}_corrupt_backup_`)) {
+      if (key && key.startsWith(`${COMPETITION_WEB_STORAGE_KEY}_corrupt_backup_`)) {
         localStorage.removeItem(key)
       }
     }

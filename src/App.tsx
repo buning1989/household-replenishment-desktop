@@ -60,7 +60,7 @@ import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from ".
 import type { AppState, DeleteCategoryOptions, ItemComputed, ItemDraft, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
 import { isDesktopRuntime, isWebRuntime, requiresUserApiKey } from "./runtime/runtimeBridge"
-import { resetCompetitionDemoState, clearCompetitionTempState } from "./demo/competitionDemoState"
+import { resetCompetitionDemoState, clearCompetitionTempState, COMPETITION_WEB_STORAGE_KEY } from "./demo/competitionDemoState"
 
 const EMPTY_DRAFT: ItemDraft = {
   name: "",
@@ -464,8 +464,7 @@ function App() {
       } else {
         // Web 端：使用比赛 Demo State，直接写 localStorage
         const demoState = resetCompetitionDemoState()
-        const WEB_STORAGE_KEY = "household_replenishment_competition_web_v1"
-        localStorage.setItem(WEB_STORAGE_KEY, JSON.stringify(demoState))
+        localStorage.setItem(COMPETITION_WEB_STORAGE_KEY, JSON.stringify(demoState))
         clearCompetitionTempState()
         setHouseholdChatMessages([])
         setHouseholdChatLastQuestion("")
