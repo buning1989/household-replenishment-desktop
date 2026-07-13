@@ -1,6 +1,15 @@
 node_modules/
 dist/
+dist-landing/
+dist-web/
 release/
 .DS_Store
 *.log
+.claude/
+.env
+.env.local
+.env.*.local
+.vercel/
+electron/build-info.json
+electron-builder.config.json
 

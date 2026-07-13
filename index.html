@@ -5,13 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#f3f1ec" />
     <!--
-      Content-Security-Policy：限制页面可加载的资源来源，防止 XSS 通过外链脚本注入。
-      - dev 模式（Vite HMR）需要 unsafe-eval 和 127.0.0.1 来源；
-      - production 模式（file://）通过 self + file: 加载本地资源；
-      - object-src 'none' 禁止 <embed>/<object>；
-      - connect-src 允许 data: 以支持应用内 data URI 的读写操作。
+      Content-Security-Policy：纵深防御。
+      - script-src / style-src 允许 'unsafe-inline'：vite-plugin-singlefile 把所有脚本/样式内联进 index.html，
+        构建产物中没有外部脚本可签名，因此必须放开 inline 才能避免白屏。
+        Electron 已开启 contextIsolation: true、nodeIntegration: false，渲染层不暴露 Node API。
+      - img-src 允许 data：常购商品图片仍可能是 base64 data URL。
+      - connect-src 允许 127.0.0.1:5173 / ws：dev 模式下 Vite HMR 需要。
+      - object-src 'none' / base-uri 'self' / form-action 'self'：收紧默认行为。
     -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:5173; style-src 'self' 'unsafe-inline' http://127.0.0.1:5173; img-src 'self' data: file:; font-src 'self' data: file:; connect-src 'self' data: file: http://127.0.0.1:5173; object-src 'none';" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:5173 ws://127.0.0.1:5173 data:; object-src 'none'; base-uri 'self'; form-action 'self';" />
+
     <title>403家庭管家</title>
   </head>
   <body>

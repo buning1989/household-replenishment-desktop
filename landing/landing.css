@@ -1,0 +1,880 @@
+/* ============================================================
+   403 管家 Landing Page Styles
+   ============================================================ */
+
+/* --- Reset & Base --- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --bg: #FAFAF8;
+  --bg-white: #FFFFFF;
+  --text-primary: #1F1F1F;
+  --text-secondary: #666666;
+  --text-tertiary: #999999;
+  --border: #EAEAEA;
+  --card-bg: #F7F7F5;
+  --btn-primary-bg: #1F1F1F;
+  --btn-primary-text: #FFFFFF;
+  --tag-bg: #F0F0EE;
+  --tag-text: #555555;
+  --status-dot-urgent: #888888;
+
+  --font-sans: "Inter", "SF Pro Display", -apple-system, BlinkMacSystemFont,
+    "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+
+  --max-width: 1120px;
+  --section-padding-y: 120px;
+  --section-padding-y-mobile: 72px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+}
+
+html {
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--text-primary);
+  line-height: 1.6;
+  min-height: 100vh;
+}
+
+/* --- Layout --- */
+.landing {
+  width: 100%;
+  overflow-x: hidden;
+}
+
+.landing-section {
+  padding: var(--section-padding-y) 32px;
+  max-width: var(--max-width);
+  margin: 0 auto;
+}
+
+.landing-section--full {
+  max-width: none;
+  padding: var(--section-padding-y) 0;
+}
+
+.landing-inner {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 0 32px;
+}
+
+/* --- Typography --- */
+.landing-h1 {
+  font-size: 96px;
+  font-weight: 600;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  white-space: nowrap;
+  flex-wrap: nowrap;
+}
+
+.hero-icon {
+  width: 176px;
+  height: 176px;
+  flex-shrink: 0;
+  object-fit: contain;
+}
+
+.landing-h2 {
+  font-size: 32px;
+  font-weight: 600;
+  line-height: 1.3;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.landing-h3 {
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.landing-body {
+  font-size: 16px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+.landing-body-sm {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.landing-caption {
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
+
+/* --- Buttons --- */
+.btn-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 11px 24px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--btn-primary-text);
+  background: var(--btn-primary-bg);
+  border: 1px solid var(--btn-primary-bg);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: opacity 0.15s ease;
+  text-decoration: none;
+  line-height: 1.4;
+}
+
+.btn-primary:hover {
+  opacity: 0.85;
+}
+
+.btn-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 11px 24px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+  text-decoration: none;
+  line-height: 1.4;
+}
+
+.btn-secondary:hover {
+  border-color: var(--text-primary);
+}
+
+/* ============================================================
+   Section 1: Hero
+   ============================================================ */
+.hero {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 64px;
+  min-height: 100vh;
+  padding-top: 80px;
+  padding-bottom: 80px;
+  align-items: center;
+}
+
+.hero-content {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.hero-subtitle {
+  font-size: 36px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-top: 8px;
+}
+
+.hero-description {
+  font-size: 15px;
+  line-height: 1.75;
+  color: var(--text-secondary);
+  max-width: 480px;
+}
+
+.hero-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.hero-tag {
+  display: inline-block;
+  padding: 5px 14px;
+  font-size: 13px;
+  color: var(--tag-text);
+  background: var(--tag-bg);
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  line-height: 1.4;
+}
+
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+/* --- Hero Panel (Product Mock) --- */
+.hero-panel {
+  width: 100%;
+  background: var(--bg-white);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.hero-panel-header {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.hero-panel-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #DCDCDC;
+}
+
+.hero-panel-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-left: 6px;
+}
+
+.hero-panel-body {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.panel-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.panel-group-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  letter-spacing: 0.02em;
+  margin-bottom: 4px;
+}
+
+.panel-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 9px 12px;
+  background: var(--card-bg);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  gap: 12px;
+}
+
+.panel-item-name {
+  font-weight: 500;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel-item-status {
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.panel-item-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.panel-item--urgent .panel-item-dot {
+  background: var(--text-primary);
+}
+
+.panel-item--urgent .panel-item-status {
+  color: var(--text-primary);
+  font-weight: 500;
+}
+
+.panel-item--watch .panel-item-dot {
+  background: var(--text-tertiary);
+}
+
+.panel-item--safe .panel-item-dot {
+  background: var(--border);
+}
+
+.panel-item--safe .panel-item-status {
+  color: var(--text-tertiary);
+}
+
+/* ============================================================
+   Section 2: Problem
+   ============================================================ */
+.section-problem {
+  background: var(--bg-white);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.problem-header {
+  text-align: center;
+  margin-bottom: 56px;
+}
+
+.problem-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-bottom: 48px;
+}
+
+.problem-card {
+  padding: 28px 24px;
+  background: var(--card-bg);
+  border-radius: var(--radius-md);
+  border-left: 2px solid var(--border);
+}
+
+.problem-card-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.problem-card-text {
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text-secondary);
+}
+
+.problem-summary {
+  text-align: center;
+  font-size: 15px;
+  color: var(--text-secondary);
+  border-top: 1px solid var(--border);
+  padding-top: 28px;
+}
+
+.problem-summary strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* ============================================================
+   Section 3: Solution
+   ============================================================ */
+.solution-header {
+  text-align: center;
+  margin-bottom: 56px;
+}
+
+.solution-header .landing-h2 {
+  margin-bottom: 16px;
+}
+
+.solution-header .landing-body {
+  max-width: 540px;
+  margin: 0 auto;
+}
+
+.solution-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 24px;
+  position: relative;
+}
+
+.solution-step {
+  text-align: center;
+  padding: 32px 24px;
+  background: var(--card-bg);
+  border-radius: var(--radius-md);
+  position: relative;
+}
+
+.solution-step-number {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-text);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+.solution-step-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.solution-step-text {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.solution-flow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0;
+  margin-top: 40px;
+}
+
+.solution-flow-step {
+  padding: 7px 18px;
+  background: var(--tag-bg);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.solution-flow-arrow {
+  width: 32px;
+  text-align: center;
+  color: var(--text-tertiary);
+  font-size: 14px;
+  line-height: 1;
+}
+
+/* ============================================================
+   Section 4: Pipeline
+   ============================================================ */
+.section-pipeline {
+  background: var(--bg-white);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.pipeline-header {
+  text-align: center;
+  margin-bottom: 56px;
+}
+
+.pipeline-header .landing-h2 {
+  margin-bottom: 0;
+}
+
+.pipeline-timeline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  position: relative;
+  padding: 0 24px;
+}
+
+.pipeline-timeline::before {
+  content: "";
+  position: absolute;
+  top: 15px;
+  left: 56px;
+  right: 56px;
+  height: 1px;
+  background: var(--border);
+}
+
+.pipeline-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.pipeline-node-dot {
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--bg-white);
+  border: 1.5px solid var(--text-primary);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+  flex-shrink: 0;
+}
+
+.pipeline-node-dot-inner {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-primary);
+}
+
+.pipeline-node-label {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  text-align: center;
+  line-height: 1.4;
+}
+
+.pipeline-note {
+  text-align: center;
+  margin-top: 48px;
+  font-size: 14px;
+  line-height: 1.7;
+  color: var(--text-secondary);
+  max-width: 540px;
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* ============================================================
+   Section 5: Voice
+   ============================================================ */
+.voice-header {
+  text-align: center;
+  margin-bottom: 48px;
+}
+
+.voice-header .landing-h2 {
+  margin-bottom: 16px;
+}
+
+.voice-header .landing-body {
+  max-width: 500px;
+  margin: 0 auto;
+}
+
+.voice-chat {
+  max-width: 480px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.voice-bubble {
+  max-width: 85%;
+  padding: 14px 18px;
+  border-radius: var(--radius-md);
+  font-size: 14px;
+  line-height: 1.65;
+}
+
+.voice-bubble--user {
+  align-self: flex-end;
+  background: var(--btn-primary-bg);
+  color: var(--btn-primary-text);
+  border-bottom-right-radius: 4px;
+}
+
+.voice-bubble--assistant {
+  align-self: flex-start;
+  background: var(--card-bg);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-bottom-left-radius: 4px;
+}
+
+.voice-bubble-role {
+  display: block;
+  font-size: 11px;
+  font-weight: 500;
+  margin-bottom: 4px;
+  opacity: 0.55;
+}
+
+.voice-bubble--user .voice-bubble-role {
+  text-align: right;
+}
+
+.voice-bubble--assistant .voice-bubble-role {
+  color: var(--text-tertiary);
+}
+
+.voice-divider {
+  width: 40px;
+  height: 1px;
+  background: var(--border);
+  margin: 8px 0;
+  align-self: center;
+}
+
+/* ============================================================
+   Section 6: Roadmap
+   ============================================================ */
+.section-roadmap {
+  background: var(--bg-white);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.roadmap-header {
+  text-align: center;
+  margin-bottom: 48px;
+}
+
+.roadmap-header .landing-h2 {
+  margin-bottom: 16px;
+}
+
+.roadmap-header .landing-body {
+  max-width: 540px;
+  margin: 0 auto;
+}
+
+.roadmap-levels {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  margin-bottom: 48px;
+}
+
+.roadmap-level {
+  padding: 28px 24px;
+  background: var(--card-bg);
+  border-radius: var(--radius-md);
+  text-align: center;
+}
+
+.roadmap-level-stage {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  margin-bottom: 10px;
+}
+
+.roadmap-level-title {
+  font-size: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+
+.roadmap-level-text {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+}
+
+.roadmap-boundary {
+  max-width: 540px;
+  margin: 0 auto;
+  text-align: center;
+}
+
+.roadmap-boundary-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 16px;
+}
+
+.roadmap-boundary-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+}
+
+.roadmap-boundary-tag {
+  display: inline-block;
+  padding: 5px 14px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  line-height: 1.4;
+}
+
+.roadmap-summary {
+  text-align: center;
+  margin-top: 40px;
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+/* ============================================================
+   Section 7: Footer
+   ============================================================ */
+.section-footer {
+  text-align: center;
+  padding-top: var(--section-padding-y);
+  padding-bottom: 80px;
+  border-top: 1px solid var(--border);
+}
+
+.section-footer .landing-h2 {
+  margin-bottom: 20px;
+}
+
+.section-footer .landing-body {
+  max-width: 500px;
+  margin: 0 auto 20px;
+}
+
+.section-footer .landing-caption {
+  max-width: 440px;
+  margin: 0 auto 36px;
+}
+
+/* ============================================================
+   Fade-in animation
+   ============================================================ */
+.fade-in {
+  opacity: 0;
+  transform: translateY(12px);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+
+.fade-in.visible {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 900px) {
+  .landing-section {
+    padding: var(--section-padding-y-mobile) 20px;
+  }
+
+  .landing-section--full {
+    padding: var(--section-padding-y-mobile) 0;
+  }
+
+  .landing-inner {
+    padding: 0 20px;
+  }
+
+  .landing-h1 {
+    font-size: 36px;
+  }
+
+  .landing-h2 {
+    font-size: 26px;
+  }
+
+  .hero {
+    grid-template-columns: 1fr;
+    gap: 40px;
+    min-height: auto;
+    padding-top: 60px;
+    padding-bottom: 60px;
+  }
+
+  .hero-panel {
+    width: 100%;
+  }
+
+  .hero-content {
+    align-items: flex-start;
+  }
+
+  .problem-cards {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .solution-steps {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .pipeline-timeline {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 16px;
+    padding: 0;
+  }
+
+  .pipeline-timeline::before {
+    top: 0;
+    bottom: 0;
+    left: 14px;
+    right: auto;
+    width: 1px;
+    height: auto;
+  }
+
+  .pipeline-node {
+    flex-direction: row;
+    gap: 16px;
+  }
+
+  .pipeline-node-label {
+    text-align: left;
+  }
+
+  .roadmap-levels {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .hero-actions {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .voice-bubble {
+    max-width: 90%;
+  }
+
+  .solution-flow {
+    gap: 0;
+  }
+}
+
+@media (max-width: 480px) {
+  .landing-h1 {
+    font-size: 30px;
+  }
+
+  .landing-h2 {
+    font-size: 22px;
+  }
+
+  .hero-description {
+    font-size: 14px;
+  }
+
+  .hero-tags {
+    gap: 6px;
+  }
+
+  .hero-tag {
+    font-size: 12px;
+    padding: 4px 10px;
+  }
+}

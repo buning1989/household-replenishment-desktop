@@ -1,15 +1,68 @@
 export type ItemType = "learning" | "fixed"
 export type ItemUrgency = "normal" | "warning" | "urgent"
 export type Rating = 1 | 2 | 3
+export type ItemSource = "manual" | "imported"
+export type ModelConfidence = "low" | "medium" | "high"
+export type PricingMode = "spec" | "measure"
+export type InventoryStatus = "justRestocked" | "plenty" | "half" | "low" | "unknown"
+
+export type ResidentCount = 1 | 2 | 3 | 4
+export type ChildSituation = "none" | "infant" | "schoolAge" | "teen"
+export type PetSituation = "none" | "cat" | "dog" | "catAndDog" | "other"
+export type CookingFrequency = "rarely" | "sometimes" | "often" | "daily"
+export type LaundryFrequency = "low" | "medium" | "daily"
+export type HomeSize = "oneBedroom" | "twoBedroom" | "threePlus"
+
+export type HouseholdProfile = {
+  residentCount: ResidentCount
+  children: ChildSituation
+  pets: PetSituation
+  cookingFrequency: CookingFrequency
+  laundryFrequency: LaundryFrequency
+  homeSize: HomeSize
+  bathroomCount?: number
+  createdAt: number
+  updatedAt: number
+}
+
+export type TemplateActivation = "default" | "conditional" | "recommended"
+export type TemplateTrigger =
+  | { kind: "pet"; values: PetSituation[] }
+  | { kind: "child"; values: ChildSituation[] }
+  | { kind: "cooking"; values: CookingFrequency[] }
+
+export type ConsumableTemplate = {
+  id: string
+  name: string
+  category: string
+  minCycleDays: number
+  maxCycleDays: number
+  defaultCycleDays: number
+  bufferDays: number
+  unit: string
+  activation: TemplateActivation
+  trigger?: TemplateTrigger
+  influenceFactors: Array<"residents" | "children" | "pets" | "cooking" | "laundry" | "homeSize">
+  learningEnabled: boolean
+  defaultConfidence: ModelConfidence
+}
 
 export interface PurchaseOption {
   id: string
-  productName: string  // 具体商品名称（如"维达卫生纸"）
-  platform: string     // 购买平台
-  unit: string         // 计量单位
-  price?: number       // 采购价格
+  productName: string  // 商品名称（如"维达卫生纸"）
+  unit: string         // 规格（如"袋"、"瓶"、"包"）
+  pricingMode?: PricingMode // 计价方式：按规格或按含量
+  measureUnit?: string // 常用计量单位（如"kg"、"L"、"抽"）
+  measureBaseAmount?: number // 计价口径数量（如 100 抽、100 克）
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  platform?: string
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  price?: number
   link?: string        // 商品链接（可选）
+  /** @deprecated 每次补货会变化，保留用于旧数据迁移。 */
+  review?: string
   isDefault?: boolean  // 是否为默认选项
+  image?: string       // 图片（base64）
 }
 
 export type RestockEvent = {
@@ -19,6 +72,13 @@ export type RestockEvent = {
   price?: number
   qty?: number
   platform?: string
+  purchaseOptionId?: string      // 本次补货对应的商品卡片 id
+  purchaseProductName?: string  // 本次补货对应的商品名称快照
+  purchaseUnit?: string         // 本次补货对应的采购单位快照
+  purchasePricingMode?: PricingMode // 本次补货对应的计价方式快照
+  purchaseMeasureBaseAmount?: number // 本次补货对应的计价口径数量快照
+  purchaseMeasureAmount?: number // 单件商品含量数值（如 500）
+  purchaseMeasureUnit?: string  // 单件商品含量单位（如"ml"、"kg"）
   rating?: Rating
   review?: string
 }
@@ -31,6 +91,8 @@ export type ReplenishmentItem = {
   cycleDays: number
   bufferDays: number
   lastRestockedAt: number
+  /** 当前库存预计用完时间；补货后清除，恢复使用 cycleDays 预测。 */
+  inventoryDepletionAt?: number
   anchorEstimated: boolean
   purchaseOptions: PurchaseOption[]  // 新增：采购选项列表
   history: RestockEvent[]            // 已有：补货记录
@@ -39,6 +101,12 @@ export type ReplenishmentItem = {
   snoozeUntil?: number
   suggestedCycleDays?: number
   learningEnabled?: boolean
+  source?: ItemSource
+  confidence?: ModelConfidence
+  inventoryStatus?: InventoryStatus
+  modelNote?: string
+  lastFeedbackAt?: number
+  feedbackCount?: number
   unit?: string
   platform?: string
   defaultQty?: number
@@ -49,19 +117,60 @@ export type ReplenishmentItem = {
 }
 
 export type ReminderSettings = {
-  reminderIntervalMinutes: 30 | 60
+  reminderIntervalHours: number
   quietStart: string
   quietEnd: string
-  snoozeUntilHour: number
+  notificationEnabled: boolean
   monthlyBudget?: number
+  /** 阿里云百炼（DashScope）API Key，用于订单截图识别；仅存本地。 */
+  aiApiKey?: string
+  /** @deprecated 旧版共用模型 ID；迁移时作为问答和订单识别的兜底。 */
+  aiModel?: string
+  /** 家庭问答使用的文本模型 ID。 */
+  aiChatModel?: string
+  /** 订单截图识别使用的视觉模型 ID。 */
+  aiOrderModel?: string
+  /** 订单识别默认模型策略：准确优先或速度优先。 */
+  aiOrderMode?: "accurate" | "fast"
+  /** 上次对话会话结束时间戳（面板关闭时更新），用于开场简报触发判断。 */
+  lastChatSessionAt?: number
 }
 
 export type AppState = {
-  version: 2
+  version: 3
   categories: string[]
   items: ReplenishmentItem[]
   settings: ReminderSettings
+  householdProfile: HouseholdProfile | null
   updatedAt: number
+  /** 403：最近一次 Agent 写入的轻量记录，用于有限纠错和撤销。 */
+  lastAgentMutation?: LastAgentMutation
+}
+
+/**
+ * 403：最近一次 Agent 写入的轻量记录。
+ * 仅支持当前会话中最近一次由 Agent 成功创建的记录的纠错与撤销。
+ * 手动 UI 创建或修改的数据不纳入该快捷纠错权限。
+ */
+export type LastAgentMutation = {
+  /** 写入类型 */
+  mutationType: "createRestockRecord" | "createItem" | "createItemWithRestock" | "addPurchaseOption" | "createCategory" | "batchCommit"
+  /** 写入时间戳 */
+  createdAt: number
+  /** 受影响的物品 id（如有） */
+  itemId?: string
+  /** 受影响的补货记录 id（如有） */
+  recordId?: string
+  /** 受影响的物品名（用于消息展示） */
+  itemName?: string
+  /** 写入前的物品快照（仅记录受影响物品，不保存全量 state） */
+  beforeSnapshot?: ReplenishmentItem
+  /** 写入后的物品快照 */
+  afterSnapshot?: ReplenishmentItem
+  /** 新创建的分类名（createCategory 时） */
+  createdCategoryName?: string
+  /** 是否已被撤销或纠错（防止重复操作） */
+  consumed?: boolean
 }
 
 export type ItemComputed = {
@@ -117,5 +226,12 @@ export type RecentRestock = {
   snapshot: ReplenishmentItem
 }
 
-export const PLATFORM_OPTIONS = ["拼多多", "淘宝", "京东", "抖音", "1688", "线下", "其他"]
+export const PLATFORM_OPTIONS = ["拼多多", "淘宝", "京东", "抖音", "1688", "线下", "美团外卖", "其他"]
 export const UNIT_OPTIONS = ["件", "包", "卷", "瓶", "袋", "盒", "支", "kg", "L", "其他"]
+
+// 删除分类时的安全选项：必须显式选择“迁移到其他分类”或“确认删除物品”，
+// 非空分类不允许在两者都没有的情况下直接删除。
+export interface DeleteCategoryOptions {
+  moveToCategory?: string
+  deleteItemsConfirmed?: boolean
+}

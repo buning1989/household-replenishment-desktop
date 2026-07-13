@@ -8,11 +8,28 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
-    "dev:web": "vite --host 127.0.0.1",
+    "dev:demo": "node scripts/dev.mjs --demo",
+    "dev:web": "vite --config vite.web.config.ts --host 0.0.0.0",
+    "dev:landing": "vite --host 127.0.0.1 --strictPort --open /landing/",
     "typecheck": "tsc --noEmit",
     "build": "npm run typecheck && vite build",
+    "build:web": "npm run typecheck && vite build --config vite.web.config.ts",
+    "build:landing": "vite build --config vite.landing.config.ts",
     "start": "electron .",
-    "package:mac": "npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg"
+    "package:mac": "npm run test && npm run build && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg",
+    "package:win": "npm run test && npm run build && electron-builder --win --x64",
+    "test": "node --test tests/*.mjs",
+    "smoke:agent-llm": "node scripts/smoke-agent-llm-fallback.mjs",
+    "smoke:agent-llm:real": "node scripts/smoke-agent-llm-real.mjs",
+    "smoke:agent-focus-regression": "node scripts/smoke-agent-focus-regression.mjs",
+    "demo:seed": "node scripts/demo-seed.mjs",
+    "demo:verify": "node scripts/demo-verify.mjs",
+    "demo:reset": "node scripts/demo-reset.mjs",
+    "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64",
+    "package:mac:personal": "node scripts/package.mjs --mode personal --target mac --arch arm64",
+    "package:win:personal": "node scripts/package.mjs --mode personal --target win --arch x64",
+    "package:mac:demo": "node scripts/package.mjs --mode demo --target mac --arch arm64",
+    "package:win:demo": "node scripts/package.mjs --mode demo --target win --arch x64"
   },
   "dependencies": {
     "motion": "^12.40.0",
@@ -27,7 +44,8 @@
     "electron": "^39.8.10",
     "electron-builder": "^26.0.0",
     "typescript": "^5.9.0",
-    "vite": "^7.0.0"
+    "vite": "^7.0.0",
+    "vite-plugin-singlefile": "^2.3.3"
   },
   "build": {
     "appId": "cn.home.replenishment",
@@ -50,7 +68,15 @@
       ]
     },
     "win": {
-      "icon": "build/icons/icon.ico"
+      "icon": "build/icons/icon_1024.png",
+      "executableName": "HouseholdManager403"
+    },
+    "nsis": {
+      "shortcutName": "403家庭管家",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     },
     "linux": {
       "icon": "build/icons/icon.png"
