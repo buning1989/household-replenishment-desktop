@@ -132,6 +132,10 @@ const builderConfig = {
   files: [
     "dist/**/*",
     "electron/**/*",
+    // electron/main.js 运行时静态导入 src/shared 下的 .mjs 模块
+    // （build-mode.mjs、demo/demo-reset-core.mjs、demo/demo-household-seed.mjs）
+    // 必须打入 app.asar，否则打包后启动报 ERR_MODULE_NOT_FOUND
+    "src/shared/**/*.mjs",
     "build/icons/**/*",
     "THIRD_PARTY_NOTICES.md",
     "package.json"

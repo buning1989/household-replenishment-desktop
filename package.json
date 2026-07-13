@@ -1,6 +1,6 @@
 {
   "name": "household-replenishment-desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "author": "403家庭管家",
   "description": "A quiet household replenishment reminder for macOS and Windows.",
@@ -56,6 +56,7 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
+      "src/shared/**/*.mjs",
       "build/icons/**/*",
       "THIRD_PARTY_NOTICES.md",
       "package.json"
