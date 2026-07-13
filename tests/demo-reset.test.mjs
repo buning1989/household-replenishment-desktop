@@ -302,18 +302,12 @@ describe("Demo Reset Core", () => {
       // 读取备份前的 state
       const beforeState = JSON.parse(fs.readFileSync(stateFile, "utf8"))
 
-      // 将 state 文件设为只读目录（模拟写入失败）
-      // 注意：我们用不可写路径来模拟失败
-      const readOnlyDir = path.join(tmpDir, "readonly")
-      fs.mkdirSync(readOnlyDir, { recursive: true })
-      fs.chmodSync(readOnlyDir, 0o444)
-      const readOnlyStateFile = path.join(readOnlyDir, "reminder-state.json")
+      // 使用不存在的父目录模拟写入失败（跨平台兼容）
+      // 注意：chmod 0o444 在 Windows 上不阻止目录写入，故改用不存在的深路径
+      const invalidStateFile = path.join(tmpDir, "nonexistent-subdir", "deep", "state.json")
 
-      const result = performDemoReset(beforeState, readOnlyStateFile, backupDir)
+      const result = performDemoReset(beforeState, invalidStateFile, backupDir)
       assert.ok(!result.ok, "恢复应失败")
-
-      // 恢复目录权限以便清理
-      fs.chmodSync(readOnlyDir, 0o755)
 
       // 原文件应未被破坏
       const afterState = JSON.parse(fs.readFileSync(stateFile, "utf8"))
