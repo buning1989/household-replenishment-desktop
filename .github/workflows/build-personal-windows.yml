@@ -39,5 +39,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: 403-household-manager-windows-personal
-          path: release/
+          path: release/personal/windows-x64/
           if-no-files-found: error

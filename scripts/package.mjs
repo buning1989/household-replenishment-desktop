@@ -105,13 +105,17 @@ if (!values["skip-build"]) {
 
 const modeConfigs = {
   personal: {
-    appId: "cn.home.replenishment.personal",
+    // Personal 沿用旧正式版应用身份，保证覆盖升级识别和 userData 路径不变
+    appId: "cn.home.replenishment",
     productName: "403家庭管家",
-    extraMetadata: { name: "household-replenishment-personal" },
-    winExecutableName: "HouseholdManager403Personal",
+    // 不覆盖 extraMetadata.name，使用 package.json 原值 household-replenishment-desktop
+    // 这保证 Electron app.getName() 返回旧值，userData 路径不变
+    extraMetadata: {},
+    winExecutableName: "HouseholdManager403",
     nsisShortcutName: "403家庭管家"
   },
   demo: {
+    // Demo 使用独立身份，与个人版完全隔离
     appId: "cn.home.replenishment.demo",
     productName: "403家庭管家 Demo",
     extraMetadata: { name: "household-replenishment-demo" },
@@ -122,12 +126,16 @@ const modeConfigs = {
 
 const modeConfig = modeConfigs[mode]
 
+// 产物目录隔离：personal 和 demo 输出到不同子目录，避免混淆
+const targetDir = target === "mac" ? `mac-arm64` : `windows-x64`
+const outputDir = `release/${mode}/${targetDir}`
+
 const builderConfig = {
   appId: modeConfig.appId,
   productName: modeConfig.productName,
   extraMetadata: modeConfig.extraMetadata,
   directories: {
-    output: "release"
+    output: outputDir
   },
   files: [
     "dist/**/*",
@@ -192,4 +200,4 @@ try {
 }
 
 console.log(`\n[package] 打包完成: mode=${mode}, target=${target}`)
-console.log(`[package] 产物目录: ${path.join(root, "release")}`)
+console.log(`[package] 产物目录: ${path.join(root, outputDir)}`)

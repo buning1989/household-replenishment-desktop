@@ -19,7 +19,7 @@ import {
 import { performDemoReset } from "../src/shared/demo/demo-reset-core.mjs"
 import {
   resolveBuildMode,
-  getUserDataDirName,
+  shouldOverrideUserData,
   shouldAllowDemoReset
 } from "../src/shared/build-mode.mjs"
 
@@ -51,12 +51,17 @@ function readBuildMode() {
 const buildMode = readBuildMode()
 
 // ---- 数据目录隔离 ----
-// 在 app ready 之前设置 userData 路径，确保所有后续 getPath("userData") 调用
-// 都指向模式专属目录。覆盖安装和版本升级时始终使用同一目录。
-const userDataDirName = getUserDataDirName(buildMode)
-const userDataPath = path.join(app.getPath("appData"), userDataDirName)
-app.setPath("userData", userDataPath)
-console.log(`[main] buildMode=${buildMode}, userData=${userDataPath}`)
+// Personal 模式：不覆盖 userData，使用 Electron 默认路径（继承旧版数据）。
+// Demo 模式：设置独立 userData 目录，与个人版完全隔离。
+// app.setPath 必须在 app.whenReady() 之前调用。
+if (shouldOverrideUserData(buildMode)) {
+  const DEMO_DIR_NAME = "403-household-manager-demo"
+  const demoUserDataPath = path.join(app.getPath("appData"), DEMO_DIR_NAME)
+  app.setPath("userData", demoUserDataPath)
+  console.log(`[main] buildMode=${buildMode}, userData=${demoUserDataPath} (demo 隔离目录)`)
+} else {
+  console.log(`[main] buildMode=${buildMode}, userData=${app.getPath("userData")} (Electron 默认，继承旧版数据)`)
+}
 
 // ---- 主进程全局异常兜底：仅记录日志，不弹 UI、不退出、不重启 ----
 process.on("uncaughtException", (error) => {

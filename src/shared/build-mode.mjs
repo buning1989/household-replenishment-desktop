@@ -4,20 +4,24 @@
 // 不依赖 React、Electron 或任何运行时环境，仅做纯计算。
 //
 // 模式说明：
-// - personal：个人正式使用版。首次启动数据为空，不注入任何 Demo/Seed/Fixture 数据，
+// - personal：个人正式使用版。继承旧版应用身份（appId、应用名、userData 路径），
+//   老用户覆盖安装后可直接读取原有数据。不注入任何 Demo/Seed/Fixture 数据，
 //   不展示"恢复 Demo State"入口，不允许通过 IPC 触发 Demo 数据恢复。
-// - demo：比赛演示版。保留现有 Demo State 和一键恢复能力。
+// - demo：比赛演示版。使用独立 appId 和独立 userData 目录，与个人版完全隔离。
+//   保留现有 Demo State 和一键恢复能力。
 //
-// 数据目录隔离：
-// - personal → 403-household-manager-personal
-// - demo     → 403-household-manager-demo
-// 两个目录互不影响，覆盖安装和版本升级时始终使用同一目录。
+// 数据目录策略：
+// - personal → 不覆盖 userData，使用 Electron 默认路径（由 app.getName() 决定）
+// - demo     → 403-household-manager-demo（独立目录，不影响个人版数据）
 
-/** personal 模式固定数据目录名 */
-export const PERSONAL_DIR_NAME = "403-household-manager-personal"
-
-/** demo 模式固定数据目录名 */
+/** demo 模式固定数据目录名（personal 模式不使用独立目录） */
 export const DEMO_DIR_NAME = "403-household-manager-demo"
+
+/** 旧正式版 appId（Personal 必须沿用，保证升级识别） */
+export const PERSONAL_APP_ID = "cn.home.replenishment"
+
+/** Demo 版 appId（独立身份） */
+export const DEMO_APP_ID = "cn.home.replenishment.demo"
 
 /** 合法的构建模式 */
 export const VALID_MODES = ["personal", "demo"]
@@ -43,12 +47,24 @@ export function resolveBuildMode(value, fallback = "personal") {
 }
 
 /**
- * 根据构建模式返回固定的 userData 目录名。
+ * 是否需要覆盖 Electron 默认 userData 路径。
+ * - personal：返回 false，使用 Electron 默认路径（继承旧版数据）
+ * - demo：返回 true，使用独立目录
  * @param {"personal" | "demo"} mode
- * @returns {string}
+ * @returns {boolean}
+ */
+export function shouldOverrideUserData(mode) {
+  return mode === "demo"
+}
+
+/**
+ * 根据 demo 模式返回独立的 userData 目录名。
+ * 仅 demo 模式有值；personal 模式返回 null（表示使用 Electron 默认）。
+ * @param {"personal" | "demo"} mode
+ * @returns {string | null}
  */
 export function getUserDataDirName(mode) {
-  return mode === "demo" ? DEMO_DIR_NAME : PERSONAL_DIR_NAME
+  return mode === "demo" ? DEMO_DIR_NAME : null
 }
 
 /**
@@ -69,6 +85,17 @@ export function shouldShowDemoResetEntry(mode) {
  */
 export function shouldAllowDemoReset(mode) {
   return mode === "demo"
+}
+
+/**
+ * 根据构建模式返回 appId。
+ * - personal：沿用旧正式版 appId（cn.home.replenishment）
+ * - demo：使用独立 appId（cn.home.replenishment.demo）
+ * @param {"personal" | "demo"} mode
+ * @returns {string}
+ */
+export function getAppId(mode) {
+  return mode === "demo" ? DEMO_APP_ID : PERSONAL_APP_ID
 }
 
 /**
