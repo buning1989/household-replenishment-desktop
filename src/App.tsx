@@ -59,7 +59,7 @@ import { loadState, persistState, reconcileState, takePendingLoadIssue, type Per
 import { canConfirmRestock, applyDeleteCategory, calculateMonthlySpend } from "./pure-logic.mjs"
 import type { AppState, DeleteCategoryOptions, ItemComputed, ItemDraft, PricingMode, Rating, ReplenishmentItem, PurchaseOption, RestockEvent } from "./types"
 import { PLATFORM_OPTIONS as platforms, UNIT_OPTIONS as units } from "./types"
-import { isDesktopRuntime, isWebRuntime, requiresUserApiKey } from "./runtime/runtimeBridge"
+import { isDesktopRuntime, isWebRuntime, requiresUserApiKey, isDemoBuild } from "./runtime/runtimeBridge"
 import { resetCompetitionDemoState, clearCompetitionTempState, COMPETITION_WEB_STORAGE_KEY } from "./demo/competitionDemoState"
 
 const EMPTY_DRAFT: ItemDraft = {
@@ -4309,7 +4309,7 @@ function SettingsPanel({ state, onChange, onClose, isClosing, demoResetStatus, d
             </div>
           </div>
           )}
-          {(import.meta.env.DEV || import.meta.env.VITE_DEMO_MODE === "true" || isWebRuntime) && (
+          {(isDemoBuild || isWebRuntime) && (
             <div className="settings-row settings-row-multiline demo-data-row">
               <div className="settings-row-label">
                 <div className="settings-row-title">演示数据</div>

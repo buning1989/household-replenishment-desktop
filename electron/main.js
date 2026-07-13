@@ -17,12 +17,46 @@ import {
   resetBudgetNotificationState
 } from "./budget-notifier.mjs"
 import { performDemoReset } from "../src/shared/demo/demo-reset-core.mjs"
+import {
+  resolveBuildMode,
+  getUserDataDirName,
+  shouldAllowDemoReset
+} from "../src/shared/build-mode.mjs"
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const isDev = Boolean(process.env.VITE_DEV_SERVER_URL)
 const DAY_MS = 24 * 60 * 60 * 1000
 const APP_NAME = "403家庭管家"
 const APP_ICON = path.join(__dirname, "../build/icons/icon_1024.png")
+
+// ---- 构建模式解析 ----
+// 优先级：APP_BUILD_MODE 环境变量 > electron/build-info.json > 默认 personal
+// dev 模式下环境变量由 scripts/dev.mjs 注入；打包后由 build-info.json 提供。
+function readBuildMode() {
+  if (process.env.APP_BUILD_MODE) {
+    return resolveBuildMode(process.env.APP_BUILD_MODE)
+  }
+  try {
+    const infoPath = path.join(__dirname, "build-info.json")
+    if (fs.existsSync(infoPath)) {
+      const info = JSON.parse(fs.readFileSync(infoPath, "utf8"))
+      return resolveBuildMode(info.mode)
+    }
+  } catch {
+    // 读取失败，回退到 personal
+  }
+  return "personal"
+}
+
+const buildMode = readBuildMode()
+
+// ---- 数据目录隔离 ----
+// 在 app ready 之前设置 userData 路径，确保所有后续 getPath("userData") 调用
+// 都指向模式专属目录。覆盖安装和版本升级时始终使用同一目录。
+const userDataDirName = getUserDataDirName(buildMode)
+const userDataPath = path.join(app.getPath("appData"), userDataDirName)
+app.setPath("userData", userDataPath)
+console.log(`[main] buildMode=${buildMode}, userData=${userDataPath}`)
 
 // ---- 主进程全局异常兜底：仅记录日志，不弹 UI、不退出、不重启 ----
 process.on("uncaughtException", (error) => {
@@ -442,6 +476,11 @@ ipcMain.handle("state:sync", (_event, state) => {
 })
 
 ipcMain.handle("state:reset-to-demo", (_event, currentState) => {
+  // personal 模式拒绝 Demo 数据恢复，防止误操作
+  if (!shouldAllowDemoReset(buildMode)) {
+    console.warn(`[demo-reset] rejected: buildMode=${buildMode} does not allow demo reset`)
+    return { ok: false, error: "个人正式版不支持恢复演示数据。" }
+  }
   console.log("[demo-reset] ipc request received")
   const file = stateFile()
   const backupDir = path.join(app.getPath("userData"), "demo-backups")

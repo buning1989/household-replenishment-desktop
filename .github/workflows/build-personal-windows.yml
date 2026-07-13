@@ -1,0 +1,43 @@
+name: Build Personal Windows
+
+# 仅手动触发，不在 push/PR 时自动运行
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows Personal
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          # 项目未固定 Node 版本（无 .nvmrc / .node-version / engines 字段），使用 Node.js 22
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm run test
+
+      - name: Package Windows personal build
+        run: npm run package:win:personal
+        env:
+          # 个人正式版打包，禁用代码签名自动发现
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: 403-household-manager-windows-personal
+          path: release/
+          if-no-files-found: error

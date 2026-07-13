@@ -16,6 +16,26 @@ export const isDesktopRuntime: boolean = Boolean(
 /** 是否处于 Web（浏览器）运行时 */
 export const isWebRuntime: boolean = !isDesktopRuntime
 
+/**
+ * 构建模式：编译时由 Vite define 注入（__APP_BUILD_MODE__）。
+ * - personal：个人正式使用版，不注入 Demo 数据，不展示 Demo 恢复入口
+ * - demo：比赛演示版，保留 Demo State 和一键恢复能力
+ *
+ * 桌面端：由 scripts/package.mjs 通过 APP_BUILD_MODE 环境变量控制
+ * Web 端：vite.web.config.ts 固定注入 "demo"
+ *
+ * typeof 守卫确保在 Node 测试环境（无 Vite define）中回退到 "personal"，
+ * 不会抛出 ReferenceError。
+ */
+export const BUILD_MODE: "personal" | "demo" =
+  typeof __APP_BUILD_MODE__ === "string" ? __APP_BUILD_MODE__ : "personal"
+
+/** 是否为 personal（个人正式使用版）构建 */
+export const isPersonalBuild: boolean = BUILD_MODE === "personal"
+
+/** 是否为 demo（比赛演示版）构建 */
+export const isDemoBuild: boolean = BUILD_MODE === "demo"
+
 type ChatMessagePayload = {
   role: "system" | "user" | "assistant"
   content: string

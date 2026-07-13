@@ -45,6 +45,7 @@ declare global {
       chatComplete: (payload: ChatCompletePayload) => Promise<ChatCompleteResult>
       openExternal: (url: string) => Promise<void>
       showWindow: () => void
+      buildMode: "personal" | "demo"
       onNotificationAction: (callback: (payload: NotificationAction) => void) => () => void
     }
     /**
@@ -57,6 +58,13 @@ declare global {
     /** 最近 20 条 trace 历史（最旧在前） */
     __agentTraceHistory?: AgentDecisionTrace[]
   }
+
+  /**
+   * 构建模式编译时常量，由 Vite define 注入。
+   * 在 Vite 构建时被替换为 "personal" 或 "demo" 字符串字面量。
+   * 在 Node 测试环境中可能为 undefined，使用时需做 typeof 守卫。
+   */
+  const __APP_BUILD_MODE__: "personal" | "demo" | undefined
 }
 
 declare module "*.png" {

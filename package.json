@@ -8,6 +8,7 @@
   "main": "electron/main.js",
   "scripts": {
     "dev": "node scripts/dev.mjs",
+    "dev:demo": "node scripts/dev.mjs --demo",
     "dev:web": "vite --config vite.web.config.ts --host 0.0.0.0",
     "dev:landing": "vite --host 127.0.0.1 --strictPort --open /landing/",
     "typecheck": "tsc --noEmit",
@@ -24,7 +25,11 @@
     "demo:seed": "node scripts/demo-seed.mjs",
     "demo:verify": "node scripts/demo-verify.mjs",
     "demo:reset": "node scripts/demo-reset.mjs",
-    "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64"
+    "package:win:arm64": "npm run test && npm run build && electron-builder --win --arm64",
+    "package:mac:personal": "node scripts/package.mjs --mode personal --target mac --arch arm64",
+    "package:win:personal": "node scripts/package.mjs --mode personal --target win --arch x64",
+    "package:mac:demo": "node scripts/package.mjs --mode demo --target mac --arch arm64",
+    "package:win:demo": "node scripts/package.mjs --mode demo --target win --arch x64"
   },
   "dependencies": {
     "motion": "^12.40.0",
@@ -67,7 +72,11 @@
       "executableName": "HouseholdManager403"
     },
     "nsis": {
-      "shortcutName": "403家庭管家"
+      "shortcutName": "403家庭管家",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
     },
     "linux": {
       "icon": "build/icons/icon.png"

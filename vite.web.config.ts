@@ -14,6 +14,10 @@ import { resolve } from "path"
 export default defineConfig({
   plugins: [react()],
   base: "/",
+  define: {
+    // Web 端固定为 demo 模式：比赛 Demo 始终展示"恢复 Demo State"入口
+    __APP_BUILD_MODE__: JSON.stringify("demo")
+  },
   server: {
     port: 5174,
     strictPort: false,

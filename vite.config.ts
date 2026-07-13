@@ -54,9 +54,16 @@ function fixInlineScript(): Plugin {
   }
 }
 
+// APP_BUILD_MODE 由 scripts/package.mjs 或 scripts/dev.mjs 通过环境变量注入。
+// 缺失时默认 personal，确保未显式指定模式的构建不会误注入 Demo 数据。
+const APP_BUILD_MODE = process.env.APP_BUILD_MODE === "demo" ? "demo" : "personal"
+
 export default defineConfig({
   plugins: [react(), viteSingleFile(), fixInlineScript()],
   base: "./",
+  define: {
+    __APP_BUILD_MODE__: JSON.stringify(APP_BUILD_MODE)
+  },
   server: {
     port: 5173,
     strictPort: true

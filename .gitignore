@@ -10,4 +10,6 @@ release/
 .env.local
 .env.*.local
 .vercel/
+electron/build-info.json
+electron-builder.config.json
 

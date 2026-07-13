@@ -2,6 +2,10 @@ import { spawn } from "node:child_process"
 import net from "node:net"
 import process from "node:process"
 
+// 默认 personal 模式；传入 --demo 切换到 demo 模式开发
+const args = process.argv.slice(2)
+const appBuildMode = args.includes("--demo") ? "demo" : "personal"
+
 const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm"
 const electronBinary = process.platform === "win32"
   ? "node_modules/.bin/electron.cmd"
@@ -27,7 +31,7 @@ if (await isPortOpen(devPort, devHost)) {
 
 const vite = spawn(npmCommand, ["run", "dev:web"], {
   stdio: "inherit",
-  env: process.env
+  env: { ...process.env, APP_BUILD_MODE: appBuildMode }
 })
 
 function waitForPort(port, host, child) {
@@ -78,7 +82,7 @@ try {
 
 const electron = spawn(electronBinary, ["."], {
   stdio: "inherit",
-  env: { ...process.env, VITE_DEV_SERVER_URL: `http://${devHost}:${devPort}` }
+  env: { ...process.env, VITE_DEV_SERVER_URL: `http://${devHost}:${devPort}`, APP_BUILD_MODE: appBuildMode }
 })
 
 let shuttingDown = false
